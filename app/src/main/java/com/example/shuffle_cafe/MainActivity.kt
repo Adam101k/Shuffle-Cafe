@@ -16,6 +16,7 @@ import androidx.compose.material.icons.filled.Place
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Star
+import androidx.compose.material.icons.filled.Bookmark
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -72,6 +73,7 @@ private fun TopSearchBar() {
     Surface(
         modifier = Modifier
             .fillMaxWidth()
+            .statusBarsPadding()
             .padding(horizontal = 16.dp, vertical = 10.dp),
         shape = RoundedCornerShape(28.dp),
         color = MaterialTheme.colorScheme.surfaceVariant
@@ -225,6 +227,12 @@ private fun BottomNavBar() {
             selected = false,
             onClick = { },
             icon = { Icon(Icons.Filled.Place, contentDescription = "Map") }
+        )
+
+        NavigationBarItem(
+            selected = false,
+            onClick = { },
+            icon = { Icon(Icons.Filled.Bookmark, contentDescription = "Saved") }
         )
 
         NavigationBarItem(
