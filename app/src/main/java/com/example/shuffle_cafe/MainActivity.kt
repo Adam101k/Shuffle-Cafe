@@ -29,7 +29,11 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.navigation.NavHostController
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.rememberNavController
 import com.example.shuffle_cafe.ui.theme.Shuffle_CafeTheme
+import androidx.navigation.compose.composable
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -38,7 +42,7 @@ class MainActivity : ComponentActivity() {
 
         setContent {
             Shuffle_CafeTheme {
-                MainScreen()
+                AppNav()
             }
         }
     }
@@ -46,10 +50,25 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MainScreen() {
+fun AppNav(){
+    val navController = rememberNavController()
+    NavHost(navController = navController, startDestination = Screen.MainScreen.route) {
+        composable(route = Screen.MainScreen.route) {
+            MainScreen(navController = navController)
+        }
+        composable(route = Screen.MapScreen.route) {
+            MapScreen(navController = navController)
+        }
+
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MainScreen(navController: NavHostController) {
     Scaffold(
         topBar = { TopSearchBar() },
-        bottomBar = { BottomNavBar() },
+        bottomBar = { BottomNavBar(navController) },
         containerColor = Color.White
     ) { innerPadding ->
         Column(
@@ -65,6 +84,25 @@ fun MainScreen() {
     }
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MapScreen(navController: NavHostController) {
+    Scaffold(
+        topBar = { TopSearchBar() },
+        bottomBar = {BottomNavBar(navController) },
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize()
+                .padding(horizontal = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Spacer(Modifier.height(16.dp))
+
+        }
+    }
+}
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TopSearchBar() {
@@ -216,16 +254,16 @@ private fun RatingStars(rating: Float) {
 }
 
 @Composable
-private fun BottomNavBar() {
+private fun BottomNavBar(navController: NavHostController) {
     NavigationBar {
         NavigationBarItem(
             selected = true,
-            onClick = { },
+            onClick = {navController.navigate(Screen.MainScreen.route) },
             icon = { Icon(Icons.Filled.Search, contentDescription = "Search") }
         )
         NavigationBarItem(
             selected = false,
-            onClick = { },
+            onClick = { navController.navigate(Screen.MapScreen.route) },
             icon = { Icon(Icons.Filled.Place, contentDescription = "Map") }
         )
 
@@ -247,6 +285,6 @@ private fun BottomNavBar() {
 @Composable
 fun MainScreenPreview() {
     Shuffle_CafeTheme {
-        MainScreen()
+        AppNav()
     }
 }
