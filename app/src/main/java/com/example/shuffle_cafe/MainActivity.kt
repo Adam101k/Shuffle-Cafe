@@ -59,6 +59,9 @@ fun AppNav(){
         composable(route = Screen.MapScreen.route) {
             MapScreen(navController = navController)
         }
+        composable(route = Screen.BookmarkScreen.route) {
+            BookmarkScreen(navController = navController)
+        }
 
     }
 }
@@ -103,6 +106,27 @@ fun MapScreen(navController: NavHostController) {
         }
     }
 }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun BookmarkScreen(navController: NavHostController) {
+    Scaffold(
+        topBar = { TopSearchBar() },
+        bottomBar = {BottomNavBar(navController) },
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize()
+                .padding(horizontal = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Spacer(Modifier.height(16.dp))
+            PlaceSaved()
+        }
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun TopSearchBar() {
@@ -135,6 +159,137 @@ private fun TopSearchBar() {
         )
     }
 }
+
+@Composable
+private fun PlaceSaved() {
+    val outlineColor = Color(0xFFE6E6E6)
+    val itemSpacing = 12.dp
+    val sectionSpacing = 22.dp
+    val shape = RoundedCornerShape(4.dp)
+
+    @Composable
+    fun Tile(
+        modifier: Modifier = Modifier,
+        showPlus: Boolean = false
+    ) {
+        OutlinedCard(
+            modifier = modifier.aspectRatio(1f),
+            shape = shape,
+            colors = CardDefaults.outlinedCardColors(containerColor = Color.White),
+            border = androidx.compose.foundation.BorderStroke(1.dp, outlineColor)
+        ) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                if (showPlus) {
+                    Text(
+                        text = "+",
+                        style = MaterialTheme.typography.headlineLarge,
+                        fontWeight = FontWeight.Medium,
+                        color = Color.Black
+                    )
+                }
+            }
+        }
+    }
+
+    @Composable
+    fun SectionTitle(title: String) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(4.dp))
+        Box(
+            modifier = Modifier
+                .width(80.dp)
+                .height(1.dp)
+                .background(outlineColor)
+        )
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(sectionSpacing)
+    ) {
+        // --- Saved ---
+        Column(modifier = Modifier.fillMaxWidth()) {
+            SectionTitle("Saved")
+            Spacer(Modifier.height(10.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(itemSpacing)
+            ) {
+                Tile(modifier = Modifier.weight(1f))
+                Tile(modifier = Modifier.weight(1f))
+                Tile(modifier = Modifier.weight(1f), showPlus = true)
+            }
+        }
+
+        // --- Collection ---
+        Column(modifier = Modifier.fillMaxWidth()) {
+            SectionTitle("Collection")
+            Spacer(Modifier.height(10.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(itemSpacing),
+                verticalAlignment = Alignment.Top
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Tile(modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = "Good Coffee",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Tile(modifier = Modifier.fillMaxWidth())
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = "Quiet Area",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.Medium,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+
+                Column(modifier = Modifier.weight(1f)) {
+                    Tile(modifier = Modifier.fillMaxWidth(), showPlus = true)
+                    Spacer(Modifier.height(6.dp))
+                    // Keep height consistent with the other columns that have labels
+                    Text(text = "", style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+        }
+
+        // --- Study Plan ---
+        Column(modifier = Modifier.fillMaxWidth()) {
+            SectionTitle("Study Plan")
+            Spacer(Modifier.height(10.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(itemSpacing)
+            ) {
+                Tile(modifier = Modifier.weight(1f))
+                Tile(modifier = Modifier.weight(1f))
+                Tile(modifier = Modifier.weight(1f), showPlus = true)
+            }
+        }
+    }
+}
+
 
 @Composable
 private fun PlaceCard() {
@@ -269,8 +424,8 @@ private fun BottomNavBar(navController: NavHostController) {
 
         NavigationBarItem(
             selected = false,
-            onClick = { },
-            icon = { Icon(Icons.Filled.Bookmark, contentDescription = "Saved") }
+            onClick = { navController.navigate(Screen.BookmarkScreen.route) },
+            icon = { Icon(Icons.Filled.Bookmark, contentDescription = "Bookmarks") }
         )
 
         NavigationBarItem(
