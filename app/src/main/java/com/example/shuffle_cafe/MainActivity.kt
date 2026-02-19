@@ -61,16 +61,20 @@ import android.location.Location
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.maps.CameraUpdate
 import com.google.android.gms.maps.CameraUpdateFactory
-import coil.compose.AsyncImage
-import io.github.jan.supabase.auth.Auth
-import io.github.jan.supabase.createSupabaseClient
-import io.github.jan.supabase.postgrest.Postgrest
-import io.github.jan.supabase.postgrest.from
-import io.ktor.websocket.WebSocketDeflateExtension.Companion.install
+//import coil.compose.AsyncImage
+//import io.github.jan.supabase.auth.Auth
+//import io.github.jan.supabase.createSupabaseClient
+//import io.github.jan.supabase.postgrest.Postgrest
+//import io.github.jan.supabase.postgrest.from
+//import io.ktor.websocket.WebSocketDeflateExtension.Companion.install
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
+import com.example.shuffle_cafe.ui.screens.LoginScreen // Moved import to top
+// Removed: import com.example.shuffle_cafe.ui.screens.BookmarkScreen // Removed incorrect import
+// Removed: import com.example.shuffle_cafe.ui.screens.ProfileScreen
+// Removed: import com.example.shuffle_cafe.ui.screens.MapScreen
 import androidx.compose.foundation.clickable
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.text.style.TextAlign
@@ -82,14 +86,13 @@ import androidx.compose.runtime.snapshots.SnapshotStateList
 import com.google.maps.android.compose.CameraPositionState
 import com.google.android.libraries.places.api.Places
 
-val supabase = createSupabaseClient(
-    supabaseUrl = "https://sknyfkgltazosjmyjfhs.supabase.co",
-    supabaseKey = "sb_publishable_dCrTJjMXS6bw1WDaqTtewg_amytqZMf"
-) {
-    install(Auth)
-    install(Postgrest)
-}
-import com.example.shuffle_cafe.ui.screens.LoginScreen // Import LoginScreen
+// val supabase = createSupabaseClient(
+// supabaseUrl = "https://sknyfkgltazosjmyjfhs.supabase.co",
+ //   supabaseKey = "sb_publishable_dCrTJjMXS6bw1WDaqTtewg_amytqZMf"
+//) {
+    //install(Auth)
+   // install(Postgrest)
+//}
 
 data class Cafe(
     val id: String,
@@ -820,6 +823,40 @@ private fun PlaceCard(navController: NavHostController, cafe: Cafe) {
                             )
                         )
                 )
+
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .align(Alignment.BottomCenter)
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Icon(
+                        imageVector = Icons.Filled.Search,
+                        contentDescription = null,
+                        tint = Color.White
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = "More like this",
+                        color = Color.White,
+                        style = MaterialTheme.typography.bodyMedium,
+                        modifier = Modifier.weight(1f)
+                    )
+
+                    Surface(
+                        shape = CircleShape,
+                        color = Color.White.copy(alpha = 0.25f)
+                    ) {
+                        IconButton(onClick = { /* TODO share */ }) {
+                            Icon(
+                                imageVector = Icons.Filled.Share,
+                                contentDescription = "Share",
+                                tint = Color.White
+                            )
+                        }
+                    }
+                }
             }
 
             Column(modifier = Modifier.padding(12.dp)) {
@@ -1022,6 +1059,31 @@ fun ProfileScreen(navController: NavHostController) {
             ) { item ->
                 RecentItemRow(item.first, item.second)
             }
+        }
+    }
+}
+
+@Composable
+fun AsyncImage(model: Uri?, contentDescription: String, modifier: Modifier) {
+    TODO("Not yet implemented")
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun BookmarkScreen(navController: NavHostController) {
+    Scaffold(
+        bottomBar = { BottomNavBar(navController) },
+        containerColor = Color.White
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize()
+                .padding(horizontal = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text("Bookmark Screen", style = MaterialTheme.typography.headlineMedium)
         }
     }
 }

@@ -34,6 +34,8 @@ fun LoginScreen(navController: NavHostController) {
     val pagerState = rememberPagerState { 2 }
     val coroutineScope = rememberCoroutineScope()
 
+    // Removed: val loginSectionOffset by remember { mutableIntStateOf(0) }
+
     Scaffold(
         // containerColor = Color.Transparent // Removed: No longer needed with solid background
     ) { innerPadding ->
@@ -58,10 +60,13 @@ fun LoginScreen(navController: NavHostController) {
                         verticalArrangement = Arrangement.Center
                     ) {
                         Image(
-                            painter = painterResource(id = R.drawable.ic_launcher_foreground),
-                            contentDescription = "App Logo",
-                            modifier = Modifier.size(120.dp)
+                            painter = painterResource(id = R.drawable.shuffle_cafe_logo),
+                            contentDescription = "Shuffle Cafe Logo",
+                            modifier = Modifier
+                                .size(150.dp) // Adjust size as needed for your new logo
+                                .align(Alignment.CenterHorizontally)
                         )
+
                         Spacer(modifier = Modifier.height(32.dp))
 
                         Text(
@@ -97,7 +102,8 @@ fun LoginScreen(navController: NavHostController) {
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(horizontal = 24.dp),
+                            .padding(horizontal = 24.dp) // Removed: .onGloballyPositioned { ... }
+                            ,
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center
                     ) {
