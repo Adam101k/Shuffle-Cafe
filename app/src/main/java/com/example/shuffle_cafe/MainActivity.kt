@@ -1,10 +1,11 @@
 package com.example.shuffle_cafe
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.net.Uri
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Image
@@ -33,11 +34,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.NavHostController
@@ -45,6 +48,18 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.rememberNavController
 import com.example.shuffle_cafe.ui.theme.Shuffle_CafeTheme
 import androidx.navigation.compose.composable
+import com.google.maps.android.compose.GoogleMap
+import com.google.maps.android.compose.MapProperties
+import com.google.maps.android.compose.MapUiSettings
+import androidx.activity.result.contract.ActivityResultContracts
+import com.google.android.gms.maps.model.CameraPosition
+import com.google.maps.android.compose.rememberCameraPositionState
+import androidx.compose.runtime.LaunchedEffect
+import com.google.android.gms.maps.model.LatLng
+import android.location.Location
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.maps.CameraUpdate
+import com.google.android.gms.maps.CameraUpdateFactory
 import coil.compose.AsyncImage
 import io.github.jan.supabase.auth.Auth
 import io.github.jan.supabase.createSupabaseClient
@@ -55,6 +70,15 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
+import androidx.compose.foundation.clickable
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.ui.text.style.TextAlign
+import androidx.navigation.NavType
+import androidx.navigation.navArgument
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.PlayArrow
+import androidx.compose.runtime.snapshots.SnapshotStateList
+
 
 val supabase = createSupabaseClient(
     supabaseUrl = "https://sknyfkgltazosjmyjfhs.supabase.co",
@@ -64,10 +88,91 @@ val supabase = createSupabaseClient(
     install(Postgrest)
 }
 
+data class Cafe(
+    val id: String,
+    val name: String,
+    val address: String,
+    val phone: String,
+    val status: String, // "Busy" / "Quiet" / "Closed" etc.
+    val hours: LinkedHashMap<String, String>,
+    val features: List<String>,
+    val ambience: List<String>,
+    val imageResId: Int = R.drawable.ic_launcher_foreground, // fallback local image
+    val imageUrl: String? = null
+)
+
+object CafeRepository {
+    // Testing data. Replace with backend data later
+    val cafes: List<Cafe> = listOf(
+        Cafe(
+            id = "1",
+            name = "Cafe Name",
+            address = "123 something ave",
+            phone = "(123) 123-1234",
+            status = "Busy/Quiet/Closed",
+            hours = linkedMapOf(
+                "Thursday" to "7:00AM - 5:00 PM",
+                "Friday" to "7:00AM - 5:00 PM",
+                "Saturday" to "8:00AM - 4:00 PM",
+                "Sunday" to "8:00AM - 2:00 PM"
+            ),
+            features = listOf(
+                "Parking availability",
+                "Bike parking",
+                "ADA accessibility",
+                "Restroom availability",
+                "Bathroom password",
+                "Wifi Availability/Quality"
+            ),
+            ambience = listOf("Quiet", "Bright"),
+            imageResId = R.drawable.ic_launcher_foreground
+        ),
+        Cafe(
+            id = "2",
+            name = "Klatch Coffee",
+            address = "13855 City Center Dr #3015",
+            phone = "(555) 555-5555",
+            status = "Quiet",
+            hours = linkedMapOf(
+                "Thursday" to "6:30AM - 6:00 PM",
+                "Friday" to "6:30AM - 6:00 PM"
+            ),
+            features = listOf("Parking availability", "Wifi Availability/Quality"),
+            ambience = listOf("Quiet"),
+            imageResId = R.drawable.ic_launcher_foreground
+        )
+    )
+
+    fun getCafe(id: String): Cafe? = cafes.firstOrNull { it.id == id }
+}
+
+object ReviewRepository {
+    private val reviewsByCafe = mutableStateMapOf<String, SnapshotStateList<String>>()
+
+    fun reviewsFor(cafeId: String): SnapshotStateList<String> =
+        reviewsByCafe.getOrPut(cafeId) { mutableStateListOf() }
+
+    fun addReview(cafeId: String, review: String) {
+        reviewsFor(cafeId).add(review)
+    }
+}
+
 class MainActivity : ComponentActivity() {
+
+    private val requestPermissionLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { isGranted ->
+            // You can handle result here if needed
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        requestPermissionLauncher.launch(
+            Manifest.permission.ACCESS_FINE_LOCATION
+        )
 
         setContent {
             Shuffle_CafeTheme {
@@ -82,6 +187,7 @@ class MainActivity : ComponentActivity() {
 fun AppNav(){
     val navController = rememberNavController()
     NavHost(navController = navController, startDestination = Screen.MainScreen.route) {
+
         composable(route = Screen.MainScreen.route) {
             MainScreen(navController = navController)
         }
@@ -91,18 +197,35 @@ fun AppNav(){
         composable(route = Screen.BookmarkScreen.route) {
             BookmarkScreen(navController = navController)
         }
-        composable(Screen.ProfileScreen.route) {
+        composable(route = Screen.ProfileScreen.route) {
             ProfileScreen(navController)
         }
 
+        composable(
+            route = Screen.CafeDetails.route,
+            arguments = listOf(navArgument("cafeId") { type = NavType.StringType })
+        ) { backStackEntry ->
+            val cafeId = backStackEntry.arguments?.getString("cafeId") ?: return@composable
+            CafeDetailsScreen(navController = navController, cafeId = cafeId)
+        }
+
+        composable(
+            route = Screen.WriteReview.route,
+            arguments = listOf(navArgument("cafeId") { type = NavType.StringType })
+        ) { backStackEntry ->
+            val cafeId = backStackEntry.arguments?.getString("cafeId") ?: return@composable
+            WriteReviewScreen(navController = navController, cafeId = cafeId)
+        }
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(navController: NavHostController) {
+    val cafe = CafeRepository.cafes.first() // sample
+
     Scaffold(
-        topBar = { TopSearchBar() },
+        topBar = { MapSearchBar() },
         bottomBar = { BottomNavBar(navController) },
         containerColor = Color.White
     ) { innerPadding ->
@@ -114,26 +237,53 @@ fun MainScreen(navController: NavHostController) {
             horizontalAlignment = Alignment.CenterHorizontally
         ) {
             Spacer(Modifier.height(16.dp))
-            PlaceCard()
+            PlaceCard(navController = navController, cafe = cafe)
         }
     }
 }
 
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MapScreen(navController: NavHostController) {
+    val context = LocalContext.current
+    val fusedLocationClient = remember {
+        LocationServices.getFusedLocationProviderClient(context)
+    }
+    val hasLocationPermission = ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.ACCESS_FINE_LOCATION
+    ) == PackageManager.PERMISSION_GRANTED
+    val defaultCamera = rememberCameraPositionState()
+
+    LaunchedEffect(hasLocationPermission){
+        if(hasLocationPermission) {
+            fusedLocationClient.lastLocation.addOnSuccessListener { location -> location?.let{
+                val userLatlng = LatLng(it.latitude, it.longitude)
+
+                defaultCamera.move(CameraUpdateFactory.newLatLngZoom(userLatlng, 17f)
+                )
+            }
+            }
+        }
+    }
     Scaffold(
         topBar = { TopSearchBar() },
         bottomBar = {BottomNavBar(navController) },
     ) { innerPadding ->
-        Column(
+        GoogleMap(
             modifier = Modifier
                 .padding(innerPadding)
-                .fillMaxSize()
-                .padding(horizontal = 16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Spacer(Modifier.height(16.dp))
+                .fillMaxSize(),
+            cameraPositionState = defaultCamera,
+            properties = MapProperties(
+                isMyLocationEnabled = hasLocationPermission
+            ),
+            uiSettings = MapUiSettings(
+                myLocationButtonEnabled = true
+            )
+        )
+        {
 
         }
     }
@@ -191,6 +341,296 @@ private fun TopSearchBar() {
         )
     }
 }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MapSearchBar() {
+    var text by remember { mutableStateOf("") }
+
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .statusBarsPadding()
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        shape = RoundedCornerShape(28.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant
+    ) {
+        TextField(
+            value = text,
+            onValueChange = { text = it },
+            placeholder = { Text("Hinted search text") },
+            leadingIcon = { Icon(Icons.Filled.Menu, contentDescription = "Menu") },
+            trailingIcon = { Icon(Icons.Filled.Search, contentDescription = "Search") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            colors = TextFieldDefaults.colors(
+                focusedContainerColor = Color.Transparent,
+                unfocusedContainerColor = Color.Transparent,
+                disabledContainerColor = Color.Transparent,
+                focusedIndicatorColor = Color.Transparent,
+                unfocusedIndicatorColor = Color.Transparent,
+                disabledIndicatorColor = Color.Transparent
+            )
+        )
+    }
+}
+
+
+@Composable
+fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
+    val cafe = remember(cafeId) { CafeRepository.getCafe(cafeId) } // When we have a real cafeID from backend, plug in here
+    val reviews = ReviewRepository.reviewsFor(cafeId)
+
+    Scaffold(
+        bottomBar = { BottomNavBar(navController) },
+        containerColor = Color.White
+    ) { innerPadding ->
+
+        if (cafe == null) {
+            Box(
+                modifier = Modifier
+                    .padding(innerPadding)
+                    .fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Text("Cafe not found")
+            }
+            return@Scaffold
+        }
+
+        LazyColumn(
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize()
+                .padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item { Spacer(Modifier.height(8.dp)) }
+
+            item {
+                Text(
+                    text = cafe.name,
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.fillMaxWidth(),
+                    textAlign = TextAlign.Center
+                )
+            }
+
+            item { Text("Address: ${cafe.address}", style = MaterialTheme.typography.bodyMedium) }
+            item { Text("Phone: ${cafe.phone}", style = MaterialTheme.typography.bodyMedium) }
+            item { Text(cafe.status, style = MaterialTheme.typography.bodyMedium) }
+
+            // Hours dropdown row
+            item { HoursDropdown(hours = cafe.hours) }
+
+            // Menu row
+            item {
+                OutlinedCard(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(4.dp),
+                    border = androidx.compose.foundation.BorderStroke(1.dp, Color.Black),
+                    colors = CardDefaults.outlinedCardColors(containerColor = Color.White)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 12.dp, vertical = 14.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Menu",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            modifier = Modifier.weight(1f)
+                        )
+                        Icon(Icons.Filled.PlayArrow, contentDescription = "Open Menu")
+                    }
+                }
+            }
+
+            // Features
+            item {
+                Text(
+                    text = "Features:",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            items(cafe.features) { feature ->
+                Text(text = "• $feature", style = MaterialTheme.typography.bodyMedium)
+            }
+
+            // Ambience
+            item {
+                Spacer(Modifier.height(6.dp))
+                Text(
+                    text = "Ambience:",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            items(cafe.ambience) { amb ->
+                Text(text = "• $amb", style = MaterialTheme.typography.bodyMedium)
+            }
+
+            // Reviews header + button
+            item {
+                Spacer(Modifier.height(18.dp))
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Reviews:",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f)
+                    )
+
+                    TextButton(
+                        onClick = { navController.navigate(Screen.WriteReview.createRoute(cafeId)) }
+                    ) {
+                        Text("Write review")
+                    }
+                }
+            }
+
+            // Reviews list
+            if (reviews.isEmpty()) {
+                item {
+                    Text(
+                        text = "No reviews yet.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = Color.Gray
+                    )
+                }
+            } else {
+                items(reviews) { review ->
+                    OutlinedCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(6.dp)
+                    ) {
+                        Text(
+                            text = review,
+                            modifier = Modifier.padding(12.dp),
+                            style = MaterialTheme.typography.bodyMedium
+                        )
+                    }
+                }
+            }
+
+            item { Spacer(Modifier.height(24.dp)) }
+        }
+    }
+}
+
+@Composable
+private fun HoursDropdown(hours: LinkedHashMap<String, String>) {
+    var expanded by remember { mutableStateOf(false) }
+    val days = remember(hours) { hours.keys.toList() }
+    var selectedDay by rememberSaveable { mutableStateOf(days.firstOrNull() ?: "Thursday") }
+
+    val selectedHours = hours[selectedDay] ?: ""
+    val label = if (selectedHours.isNotBlank()) {
+        "Hours: $selectedDay: $selectedHours"
+    } else {
+        "Hours"
+    }
+
+    Box(modifier = Modifier.fillMaxWidth()) {
+        OutlinedCard(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable { expanded = true },
+            shape = RoundedCornerShape(4.dp),
+            border = androidx.compose.foundation.BorderStroke(1.dp, Color.Black),
+            colors = CardDefaults.outlinedCardColors(containerColor = Color.White)
+        ) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.weight(1f)
+                )
+                Icon(Icons.Filled.ArrowDropDown, contentDescription = "Expand Hours")
+            }
+        }
+
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            days.forEach { day ->
+                DropdownMenuItem(
+                    text = { Text("$day: ${hours[day]}") },
+                    onClick = {
+                        selectedDay = day
+                        expanded = false
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+fun WriteReviewScreen(navController: NavHostController, cafeId: String) {
+    var reviewText by rememberSaveable { mutableStateOf("") }
+
+    Scaffold(
+        bottomBar = { BottomNavBar(navController) },
+        containerColor = Color.White
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize()
+                .padding(horizontal = 16.dp, vertical = 12.dp)
+        ) {
+            OutlinedTextField(
+                value = reviewText,
+                onValueChange = { reviewText = it },
+                placeholder = { Text("Write a review...") },
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .weight(1f),
+                singleLine = false,
+                maxLines = Int.MAX_VALUE
+            )
+
+            Spacer(Modifier.height(12.dp))
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.End
+            ) {
+                TextButton(onClick = { navController.popBackStack() }) {
+                    Text("Cancel")
+                }
+                Spacer(Modifier.width(8.dp))
+                Button(
+                    onClick = {
+                        val trimmed = reviewText.trim()
+                        if (trimmed.isNotEmpty()) {
+                            ReviewRepository.addReview(cafeId, trimmed)
+                        }
+                        navController.popBackStack()
+                    },
+                    enabled = reviewText.trim().isNotEmpty()
+                ) {
+                    Text("Post")
+                }
+            }
+        }
+    }
+}
+
 
 @Composable
 private fun PlaceSaved() {
@@ -322,11 +762,14 @@ private fun PlaceSaved() {
     }
 }
 
-
 @Composable
-private fun PlaceCard() {
+private fun PlaceCard(navController: NavHostController, cafe: Cafe) {
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable {
+                navController.navigate(Screen.CafeDetails.createRoute(cafe.id))
+            },
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = Color.White),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
@@ -337,16 +780,13 @@ private fun PlaceCard() {
                     .fillMaxWidth()
                     .height(220.dp)
             ) {
-                // Put an image named "starbucks.jpg/png/webp" in:
-                // app/src/main/res/drawable/
-                Image(
-                    painter = painterResource(id = R.drawable.ic_launcher_foreground),
-                    contentDescription = "Place photo",
+                AsyncImage(
+                    model = cafe.imageUrl ?: cafe.imageResId,
+                    contentDescription = "${cafe.name} photo",
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
                 )
 
-                // gradient at bottom
                 Box(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -358,45 +798,11 @@ private fun PlaceCard() {
                             )
                         )
                 )
-
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .align(Alignment.BottomCenter)
-                        .padding(12.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Icon(
-                        imageVector = Icons.Filled.Search,
-                        contentDescription = null,
-                        tint = Color.White
-                    )
-                    Spacer(Modifier.width(8.dp))
-                    Text(
-                        text = "More like this",
-                        color = Color.White,
-                        style = MaterialTheme.typography.bodyMedium,
-                        modifier = Modifier.weight(1f)
-                    )
-
-                    Surface(
-                        shape = CircleShape,
-                        color = Color.White.copy(alpha = 0.25f)
-                    ) {
-                        IconButton(onClick = { /* TODO share */ }) {
-                            Icon(
-                                imageVector = Icons.Filled.Share,
-                                contentDescription = "Share",
-                                tint = Color.White
-                            )
-                        }
-                    }
-                }
             }
 
             Column(modifier = Modifier.padding(12.dp)) {
                 Text(
-                    text = "Starbucks",
+                    text = cafe.name,
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.SemiBold
                 )
@@ -416,12 +822,7 @@ private fun PlaceCard() {
                 }
 
                 Spacer(Modifier.height(4.dp))
-
-                Text(
-                    text = "Fullerton",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = Color.Black
-                )
+                Text(text = cafe.address, style = MaterialTheme.typography.bodyMedium, color = Color.Black)
             }
         }
     }
