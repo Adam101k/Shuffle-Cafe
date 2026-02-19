@@ -1,5 +1,7 @@
 package com.example.shuffle_cafe
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -24,21 +26,47 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.rememberNavController
 import com.example.shuffle_cafe.ui.theme.Shuffle_CafeTheme
 import androidx.navigation.compose.composable
+import com.google.maps.android.compose.GoogleMap
+import com.google.maps.android.compose.MapProperties
+import com.google.maps.android.compose.MapUiSettings
+import androidx.activity.result.contract.ActivityResultContracts
+import com.google.android.gms.maps.model.CameraPosition
+import com.google.maps.android.compose.rememberCameraPositionState
+import androidx.compose.runtime.LaunchedEffect
+import com.google.android.gms.maps.model.LatLng
+import android.location.Location
+import com.google.android.gms.location.LocationServices
+import com.google.android.gms.maps.CameraUpdate
+import com.google.android.gms.maps.CameraUpdateFactory
 
 class MainActivity : ComponentActivity() {
+
+    private val requestPermissionLauncher =
+        registerForActivityResult(
+            ActivityResultContracts.RequestPermission()
+        ) { isGranted ->
+            // You can handle result here if needed
+        }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        requestPermissionLauncher.launch(
+            Manifest.permission.ACCESS_FINE_LOCATION
+        )
 
         setContent {
             Shuffle_CafeTheme {
@@ -67,7 +95,7 @@ fun AppNav(){
 @Composable
 fun MainScreen(navController: NavHostController) {
     Scaffold(
-        topBar = { TopSearchBar() },
+        topBar = { MapSearchBar() },
         bottomBar = { BottomNavBar(navController) },
         containerColor = Color.White
     ) { innerPadding ->
@@ -87,18 +115,44 @@ fun MainScreen(navController: NavHostController) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MapScreen(navController: NavHostController) {
+    val context = LocalContext.current
+    val fusedLocationClient = remember {
+        LocationServices.getFusedLocationProviderClient(context)
+    }
+    val hasLocationPermission = ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.ACCESS_FINE_LOCATION
+    ) == PackageManager.PERMISSION_GRANTED
+    val defaultCamera = rememberCameraPositionState()
+
+    LaunchedEffect(hasLocationPermission){
+        if(hasLocationPermission) {
+            fusedLocationClient.lastLocation.addOnSuccessListener { location -> location?.let{
+                val userLatlng = LatLng(it.latitude, it.longitude)
+
+                defaultCamera.move(CameraUpdateFactory.newLatLngZoom(userLatlng, 17f)
+                )
+            }
+            }
+        }
+    }
     Scaffold(
         topBar = { TopSearchBar() },
         bottomBar = {BottomNavBar(navController) },
     ) { innerPadding ->
-        Column(
+        GoogleMap(
             modifier = Modifier
                 .padding(innerPadding)
-                .fillMaxSize()
-                .padding(horizontal = 16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Spacer(Modifier.height(16.dp))
+                .fillMaxSize(),
+            cameraPositionState = defaultCamera,
+            properties = MapProperties(
+                isMyLocationEnabled = hasLocationPermission
+            ),
+            uiSettings = MapUiSettings(
+                myLocationButtonEnabled = true
+            )
+        )
+        {
 
         }
     }
@@ -135,6 +189,40 @@ private fun TopSearchBar() {
         )
     }
 }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MapSearchBar() {
+    var text by remember { mutableStateOf("") }
+
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .statusBarsPadding()
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        shape = RoundedCornerShape(28.dp),
+        color = MaterialTheme.colorScheme.surfaceVariant
+    ) {
+        TextField(
+            value = text,
+            onValueChange = { text = it },
+            placeholder = { Text("Hinted search text") },
+            leadingIcon = { Icon(Icons.Filled.Menu, contentDescription = "Menu") },
+            trailingIcon = { Icon(Icons.Filled.Search, contentDescription = "Search") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+            colors = TextFieldDefaults.colors(
+                focusedContainerColor = Color.Transparent,
+                unfocusedContainerColor = Color.Transparent,
+                disabledContainerColor = Color.Transparent,
+                focusedIndicatorColor = Color.Transparent,
+                unfocusedIndicatorColor = Color.Transparent,
+                disabledIndicatorColor = Color.Transparent
+            )
+        )
+    }
+}
+
 
 @Composable
 private fun PlaceCard() {
