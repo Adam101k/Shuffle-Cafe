@@ -1,7 +1,10 @@
 package com.example.shuffle_cafe
 
 import android.os.Bundle
+import android.net.Uri
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Image
@@ -19,6 +22,10 @@ import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Star
 import androidx.compose.material.icons.filled.Bookmark
+import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.Group
+import androidx.compose.material.icons.filled.Notifications
+import androidx.compose.material.icons.filled.BookmarkBorder
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -31,11 +38,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.NavHostController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.rememberNavController
 import com.example.shuffle_cafe.ui.theme.Shuffle_CafeTheme
 import androidx.navigation.compose.composable
+import coil.compose.AsyncImage
 import io.github.jan.supabase.auth.Auth
 import io.github.jan.supabase.createSupabaseClient
 import io.github.jan.supabase.postgrest.Postgrest
@@ -80,6 +90,9 @@ fun AppNav(){
         }
         composable(route = Screen.BookmarkScreen.route) {
             BookmarkScreen(navController = navController)
+        }
+        composable(Screen.ProfileScreen.route) {
+            ProfileScreen(navController)
         }
 
     }
@@ -429,31 +442,210 @@ private fun RatingStars(rating: Float) {
 
 @Composable
 private fun BottomNavBar(navController: NavHostController) {
+    val navBackStackEntry by navController.currentBackStackEntryAsState()
+    val currentRoute = navBackStackEntry?.destination?.route
+
     NavigationBar {
         NavigationBarItem(
-            selected = true,
+            selected = currentRoute == Screen.MainScreen.route,
             onClick = {navController.navigate(Screen.MainScreen.route) },
             icon = { Icon(Icons.Filled.Search, contentDescription = "Search") }
         )
         NavigationBarItem(
-            selected = false,
+            selected = currentRoute == Screen.MapScreen.route,
             onClick = { navController.navigate(Screen.MapScreen.route) },
             icon = { Icon(Icons.Filled.Place, contentDescription = "Map") }
         )
 
         NavigationBarItem(
-            selected = false,
+            selected = currentRoute == Screen.BookmarkScreen.route,
             onClick = { navController.navigate(Screen.BookmarkScreen.route) },
             icon = { Icon(Icons.Filled.Bookmark, contentDescription = "Bookmarks") }
         )
 
         NavigationBarItem(
-            selected = false,
-            onClick = { },
+            selected = currentRoute == Screen.ProfileScreen.route,
+            onClick = { navController.navigate(Screen.ProfileScreen.route) },
             icon = { Icon(Icons.Filled.Person, contentDescription = "Profile") }
         )
     }
 }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun ProfileScreen(navController: NavHostController) {
+
+    //profile picture state
+    var avatarUri by remember { mutableStateOf<Uri?>(null) }
+
+    val pickImage = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+        avatarUri = uri
+    }
+
+    Scaffold(
+        bottomBar = { BottomNavBar(navController) },
+        containerColor = Color.White
+    ) { innerPadding ->
+
+        LazyColumn(
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize()
+                .padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+
+            //notifications icon
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    IconButton(onClick = { }) {
+                        Icon(
+                            Icons.Filled.Notifications,
+                            contentDescription = "Notifications"
+                        )
+                    }
+                }
+            }
+
+            //avatar + username
+            item {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+
+                    Surface(
+                        shape = CircleShape,
+                        modifier = Modifier.size(72.dp),
+                        color = Color(0xFFEDE7FF),
+                        onClick = { pickImage.launch("image/*") }
+                    ) {
+                        if (avatarUri == null) {
+                            Box(contentAlignment = Alignment.Center) {
+                                Icon(
+                                    Icons.Filled.Person,
+                                    contentDescription = "Profile picture",
+                                    modifier = Modifier.size(32.dp),
+                                    tint = Color(0xFF6B4EFF)
+                                )
+                            }
+                        } else {
+                            AsyncImage(
+                                model = avatarUri,
+                                contentDescription = "Profile picture",
+                                modifier = Modifier.fillMaxSize()
+                            )
+                        }
+                    }
+
+                    Spacer(Modifier.height(8.dp))
+
+                    Text(
+                        text = "User",
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+
+            //quick actions
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    ProfileAction(Icons.Filled.Star, "Review")
+                    ProfileAction(Icons.Filled.CameraAlt, "Photos")
+                    ProfileAction(Icons.Filled.Group, "Groups")
+                }
+            }
+            // experience
+            item {
+                Text(
+                    text = "Experience",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            item {
+                OutlinedCard(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(80.dp),
+                    shape = RoundedCornerShape(8.dp)
+                ) {}
+            }
+            //recently viewed
+            item {
+                Text(
+                    text = "Recently View",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+            }
+            items(
+                listOf(
+                    "Klatch Coffee" to "13855 City Center Dr #3015...",
+                    "Aroma Craft Coffee" to "20265 Valley Blvd Ste Q..."
+                )
+            ) { item ->
+                RecentItemRow(item.first, item.second)
+            }
+        }
+    }
+}
+
+@Composable
+private fun ProfileAction(
+    icon: ImageVector,
+    label: String
+) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Icon(icon, contentDescription = label, modifier = Modifier.size(28.dp))
+        Spacer(Modifier.height(4.dp))
+        Text(text = label, style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+private fun RecentItemRow(name: String, address: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Surface(
+            modifier = Modifier.size(44.dp),
+            shape = RoundedCornerShape(8.dp),
+            color = Color(0xFFF0F0F0)
+        ) {}
+
+        Spacer(Modifier.width(12.dp))
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(name, fontWeight = FontWeight.SemiBold)
+            Text(
+                address,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.Gray
+            )
+        }
+
+        IconButton(onClick = { }) {
+            Icon(
+                Icons.Filled.BookmarkBorder,
+                contentDescription = "Bookmark"
+            )
+        }
+    }
+}
+
+
+
 
 @Preview(showBackground = true, showSystemUi = true)
 @Composable
