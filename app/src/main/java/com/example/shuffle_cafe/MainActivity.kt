@@ -6,6 +6,7 @@ import android.os.Bundle
 import android.net.Uri
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Image
@@ -88,6 +89,7 @@ val supabase = createSupabaseClient(
     install(Auth)
     install(Postgrest)
 }
+import com.example.shuffle_cafe.ui.screens.LoginScreen // Import LoginScreen
 
 data class Cafe(
     val id: String,
@@ -191,6 +193,16 @@ fun AppNav(){
     val navController = rememberNavController()
     NavHost(navController = navController, startDestination = Screen.MainScreen.route) {
 
+    // Placeholder for login status. In a real app, this would come from a data source.
+    val isUserLoggedIn by remember { mutableStateOf(false) }
+
+    NavHost(
+        navController = navController,
+        startDestination = if (isUserLoggedIn) Screen.MainScreen.route else Screen.LoginScreen.route
+    ) {
+        composable(route = Screen.LoginScreen.route) {
+            LoginScreen(navController = navController)
+        }
         composable(route = Screen.MainScreen.route) {
             MainScreen(navController = navController)
         }
@@ -872,6 +884,9 @@ private fun BottomNavBar(navController: NavHostController) {
             selected = currentRoute == Screen.BookmarkScreen.route,
             onClick = { navController.navigate(Screen.BookmarkScreen.route) },
             icon = { Icon(Icons.Filled.Bookmark, contentDescription = "Bookmarks") }
+            selected = false,
+            onClick = { },
+            icon = { Icon(Icons.Filled.Bookmark, contentDescription = "Saved") }
         )
 
         NavigationBarItem(
