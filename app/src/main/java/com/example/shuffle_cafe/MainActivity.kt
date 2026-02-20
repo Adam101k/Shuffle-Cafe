@@ -11,6 +11,7 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable // Added import for clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -28,8 +29,12 @@ import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.Group
 import androidx.compose.material.icons.filled.Notifications
 import androidx.compose.material.icons.filled.BookmarkBorder
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
@@ -38,6 +43,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
@@ -61,12 +67,12 @@ import android.location.Location
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.maps.CameraUpdate
 import com.google.android.gms.maps.CameraUpdateFactory
-//import coil.compose.AsyncImage
-//import io.github.jan.supabase.auth.Auth
-//import io.github.jan.supabase.createSupabaseClient
-//import io.github.jan.supabase.postgrest.Postgrest
-//import io.github.jan.supabase.postgrest.from
-//import io.ktor.websocket.WebSocketDeflateExtension.Companion.install
+import coil.compose.AsyncImage
+// import io.github.jan.supabase.auth.Auth
+// import io.github.jan.supabase.createSupabaseClient
+// import io.github.jan.supabase.postgrest.Postgrest
+// import io.github.jan.supabase.postgrest.from
+// import io.ktor.websocket.WebSocketDeflateExtension.Companion.install
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -75,20 +81,16 @@ import com.example.shuffle_cafe.ui.screens.LoginScreen // Moved import to top
 // Removed: import com.example.shuffle_cafe.ui.screens.BookmarkScreen // Removed incorrect import
 // Removed: import com.example.shuffle_cafe.ui.screens.ProfileScreen
 // Removed: import com.example.shuffle_cafe.ui.screens.MapScreen
-import androidx.compose.foundation.clickable
-import androidx.compose.runtime.saveable.rememberSaveable
-import androidx.compose.ui.text.style.TextAlign
 import androidx.navigation.NavType
 import androidx.navigation.navArgument
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.runtime.snapshots.SnapshotStateList
-import com.google.maps.android.compose.CameraPositionState
-import com.google.android.libraries.places.api.Places
+
 
 // val supabase = createSupabaseClient(
 // supabaseUrl = "https://sknyfkgltazosjmyjfhs.supabase.co",
- //   supabaseKey = "sb_publishable_dCrTJjMXS6bw1WDaqTtewg_amytqZMf"
+//   supabaseKey = "sb_publishable_dCrTJjMXS6bw1WDaqTtewg_amytqZMf"
 //) {
     //install(Auth)
    // install(Postgrest)
@@ -268,7 +270,6 @@ fun MapScreen(navController: NavHostController) {
     val fusedLocationClient = remember {
         LocationServices.getFusedLocationProviderClient(context)
     }
-    var destination by remember { mutableStateOf<LatLng?>(null) }
     val hasLocationPermission = ContextCompat.checkSelfPermission(
         context,
         Manifest.permission.ACCESS_FINE_LOCATION
@@ -330,7 +331,7 @@ fun BookmarkScreen(navController: NavHostController) {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun TopSearchBar() {
+fun TopSearchBar() {
     var text by remember { mutableStateOf("") }
 
     Surface(
@@ -551,7 +552,7 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
 }
 
 @Composable
-private fun HoursDropdown(hours: LinkedHashMap<String, String>) {
+fun HoursDropdown(hours: LinkedHashMap<String, String>) {
     var expanded by remember { mutableStateOf(false) }
     val days = remember(hours) { hours.keys.toList() }
     var selectedDay by rememberSaveable { mutableStateOf(days.firstOrNull() ?: "Thursday") }
@@ -658,7 +659,7 @@ fun WriteReviewScreen(navController: NavHostController, cafeId: String) {
 
 
 @Composable
-private fun PlaceSaved() {
+fun PlaceSaved() {
     val outlineColor = Color(0xFFE6E6E6)
     val itemSpacing = 12.dp
     val sectionSpacing = 22.dp
@@ -788,7 +789,7 @@ private fun PlaceSaved() {
 }
 
 @Composable
-private fun PlaceCard(navController: NavHostController, cafe: Cafe) {
+fun PlaceCard(navController: NavHostController, cafe: Cafe) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
@@ -888,7 +889,7 @@ private fun PlaceCard(navController: NavHostController, cafe: Cafe) {
 }
 
 @Composable
-private fun RatingStars(rating: Float) {
+fun RatingStars(rating: Float) {
     val fullStars = rating.toInt().coerceIn(0, 5)
     Row {
         repeat(fullStars) {
@@ -901,7 +902,7 @@ private fun RatingStars(rating: Float) {
 }
 
 @Composable
-private fun BottomNavBar(navController: NavHostController) {
+fun BottomNavBar(navController: NavHostController) {
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentRoute = navBackStackEntry?.destination?.route
 
@@ -1101,7 +1102,7 @@ private fun ProfileAction(
 }
 
 @Composable
-private fun RecentItemRow(name: String, address: String) {
+fun RecentItemRow(name: String, address: String) {
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically
