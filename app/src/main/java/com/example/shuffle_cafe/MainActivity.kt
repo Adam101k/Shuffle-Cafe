@@ -78,7 +78,8 @@ import androidx.navigation.navArgument
 import androidx.compose.material.icons.filled.ArrowDropDown
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.runtime.snapshots.SnapshotStateList
-
+import com.google.maps.android.compose.CameraPositionState
+import com.google.android.libraries.places.api.Places
 
 val supabase = createSupabaseClient(
     supabaseUrl = "https://sknyfkgltazosjmyjfhs.supabase.co",
@@ -169,7 +170,9 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
-
+        if (!Places.isInitialized()) {
+            Places.initialize(applicationContext, "AIzaSyC7QTmdJE2fnRXMiKWrMZftkXIG20gNWrA")
+        }
         requestPermissionLauncher.launch(
             Manifest.permission.ACCESS_FINE_LOCATION
         )
@@ -225,7 +228,7 @@ fun MainScreen(navController: NavHostController) {
     val cafe = CafeRepository.cafes.first() // sample
 
     Scaffold(
-        topBar = { MapSearchBar() },
+        topBar = { TopSearchBar() },
         bottomBar = { BottomNavBar(navController) },
         containerColor = Color.White
     ) { innerPadding ->
@@ -250,6 +253,7 @@ fun MapScreen(navController: NavHostController) {
     val fusedLocationClient = remember {
         LocationServices.getFusedLocationProviderClient(context)
     }
+    var destination by remember { mutableStateOf<LatLng?>(null) }
     val hasLocationPermission = ContextCompat.checkSelfPermission(
         context,
         Manifest.permission.ACCESS_FINE_LOCATION
@@ -268,7 +272,7 @@ fun MapScreen(navController: NavHostController) {
         }
     }
     Scaffold(
-        topBar = { TopSearchBar() },
+        topBar = {  MapSearchBar(defaultCamera) {latLng -> destination = latLng}  },
         bottomBar = {BottomNavBar(navController) },
     ) { innerPadding ->
         GoogleMap(
@@ -344,7 +348,8 @@ private fun TopSearchBar() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun MapSearchBar() {
+private fun MapSearchBar(cameraPosition: CameraPositionState, onLocationFound: (LatLng) -> Unit) {
+    val context = LocalContext.current
     var text by remember { mutableStateOf("") }
 
     Surface(
@@ -363,6 +368,11 @@ private fun MapSearchBar() {
             trailingIcon = { Icon(Icons.Filled.Search, contentDescription = "Search") },
             singleLine = true,
             modifier = Modifier.fillMaxWidth(),
+            keyboardActions = androidx.compose.foundation.text.KeyboardActions(
+                onDone = {
+                    val placesClient = Places.createClient(context)
+                }
+            ),
             colors = TextFieldDefaults.colors(
                 focusedContainerColor = Color.Transparent,
                 unfocusedContainerColor = Color.Transparent,

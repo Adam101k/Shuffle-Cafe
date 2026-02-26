@@ -69,4 +69,5 @@ dependencies {
     implementation("io.github.jan-tennert.supabase:postgrest-kt")
     implementation("io.github.jan-tennert.supabase:auth-kt")
     implementation("io.ktor:ktor-client-android:3.4.0")
+    implementation("com.google.android.libraries.places:places:3.5.0")
 }
