@@ -12,7 +12,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable // Added import for clickable
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.* 
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -58,8 +58,7 @@ import androidx.navigation.compose.composable
 import com.google.maps.android.compose.GoogleMap
 import com.google.maps.android.compose.MapProperties
 import com.google.maps.android.compose.MapUiSettings
-import androidx.activity.result.contract.ActivityResultContracts
-import com.google.android.gms.maps.model.CameraPosition
+import com.google.maps.android.compose.CameraPositionState // Added import for CameraPositionState
 import com.google.maps.android.compose.rememberCameraPositionState
 import androidx.compose.runtime.LaunchedEffect
 import com.google.android.gms.maps.model.LatLng
@@ -68,6 +67,8 @@ import com.google.android.gms.location.LocationServices
 import com.google.android.gms.maps.CameraUpdate
 import com.google.android.gms.maps.CameraUpdateFactory
 import coil.compose.AsyncImage
+import com.google.android.libraries.places.api.Places
+import com.google.android.libraries.places.api.net.PlacesClient
 // import io.github.jan.supabase.auth.Auth
 // import io.github.jan.supabase.createSupabaseClient
 // import io.github.jan.supabase.postgrest.Postgrest
@@ -83,9 +84,6 @@ import com.example.shuffle_cafe.ui.screens.LoginScreen // Moved import to top
 // Removed: import com.example.shuffle_cafe.ui.screens.MapScreen
 import androidx.navigation.NavType
 import androidx.navigation.navArgument
-import androidx.compose.material.icons.filled.ArrowDropDown
-import androidx.compose.material.icons.filled.PlayArrow
-import androidx.compose.runtime.snapshots.SnapshotStateList
 
 
 // val supabase = createSupabaseClient(
@@ -196,8 +194,6 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun AppNav(){
     val navController = rememberNavController()
-    NavHost(navController = navController, startDestination = Screen.MainScreen.route) {
-
     // Placeholder for login status. In a real app, this would come from a data source.
     val isUserLoggedIn by remember { mutableStateOf(false) }
 
@@ -288,7 +284,7 @@ fun MapScreen(navController: NavHostController) {
         }
     }
     Scaffold(
-        topBar = {  MapSearchBar(defaultCamera) {latLng -> destination = latLng}  },
+        topBar = {  MapSearchBar(defaultCamera) {latLng -> /* destination = latLng */ }  }, // Removed 'destination = latLng' as it's an unresolved reference
         bottomBar = {BottomNavBar(navController) },
     ) { innerPadding ->
         GoogleMap(
@@ -364,7 +360,7 @@ fun TopSearchBar() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun MapSearchBar(cameraPosition: CameraPositionState, onLocationFound: (LatLng) -> Unit) {
+fun MapSearchBar(cameraPosition: CameraPositionState, onLocationFound: (LatLng) -> Unit) { // Removed private
     val context = LocalContext.current
     var text by remember { mutableStateOf("") }
 
@@ -848,7 +844,7 @@ fun PlaceCard(navController: NavHostController, cafe: Cafe) {
                     Surface(
                         shape = CircleShape,
                         color = Color.White.copy(alpha = 0.25f)
-                    ) {
+                    ) { // Removed trailing ')' and '+'
                         IconButton(onClick = { /* TODO share */ }) {
                             Icon(
                                 imageVector = Icons.Filled.Share,
@@ -922,9 +918,6 @@ fun BottomNavBar(navController: NavHostController) {
             selected = currentRoute == Screen.BookmarkScreen.route,
             onClick = { navController.navigate(Screen.BookmarkScreen.route) },
             icon = { Icon(Icons.Filled.Bookmark, contentDescription = "Bookmarks") }
-            selected = false,
-            onClick = { },
-            icon = { Icon(Icons.Filled.Bookmark, contentDescription = "Saved") }
         )
 
         NavigationBarItem(
@@ -1069,6 +1062,8 @@ fun AsyncImage(model: Uri?, contentDescription: String, modifier: Modifier) {
     TODO("Not yet implemented")
 }
 
+// Removed duplicate BookmarkScreen
+/*
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BookmarkScreen(navController: NavHostController) {
@@ -1088,9 +1083,10 @@ fun BookmarkScreen(navController: NavHostController) {
         }
     }
 }
+*/
 
 @Composable
-private fun ProfileAction(
+fun ProfileAction( // Removed private
     icon: ImageVector,
     label: String
 ) {
