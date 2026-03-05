@@ -15,6 +15,7 @@ import androidx.compose.foundation.clickable // Added import for clickable
 import androidx.compose.foundation.layout.* 
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -63,20 +64,20 @@ import com.google.maps.android.compose.rememberCameraPositionState
 import androidx.compose.runtime.LaunchedEffect
 import com.google.android.gms.maps.model.LatLng
 import android.location.Location
+import android.provider.ContactsContract
+import androidx.compose.material.icons.filled.Photo
 import com.google.android.gms.location.LocationServices
 import com.google.android.gms.maps.CameraUpdate
 import com.google.android.gms.maps.CameraUpdateFactory
 import coil.compose.AsyncImage
 import com.google.android.libraries.places.api.Places
 import com.google.android.libraries.places.api.net.PlacesClient
-// import io.github.jan.supabase.auth.Auth
-// import io.github.jan.supabase.createSupabaseClient
-// import io.github.jan.supabase.postgrest.Postgrest
-// import io.github.jan.supabase.postgrest.from
-// import io.ktor.websocket.WebSocketDeflateExtension.Companion.install
-import kotlinx.coroutines.Dispatchers
+import io.github.jan.supabase.auth.Auth
+import io.github.jan.supabase.createSupabaseClient
+import io.github.jan.supabase.postgrest.Postgrest
+import io.github.jan.supabase.postgrest.from
+import io.github.jan.supabase.storage.storage
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 import kotlinx.serialization.Serializable
 import com.example.shuffle_cafe.ui.screens.LoginScreen // Moved import to top
 // Removed: import com.example.shuffle_cafe.ui.screens.BookmarkScreen // Removed incorrect import
@@ -84,15 +85,18 @@ import com.example.shuffle_cafe.ui.screens.LoginScreen // Moved import to top
 // Removed: import com.example.shuffle_cafe.ui.screens.MapScreen
 import androidx.navigation.NavType
 import androidx.navigation.navArgument
+import io.github.jan.supabase.auth.auth
+import io.github.jan.supabase.storage.Storage
 
 
-// val supabase = createSupabaseClient(
-// supabaseUrl = "https://sknyfkgltazosjmyjfhs.supabase.co",
-//   supabaseKey = "sb_publishable_dCrTJjMXS6bw1WDaqTtewg_amytqZMf"
-//) {
-    //install(Auth)
-   // install(Postgrest)
-//}
+val supabase = createSupabaseClient(
+    supabaseUrl = "https://sknyfkgltazosjmyjfhs.supabase.co",
+    supabaseKey = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InNrbnlma2dsdGF6b3NqbXlqZmhzIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzEzNjgzNTMsImV4cCI6MjA4Njk0NDM1M30.p3dCwqQz8iQnRsFw1VkllaWv2BGkc3K-ugqHfxaMiPE"
+) {
+    install(Auth)
+    install(Postgrest)
+    install(Storage)
+}
 
 data class Cafe(
     val id: String,
@@ -195,6 +199,9 @@ class MainActivity : ComponentActivity() {
 fun AppNav(){
     val navController = rememberNavController()
     // Placeholder for login status. In a real app, this would come from a data source.
+    //val currentUser = supabase.auth.currentUserOrNull()
+    //val isUserLoggedIn = currentUser != null
+
     val isUserLoggedIn by remember { mutableStateOf(false) }
 
     NavHost(
@@ -927,163 +934,340 @@ fun BottomNavBar(navController: NavHostController) {
         )
     }
 }
+@Serializable
+data class Profile(
+    val id: String,
+    val first_name: String,
+    val last_name: String,
+    val avatar_url: String? = null,
+    val bio: String? = null
+)
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileScreen(navController: NavHostController) {
 
-    //profile picture state
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+
+    var profile by remember { mutableStateOf<Profile?>(null) }
+    var bioText by remember { mutableStateOf("") }
     var avatarUri by remember { mutableStateOf<Uri?>(null) }
 
+    var isLoading by remember { mutableStateOf(true) }
+
+    // Pick image + upload to DB
     val pickImage = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri ->
-        avatarUri = uri
+
+        if (uri != null) {
+            avatarUri = uri
+
+            scope.launch {
+
+                val user = supabase.auth.currentUserOrNull()
+                if (user == null) return@launch
+
+                try {
+                    val inputStream = context.contentResolver.openInputStream(uri)
+                    val bytes = inputStream?.readBytes() ?: return@launch
+
+                    val fileName = "${user.id}.png"
+
+                    // Upload to storage
+                    supabase.storage
+                        .from("avatars")
+                        .upload(
+                            path = fileName,
+                            data = bytes
+                        ) {
+                            upsert = true
+                        }
+
+                    println("Upload success!")
+
+                    val publicUrl = supabase.storage
+                        .from("avatars")
+                        .publicUrl(fileName)
+
+                    // Save URL in profiles table
+                    supabase.from("profiles")
+                        .update(mapOf("avatar_url" to publicUrl)) {
+                            filter {
+                                eq("id", user.id)
+                            }
+                        }
+
+                    // update profile?? might not be needed
+                    profile = profile?.copy(avatar_url = publicUrl)
+
+                } catch (e: Exception) {
+                    println("Upload failed: ${e.message}")
+                    e.printStackTrace()
+                }
+            }
+        }
     }
 
-    Scaffold(
-        bottomBar = { BottomNavBar(navController) },
-        containerColor = Color.White
-    ) { innerPadding ->
+    // Fetch the profile
+    LaunchedEffect(Unit) {
+        val user = supabase.auth.currentUserOrNull()
 
-        LazyColumn(
-            modifier = Modifier
-                .padding(innerPadding)
-                .fillMaxSize()
-                .padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
+        if (user != null) {
+            try {
+                val result = supabase
+                    .from("profiles")
+                    .select {
+                        filter {
+                            eq("id", user.id)
+                        }
+                    }
+                    .decodeSingle<Profile>()
+
+                profile = result
+                bioText = result.bio ?: ""
+
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        isLoading = false;
+    }
+
+    if (isLoading) {
+
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
         ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator()
+                Spacer(modifier = Modifier.height(12.dp))
+                Text("Loading profile...")
+            }
+        }
 
-            //notifications icon
-            item {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End
-                ) {
-                    IconButton(onClick = { }) {
+    }
+
+    else {
+        Scaffold(
+            bottomBar = { BottomNavBar(navController) },
+            containerColor = Color.White
+        ) { innerPadding ->
+
+            LazyColumn(
+                modifier = Modifier
+                    .padding(innerPadding)
+                    .fillMaxSize()
+                    .padding(horizontal = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+
+                // Notifications
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        IconButton(onClick = { }) {
+                            Icon(
+                                Icons.Filled.Notifications,
+                                contentDescription = "Notifications"
+                            )
+                        }
+                    }
+                }
+
+                // Avatar + Name
+                item {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+
+                        Surface(
+                            shape = CircleShape,
+                            modifier = Modifier.size(72.dp),
+                            color = Color(0xFFEDE7FF),
+                            onClick = { pickImage.launch("image/*") }
+                        ) {
+
+                            when {
+                                avatarUri != null -> {
+                                    AsyncImage(
+                                        model = avatarUri,
+                                        contentDescription = "Profile picture",
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+
+                                profile?.avatar_url != null -> {
+                                    AsyncImage(
+                                        model = "${profile?.avatar_url}?t=${System.currentTimeMillis()}",
+                                        contentDescription = "Profile picture",
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+
+                                else -> {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            Icons.Filled.Person,
+                                            contentDescription = "Profile picture",
+                                            modifier = Modifier.size(32.dp),
+                                            tint = Color(0xFF6B4EFF)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+
+                        Text(
+                            text = profile?.let {
+                                val first = it.first_name.takeIf { it.isNotBlank() } ?: ""
+                                val last = it.last_name.takeIf { it.isNotBlank() } ?: ""
+                                if (first.isNotEmpty() || last.isNotEmpty()) "$first $last" else "User"
+                            } ?: "User",
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+
+                // Quick Actions
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly
+                    ) {
+                        ProfileAction(Icons.Filled.Star, "Review")
+                        ProfileAction(Icons.Filled.CameraAlt, "Photos")
+                        ProfileAction(Icons.Filled.Group, "Groups")
+                    }
+                }
+
+                // Experience Title
+                item {
+                    Text(
+                        text = "Experience",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                // Bio/ experience
+                item {
+                    OutlinedCard(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(80.dp),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+
+                        TextField(
+                            value = bioText,
+                            onValueChange = { bioText = it },
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(horizontal = 8.dp),
+                            placeholder = { Text("Tell us about yourself...") },
+                            colors = TextFieldDefaults.colors(
+                                focusedContainerColor = Color.Transparent,
+                                unfocusedContainerColor = Color.Transparent
+                            )
+                        )
+                    }
+                }
+
+                // Save Bio
+                item {
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                val user = supabase.auth.currentUserOrNull()
+                                if (user != null) {
+                                    supabase.from("profiles")
+                                        .update(mapOf("bio" to bioText)) {
+                                            filter {
+                                                eq("id", user.id)
+                                            }
+                                        }
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Save")
+                    }
+                }
+
+                // Recently viewed
+                item {
+                    Text(
+                        text = "Recently View",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                items(
+                    listOf(
+                        "Klatch Coffee" to "13855 City Center Dr #3015...",
+                        "Aroma Craft Coffee" to "20265 Valley Blvd Ste Q..."
+                    )
+                ) { item ->
+                    RecentItemRow(item.first, item.second)
+                }
+
+                item {
+
+                    Spacer(modifier = Modifier.height(32.dp))
+
+                    OutlinedButton(
+                        onClick = {
+                            scope.launch {
+                                supabase.auth.signOut()
+                                navController.navigate(Screen.LoginScreen.route) {
+                                    popUpTo(0) { inclusive = true }
+                                }
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, Color.Red),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = Color.Transparent
+                        )
+                    ) {
                         Icon(
-                            Icons.Filled.Notifications,
-                            contentDescription = "Notifications"
+                            imageVector = Icons.Filled.Person, // or Icons.Filled.ExitToApp
+                            contentDescription = "Logout",
+                            tint = Color.Red
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Logout",
+                            color = Color.Red,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold
                         )
                     }
                 }
             }
-
-            //avatar + username
-            item {
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-
-                    Surface(
-                        shape = CircleShape,
-                        modifier = Modifier.size(72.dp),
-                        color = Color(0xFFEDE7FF),
-                        onClick = { pickImage.launch("image/*") }
-                    ) {
-                        if (avatarUri == null) {
-                            Box(contentAlignment = Alignment.Center) {
-                                Icon(
-                                    Icons.Filled.Person,
-                                    contentDescription = "Profile picture",
-                                    modifier = Modifier.size(32.dp),
-                                    tint = Color(0xFF6B4EFF)
-                                )
-                            }
-                        } else {
-                            AsyncImage(
-                                model = avatarUri,
-                                contentDescription = "Profile picture",
-                                modifier = Modifier.fillMaxSize()
-                            )
-                        }
-                    }
-
-                    Spacer(Modifier.height(8.dp))
-
-                    Text(
-                        text = "User",
-                        style = MaterialTheme.typography.headlineSmall,
-                        fontWeight = FontWeight.SemiBold
-                    )
-                }
-            }
-
-            //quick actions
-            item {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.SpaceEvenly
-                ) {
-                    ProfileAction(Icons.Filled.Star, "Review")
-                    ProfileAction(Icons.Filled.CameraAlt, "Photos")
-                    ProfileAction(Icons.Filled.Group, "Groups")
-                }
-            }
-            // experience
-            item {
-                Text(
-                    text = "Experience",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-            item {
-                OutlinedCard(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(80.dp),
-                    shape = RoundedCornerShape(8.dp)
-                ) {}
-            }
-            //recently viewed
-            item {
-                Text(
-                    text = "Recently View",
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold
-                )
-            }
-            items(
-                listOf(
-                    "Klatch Coffee" to "13855 City Center Dr #3015...",
-                    "Aroma Craft Coffee" to "20265 Valley Blvd Ste Q..."
-                )
-            ) { item ->
-                RecentItemRow(item.first, item.second)
-            }
         }
     }
 }
 
-@Composable
-fun AsyncImage(model: Uri?, contentDescription: String, modifier: Modifier) {
-    TODO("Not yet implemented")
-}
-
-// Removed duplicate BookmarkScreen
-/*
-@OptIn(ExperimentalMaterial3Api::class)
-@Composable
-fun BookmarkScreen(navController: NavHostController) {
-    Scaffold(
-        bottomBar = { BottomNavBar(navController) },
-        containerColor = Color.White
-    ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .padding(innerPadding)
-                .fillMaxSize()
-                .padding(horizontal = 16.dp),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center
-        ) {
-            Text("Bookmark Screen", style = MaterialTheme.typography.headlineMedium)
-        }
-    }
-}
-*/
+//@Composable
+//fun AsyncImage(model: Uri?, contentDescription: String, modifier: Modifier) {
+  //  TODO("Not yet implemented")
+//}
 
 @Composable
 fun ProfileAction( // Removed private
@@ -1128,7 +1312,6 @@ fun RecentItemRow(name: String, address: String) {
         }
     }
 }
-
 
 
 
