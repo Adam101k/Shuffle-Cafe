@@ -808,7 +808,7 @@ fun HoursDropdown(hours: LinkedHashMap<String, String>) {
 @Composable
 fun WriteReviewScreen(navController: NavHostController, cafeId: String) {
     var text by rememberSaveable { mutableStateOf("") }
-    Scaffold(bottomBar = { BottomNavBar(navController) }, containerColor = Color.White) { innerPadding ->
+    Scaffold(bottomBar = { BottomNavBar(navController) }, containerColor = Color(0xFFC79A87)) { innerPadding ->
         Column(modifier = Modifier.padding(innerPadding).fillMaxSize().padding(16.dp)) {
             OutlinedTextField(text, { text = it }, placeholder = { Text("Write a review...") }, modifier = Modifier.fillMaxWidth().weight(1f))
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
