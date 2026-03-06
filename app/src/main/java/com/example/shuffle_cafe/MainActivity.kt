@@ -494,38 +494,10 @@ fun MapScreen(navController: NavHostController) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BookmarkScreen(navController: NavHostController) {
-    val savedCafes = BookmarkRepository.cafes()
-
-    Scaffold(
-        topBar = { TopSearchBar() },
-        bottomBar = { BottomNavBar(navController) },
-        containerColor = Color.White
-    ) { innerPadding ->
-        Column(
-            modifier = Modifier
-                .padding(innerPadding)
-                .fillMaxSize()
-                .padding(horizontal = 16.dp)
-        ) {
-            Spacer(Modifier.height(12.dp))
-            Text("Saved", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
-            Spacer(Modifier.height(12.dp))
-
-            if (savedCafes.isEmpty()) {
-                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-                    Text("No saved cafes yet. Open a cafe and tap the bookmark.")
-                }
-            } else {
-                LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                    items(savedCafes, key = { it.id }) { cafe ->
-                        SavedCafeRow(
-                            cafe = cafe,
-                            onOpen = { navController.navigate(Screen.CafeDetails.createRoute(cafe.id)) },
-                            onRemove = { BookmarkRepository.remove(cafe.id) }
-                        )
-                    }
-                }
-            }
+    Scaffold(topBar = { TopSearchBar() }, bottomBar = { BottomNavBar(navController) }) { innerPadding ->
+        Column(modifier = Modifier.padding(innerPadding).fillMaxSize().padding(horizontal = 16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+            Spacer(Modifier.height(16.dp))
+            PlaceSaved(navController)
         }
     }
 }
@@ -537,7 +509,7 @@ fun SavedCafeRow(
     onRemove: () -> Unit
 ) {
     OutlinedCard(
-        modifier = Modifier.fillMaxWidth().clickable { onOpen() },
+        modifier = Modifier.fillMaxWidth(),
         shape = RoundedCornerShape(12.dp)
     ) {
         Row(
@@ -778,12 +750,16 @@ fun WriteReviewScreen(navController: NavHostController, cafeId: String) {
 }
 
 @Composable
-fun PlaceSaved() {
+fun PlaceSaved(navController: NavHostController) {
     val outlineColor = Color(0xFFE6E6E6)
+    val savedCafes = BookmarkRepository.cafes()
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(22.dp)) {
         Column {
             Text("Saved", fontWeight = FontWeight.SemiBold); Spacer(Modifier.height(4.dp)); Box(Modifier.width(80.dp).height(1.dp).background(outlineColor))
-            Spacer(Modifier.height(10.dp)); Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) { SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f), true) }
+            Spacer(Modifier.height(10.dp)); Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            if (savedCafes.isEmpty()) { SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f), true) }
+            else { savedCafes.take(3).forEach { cafe -> SavedCafeTile(cafe = cafe, navController = navController, modifier = Modifier.weight(1f)) }; if (savedCafes.size < 3) { repeat(3 - savedCafes.size) { if (savedCafes.size + it == 2) SavedTile(Modifier.weight(1f), true) else SavedTile(Modifier.weight(1f)) } } }
+        }
         }
         Column {
             Text("Collection", fontWeight = FontWeight.SemiBold); Spacer(Modifier.height(4.dp)); Box(Modifier.width(80.dp).height(1.dp).background(outlineColor))
@@ -803,22 +779,31 @@ fun SavedTile(modifier: Modifier = Modifier, plus: Boolean = false) {
 }
 
 @Composable
+fun SavedCafeTile(cafe: Cafe, navController: NavHostController, modifier: Modifier = Modifier) {
+    val outlineColor = Color(0xFFE6E6E6)
+    OutlinedCard(modifier = modifier.aspectRatio(1f), shape = RoundedCornerShape(4.dp), border = BorderStroke(1.dp, outlineColor)) { Box(modifier = Modifier.fillMaxSize()) { Box(modifier = Modifier.fillMaxSize().clickable { navController.navigate(Screen.CafeDetails.createRoute(cafe.id)) }) { AsyncImage(model = cafe.imageBitmap ?: cafe.imageUrl ?: cafe.imageResId, contentDescription = cafe.name, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }; IconButton(onClick = { BookmarkRepository.toggle(cafe.id) }, modifier = Modifier.align(Alignment.TopEnd)) { Icon(Icons.Filled.Bookmark, contentDescription = "Remove", tint = Color.White) } } }
+}
+@Composable
 fun PlaceCard(navController: NavHostController, cafe: Cafe, modifier: Modifier = Modifier) {
     Card(
-        modifier = modifier.fillMaxWidth().clickable { navController.navigate(Screen.CafeDetails.createRoute(cafe.id)) },
+        modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = Color.White),
         border = BorderStroke(2.dp, Color.Black),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column {
-            Box(modifier = Modifier.fillMaxWidth().height(340.dp)) {
+            Box(modifier = Modifier.fillMaxWidth().height(340.dp).clickable { navController.navigate(Screen.CafeDetails.createRoute(cafe.id)) }) {
                 AsyncImage(
                     model = cafe.imageBitmap ?: cafe.imageUrl ?: cafe.imageResId,
                     contentDescription = null,
                     modifier = Modifier.fillMaxSize(),
                     contentScale = ContentScale.Crop
                 )
+                val isBookmarked = BookmarkRepository.isBookmarked(cafe.id)
+                IconButton(onClick = { BookmarkRepository.toggle(cafe.id) }, modifier = Modifier.align(Alignment.TopStart).padding(10.dp).background(Color.Black.copy(alpha = 0.35f), CircleShape)) {
+                    Icon(imageVector = if (isBookmarked) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder, contentDescription = if (isBookmarked) "Remove bookmark" else "Add bookmark", tint = Color.White)
+                }
                 Box(modifier = Modifier.fillMaxWidth().height(72.dp).align(Alignment.BottomCenter).background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(0.5f)))))
                 Row(modifier = Modifier.align(Alignment.BottomCenter).padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
                     Icon(Icons.Filled.Search, contentDescription = null, tint = Color.White); Spacer(Modifier.width(8.dp)); Text("More like this", color = Color.White, modifier = Modifier.weight(1f))
@@ -833,11 +818,7 @@ fun PlaceCard(navController: NavHostController, cafe: Cafe, modifier: Modifier =
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         RatingStars(rating)
                         Spacer(Modifier.width(8.dp))
-                        Text(
-                            String.format(Locale.US, "%.1f (%d Reviews)", rating, reviewCount),
-                            color = Color.Gray,
-                            style = MaterialTheme.typography.bodySmall
-                        )
+                        Text(String.format(Locale.US, "%.1f (%d Reviews)", rating, reviewCount), color = Color.Gray, style = MaterialTheme.typography.bodySmall)
                     }
                 } else {
                     Text("No ratings yet", color = Color.Gray, style = MaterialTheme.typography.bodySmall)
