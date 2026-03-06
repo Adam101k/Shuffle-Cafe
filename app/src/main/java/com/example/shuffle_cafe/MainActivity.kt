@@ -23,7 +23,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.* 
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -122,6 +122,53 @@ data class Cafe(
     val imageBitmap: Bitmap? = null
 )
 
+private data class VisibleCafeStack(
+    val cafes: List<Cafe>,
+    val nextCafeIndex: Int
+)
+
+private fun buildVisibleCafeStack(cafes: List<Cafe>): VisibleCafeStack {
+    if (cafes.isEmpty()) {
+        return VisibleCafeStack(emptyList(), 0)
+    }
+
+    val visibleCount = minOf(3, cafes.size)
+    return VisibleCafeStack(
+        cafes = cafes.take(visibleCount),
+        nextCafeIndex = visibleCount % cafes.size
+    )
+}
+
+private fun advanceVisibleCafeStack(
+    visibleCafes: List<Cafe>,
+    swipedCafe: Cafe,
+    allCafes: List<Cafe>,
+    nextCafeIndex: Int
+): VisibleCafeStack {
+    if (visibleCafes.isEmpty()) {
+        return VisibleCafeStack(emptyList(), nextCafeIndex)
+    }
+
+    val swipedIndex = visibleCafes.indexOfFirst { it.id == swipedCafe.id }
+    if (swipedIndex == -1) {
+        return VisibleCafeStack(visibleCafes, nextCafeIndex)
+    }
+
+    val remainingCafes = visibleCafes.filterNot { it.id == swipedCafe.id }
+    if (allCafes.size <= visibleCafes.size) {
+        return VisibleCafeStack(
+            cafes = remainingCafes + swipedCafe,
+            nextCafeIndex = nextCafeIndex
+        )
+    }
+
+    val nextCafe = allCafes[nextCafeIndex]
+    return VisibleCafeStack(
+        cafes = remainingCafes + nextCafe,
+        nextCafeIndex = (nextCafeIndex + 1) % allCafes.size
+    )
+}
+
 object CafeRepository {
     private val fallbackCafes: List<Cafe> = listOf(
         Cafe("1", "Cafe Name 1", "123 something ave", "(123) 123-1234", "Busy", linkedMapOf("Thursday" to "7:00AM - 5:00 PM"), listOf("Parking"), listOf("Quiet")),
@@ -218,20 +265,15 @@ fun MainScreen(navController: NavHostController) {
     val hasLocationPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
 
     var allCafes by remember { mutableStateOf<List<Cafe>>(emptyList()) }
-    val currentVisibleCafes = remember { mutableStateListOf<Cafe>() }
+    var currentVisibleCafes by remember { mutableStateOf<List<Cafe>>(emptyList()) }
     var nextCafeIndex by rememberSaveable { mutableIntStateOf(0) }
     var isLoading by remember { mutableStateOf(true) }
     var loadError by remember { mutableStateOf<String?>(null) }
 
     val setVisibleStack: (List<Cafe>) -> Unit = { cafes ->
-        currentVisibleCafes.clear()
-        if (cafes.isNotEmpty()) {
-            val visibleCount = minOf(3, cafes.size)
-            currentVisibleCafes.addAll(cafes.take(visibleCount))
-            nextCafeIndex = visibleCount % cafes.size
-        } else {
-            nextCafeIndex = 0
-        }
+        val visibleStack = buildVisibleCafeStack(cafes)
+        currentVisibleCafes = visibleStack.cafes
+        nextCafeIndex = visibleStack.nextCafeIndex
     }
 
     LaunchedEffect(hasLocationPermission, placesClient) {
@@ -279,16 +321,17 @@ fun MainScreen(navController: NavHostController) {
                 allCafes = updatedCafes
                 CafeRepository.setLiveCafes(updatedCafes)
 
-                val visibleIndex = currentVisibleCafes.indexOfFirst { it.id == cafeId }
-                if (visibleIndex >= 0) {
-                    val replacement = updatedCafes.firstOrNull { it.id == cafeId } ?: return@fetchNearbyCafes
-                    currentVisibleCafes[visibleIndex] = replacement
+                val replacement = updatedCafes.firstOrNull { it.id == cafeId } ?: return@fetchNearbyCafes
+                if (currentVisibleCafes.any { it.id == cafeId }) {
+                    currentVisibleCafes = currentVisibleCafes.map { visibleCafe ->
+                        if (visibleCafe.id == cafeId) replacement else visibleCafe
+                    }
                 }
             }
         )
     }
 
-    Scaffold(topBar = { TopSearchBar() }, bottomBar = { BottomNavBar(navController) }, containerColor = Color.White) { innerPadding ->
+    Scaffold(topBar = { TopSearchBar() }, bottomBar = { BottomNavBar(navController) }, containerColor = Color(0xFFC79A87)) { innerPadding ->
         Column(modifier = Modifier.padding(innerPadding).fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
             when {
                 isLoading -> {
@@ -304,15 +347,14 @@ fun MainScreen(navController: NavHostController) {
                 }
                 else -> {
                     val onCafeSwiped: (Cafe) -> Unit = { swipedCafe ->
-                        val visibleSizeBeforeSwipe = currentVisibleCafes.size
-                        currentVisibleCafes.remove(swipedCafe)
-
-                        if (allCafes.size <= visibleSizeBeforeSwipe) {
-                            currentVisibleCafes.add(swipedCafe)
-                        } else {
-                            currentVisibleCafes.add(allCafes[nextCafeIndex])
-                            nextCafeIndex = (nextCafeIndex + 1) % allCafes.size
-                        }
+                        val visibleStack = advanceVisibleCafeStack(
+                            visibleCafes = currentVisibleCafes,
+                            swipedCafe = swipedCafe,
+                            allCafes = allCafes,
+                            nextCafeIndex = nextCafeIndex
+                        )
+                        currentVisibleCafes = visibleStack.cafes
+                        nextCafeIndex = visibleStack.nextCafeIndex
                     }
 
                     SwipeableCafeStack(
@@ -1240,7 +1282,7 @@ fun RecentItemRow(name: String, address: String) {
 }
 
 @Composable
-fun SwipeableCafeStack(cafes: SnapshotStateList<Cafe>, navController: NavHostController, onSwipeLeft: (Cafe) -> Unit, onSwipeRight: (Cafe) -> Unit) {
+fun SwipeableCafeStack(cafes: List<Cafe>, navController: NavHostController, onSwipeLeft: (Cafe) -> Unit, onSwipeRight: (Cafe) -> Unit) {
     if (cafes.isEmpty()) return
     val scope = rememberCoroutineScope()
     val density = LocalDensity.current
@@ -1249,98 +1291,131 @@ fun SwipeableCafeStack(cafes: SnapshotStateList<Cafe>, navController: NavHostCon
     val offscreenTargetPx = with(density) { configuration.screenWidthDp.dp.toPx() * 1.2f }
     val offsetX = remember { Animatable(0f) }
     val cardRotation = remember { Animatable(0f) }
+    var exitingCafe by remember { mutableStateOf<Cafe?>(null) }
+    var isSwipeTransitionRunning by remember { mutableStateOf(false) }
 
-    LaunchedEffect(cafes.firstOrNull()?.id) {
-        offsetX.snapTo(0f)
-        cardRotation.snapTo(0f)
+    val renderedCafes = remember(cafes, exitingCafe, isSwipeTransitionRunning) {
+        if (isSwipeTransitionRunning) {
+            cafes.filterNot { it.id == exitingCafe?.id }
+        } else {
+            cafes
+        }
     }
 
     Box(modifier = Modifier.fillMaxWidth(0.9f).aspectRatio(0.58f), contentAlignment = Alignment.Center) {
         // Draw from back to front
-        for (i in cafes.indices.reversed()) {
-            val cafe = cafes[i]
-            val stackIndex = i.toFloat()
-            val scaleTarget = 1f - (stackIndex * 0.05f).coerceAtMost(0.1f)
-            val yOffsetTarget = (stackIndex * 10).dp
-            val animatedScale by animateFloatAsState(
-                targetValue = scaleTarget,
-                animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
-                label = "stackScale"
-            )
-            val animatedYOffset by animateDpAsState(
-                targetValue = yOffsetTarget,
-                animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
-                label = "stackYOffset"
-            )
+        for (i in renderedCafes.indices.reversed()) {
+            val cafe = renderedCafes[i]
             key(cafe.id) {
-                val modifier = if (i == 0) {
-                    Modifier
-                        .zIndex(100f)
-                        .offset(y = animatedYOffset)
-                        .scale(animatedScale)
+                val isTopCard = i == 0
+                val stackScaleTarget = when (i) {
+                    0 -> 1f
+                    1 -> 0.97f
+                    else -> 0.94f
+                }
+                val stackYOffsetTarget = when (i) {
+                    0 -> 0.dp
+                    1 -> 6.dp
+                    else -> 12.dp
+                }
+                val animatedScale by animateFloatAsState(
+                    targetValue = stackScaleTarget,
+                    animationSpec = tween(durationMillis = 120, easing = FastOutSlowInEasing),
+                    label = "stackScale-${cafe.id}"
+                )
+                val animatedYOffset by animateDpAsState(
+                    targetValue = stackYOffsetTarget,
+                    animationSpec = tween(durationMillis = 120, easing = FastOutSlowInEasing),
+                    label = "stackYOffset-${cafe.id}"
+                )
+                val baseModifier = Modifier
+                    .zIndex(if (isTopCard) 100f else 10f - i.toFloat())
+                    .offset(y = animatedYOffset)
+                    .scale(animatedScale)
+
+                val modifier = if (isTopCard && !isSwipeTransitionRunning) {
+                    baseModifier
                         .graphicsLayer {
                             translationX = offsetX.value
                             rotationZ = cardRotation.value
                         }
-                        .pointerInput(cafe.id) {
-                            detectDragGestures(
-                                onDrag = { change, drag ->
-                                    change.consume()
-                                    scope.launch {
-                                        val newOffset = offsetX.value + drag.x
-                                        offsetX.snapTo(newOffset)
-                                        cardRotation.snapTo((newOffset / 40f).coerceIn(-18f, 18f))
-                                    }
-                                },
-                                onDragEnd = {
-                                    scope.launch {
-                                        val currentOffset = offsetX.value
-                                        if (currentOffset > swipeThresholdPx || currentOffset < -swipeThresholdPx) {
-                                            val target = if (currentOffset > 0) offscreenTargetPx else -offscreenTargetPx
-                                            launch {
-                                                cardRotation.animateTo(
-                                                    targetValue = (target / 40f).coerceIn(-18f, 18f),
+                        .pointerInput(cafe.id, isSwipeTransitionRunning) {
+                            if (!isSwipeTransitionRunning) {
+                                detectDragGestures(
+                                    onDrag = { change, drag ->
+                                        change.consume()
+                                        scope.launch {
+                                            val newOffset = offsetX.value + drag.x
+                                            offsetX.snapTo(newOffset)
+                                            cardRotation.snapTo((newOffset / 40f).coerceIn(-18f, 18f))
+                                        }
+                                    },
+                                    onDragEnd = {
+                                        scope.launch {
+                                            val currentOffset = offsetX.value
+                                            if (currentOffset > swipeThresholdPx || currentOffset < -swipeThresholdPx) {
+                                                val target = if (currentOffset > 0) offscreenTargetPx else -offscreenTargetPx
+                                                isSwipeTransitionRunning = true
+                                                exitingCafe = cafe
+                                                if (currentOffset > 0) onSwipeRight(cafe) else onSwipeLeft(cafe)
+                                                launch {
+                                                    cardRotation.animateTo(
+                                                        targetValue = (target / 40f).coerceIn(-18f, 18f),
+                                                        animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing)
+                                                    )
+                                                }
+                                                offsetX.animateTo(
+                                                    targetValue = target,
                                                     animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing)
                                                 )
-                                            }
-                                            offsetX.animateTo(
-                                                targetValue = target,
-                                                animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing)
-                                            )
-
-                                            if (currentOffset > 0) onSwipeRight(cafe) else onSwipeLeft(cafe)
-                                        }
-                                        else {
-                                            launch {
-                                                offsetX.animateTo(
-                                                    targetValue = 0f,
-                                                    animationSpec = spring(
-                                                        dampingRatio = Spring.DampingRatioNoBouncy,
-                                                        stiffness = Spring.StiffnessMediumLow
+                                                exitingCafe = null
+                                                offsetX.snapTo(0f)
+                                                cardRotation.snapTo(0f)
+                                                isSwipeTransitionRunning = false
+                                            } else {
+                                                launch {
+                                                    offsetX.animateTo(
+                                                        targetValue = 0f,
+                                                        animationSpec = spring(
+                                                            dampingRatio = Spring.DampingRatioNoBouncy,
+                                                            stiffness = Spring.StiffnessMediumLow
+                                                        )
                                                     )
-                                                )
-                                            }
-                                            launch {
-                                                cardRotation.animateTo(
-                                                    targetValue = 0f,
-                                                    animationSpec = spring(
-                                                        dampingRatio = Spring.DampingRatioNoBouncy,
-                                                        stiffness = Spring.StiffnessMediumLow
+                                                }
+                                                launch {
+                                                    cardRotation.animateTo(
+                                                        targetValue = 0f,
+                                                        animationSpec = spring(
+                                                            dampingRatio = Spring.DampingRatioNoBouncy,
+                                                            stiffness = Spring.StiffnessMediumLow
+                                                        )
                                                     )
-                                                )
+                                                }
                                             }
                                         }
                                     }
-                                }
-                            )
+                                )
+                            }
                         }
                 } else {
-                    Modifier
-                        .zIndex(10f - stackIndex)
-                        .offset(y = animatedYOffset)
-                        .scale(animatedScale)
+                    baseModifier
                 }
                 PlaceCard(navController = navController, cafe = cafe, modifier = modifier)
+            }
+        }
+
+        exitingCafe?.let { overlayCafe ->
+            key("overlay-${overlayCafe.id}") {
+                PlaceCard(
+                    navController = navController,
+                    cafe = overlayCafe,
+                    modifier = Modifier
+                        .zIndex(200f)
+                        .graphicsLayer {
+                            translationX = offsetX.value
+                            rotationZ = cardRotation.value
+                        }
+                )
             }
         }
     }
