@@ -142,6 +142,28 @@ object CafeRepository {
     fun getCafe(id: String): Cafe? = cafes.firstOrNull { it.id == id }
 }
 
+object BookmarkRepository {
+    // store just IDs
+    private val bookmarkedIds = mutableStateListOf<String>()
+
+    fun isBookmarked(cafeId: String): Boolean = bookmarkedIds.contains(cafeId)
+
+    fun toggle(cafeId: String) {
+        if (bookmarkedIds.contains(cafeId)) bookmarkedIds.remove(cafeId)
+        else bookmarkedIds.add(cafeId)
+    }
+
+    fun remove(cafeId: String) {
+        bookmarkedIds.remove(cafeId)
+    }
+
+    // Expose as List so callers can display it
+    fun ids(): List<String> = bookmarkedIds
+
+    fun cafes(): List<Cafe> = bookmarkedIds
+        .mapNotNull { id -> CafeRepository.getCafe(id) }
+}
+
 object ReviewRepository {
     private val reviewsByCafe = mutableStateMapOf<String, SnapshotStateList<String>>()
     fun reviewsFor(cafeId: String): SnapshotStateList<String> = reviewsByCafe.getOrPut(cafeId) { mutableStateListOf() }
@@ -459,10 +481,80 @@ fun MapScreen(navController: NavHostController) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BookmarkScreen(navController: NavHostController) {
-    Scaffold(topBar = { TopSearchBar() }, bottomBar = { BottomNavBar(navController) }) { innerPadding ->
-        Column(modifier = Modifier.padding(innerPadding).fillMaxSize().padding(horizontal = 16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Spacer(Modifier.height(16.dp))
-            PlaceSaved()
+    val savedCafes = BookmarkRepository.cafes()
+
+    Scaffold(
+        topBar = { TopSearchBar() },
+        bottomBar = { BottomNavBar(navController) },
+        containerColor = Color.White
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize()
+                .padding(horizontal = 16.dp)
+        ) {
+            Spacer(Modifier.height(12.dp))
+            Text("Saved", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(12.dp))
+
+            if (savedCafes.isEmpty()) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("No saved cafes yet. Open a cafe and tap the bookmark.")
+                }
+            } else {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    items(savedCafes, key = { it.id }) { cafe ->
+                        SavedCafeRow(
+                            cafe = cafe,
+                            onOpen = { navController.navigate(Screen.CafeDetails.createRoute(cafe.id)) },
+                            onRemove = { BookmarkRepository.remove(cafe.id) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SavedCafeRow(
+    cafe: Cafe,
+    onOpen: () -> Unit,
+    onRemove: () -> Unit
+) {
+    OutlinedCard(
+        modifier = Modifier.fillMaxWidth().clickable { onOpen() },
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Small thumbnail
+            Surface(
+                modifier = Modifier.size(56.dp),
+                shape = RoundedCornerShape(10.dp),
+                color = Color(0xFFF0F0F0)
+            ) {
+                AsyncImage(
+                    model = cafe.imageBitmap ?: cafe.imageUrl ?: cafe.imageResId,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+
+            Spacer(Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(cafe.name, fontWeight = FontWeight.SemiBold)
+                Text(cafe.address, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+            }
+
+            IconButton(onClick = onRemove) {
+                Icon(Icons.Filled.Bookmark, contentDescription = "Remove bookmark")
+            }
         }
     }
 }
@@ -489,18 +581,106 @@ fun MapSearchBar() {
 fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
     val cafe = remember(cafeId) { CafeRepository.getCafe(cafeId) }
     val reviews = ReviewRepository.reviewsFor(cafeId)
-    Scaffold(bottomBar = { BottomNavBar(navController) }, containerColor = Color.White) { innerPadding ->
-        if (cafe == null) { Box(modifier = Modifier.padding(innerPadding).fillMaxSize(), contentAlignment = Alignment.Center) { Text("Cafe not found") }; return@Scaffold }
-        LazyColumn(modifier = Modifier.padding(innerPadding).fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            item { Spacer(Modifier.height(8.dp)); Text(cafe.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center) }
-            item { Text("Address: ${cafe.address}"); Text("Phone: ${cafe.phone}"); Text(cafe.status); HoursDropdown(cafe.hours) }
-            item { OutlinedCard(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(4.dp), border = BorderStroke(1.dp, Color.Black)) { Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) { Text("Menu", modifier = Modifier.weight(1f)); Icon(Icons.Filled.PlayArrow, null) } } }
+
+    val isBookmarked = BookmarkRepository.isBookmarked(cafeId)
+
+    Scaffold(
+        bottomBar = { BottomNavBar(navController) },
+        containerColor = Color.White
+    ) { innerPadding ->
+        if (cafe == null) {
+            Box(
+                modifier = Modifier.padding(innerPadding).fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) { Text("Cafe not found") }
+            return@Scaffold
+        }
+
+        LazyColumn(
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize()
+                .padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                Spacer(Modifier.height(8.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Spacer(Modifier.width(40.dp)) // keeps title centered-ish
+
+                    Text(
+                        cafe.name,
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f),
+                        textAlign = TextAlign.Center
+                    )
+
+                    IconButton(
+                        onClick = { BookmarkRepository.toggle(cafeId) }
+                    ) {
+                        Icon(
+                            imageVector = if (isBookmarked) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder,
+                            contentDescription = if (isBookmarked) "Remove bookmark" else "Add bookmark"
+                        )
+                    }
+                }
+            }
+
+            item {
+                Text("Address: ${cafe.address}")
+                Text("Phone: ${cafe.phone}")
+                Text(cafe.status)
+                HoursDropdown(cafe.hours)
+            }
+
+            item {
+                OutlinedCard(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(4.dp),
+                    border = BorderStroke(1.dp, Color.Black)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Menu", modifier = Modifier.weight(1f))
+                        Icon(Icons.Filled.PlayArrow, null)
+                    }
+                }
+            }
+
             item { Text("Features:", fontWeight = FontWeight.SemiBold) }
             items(cafe.features) { Text("• $it") }
+
             item { Text("Ambience:", fontWeight = FontWeight.SemiBold) }
             items(cafe.ambience) { Text("• $it") }
-            item { Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Text("Reviews:", modifier = Modifier.weight(1f)); TextButton(onClick = { navController.navigate(Screen.WriteReview.createRoute(cafeId)) }) { Text("Write review") } } }
-            if (reviews.isEmpty()) { item { Text("No reviews yet.", color = Color.Gray) } } else { items(reviews) { OutlinedCard(modifier = Modifier.fillMaxWidth()) { Text(it, modifier = Modifier.padding(12.dp)) } } }
+
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Reviews:", modifier = Modifier.weight(1f))
+                    TextButton(onClick = { navController.navigate(Screen.WriteReview.createRoute(cafeId)) }) {
+                        Text("Write review")
+                    }
+                }
+            }
+
+            if (reviews.isEmpty()) {
+                item { Text("No reviews yet.", color = Color.Gray) }
+            } else {
+                items(reviews) {
+                    OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+                        Text(it, modifier = Modifier.padding(12.dp))
+                    }
+                }
+            }
         }
     }
 }
