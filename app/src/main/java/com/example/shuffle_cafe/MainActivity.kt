@@ -1,6 +1,7 @@
 package com.example.shuffle_cafe
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.location.Location
@@ -22,7 +23,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.layout.* 
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -37,6 +38,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.scale
+import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
@@ -57,6 +59,7 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
+import androidx.navigationevent.NavigationEventInfo
 import coil.compose.AsyncImage
 import com.example.shuffle_cafe.ui.screens.LoginScreen
 import com.example.shuffle_cafe.ui.theme.Shuffle_CafeTheme
@@ -67,6 +70,7 @@ import com.google.android.gms.maps.CameraUpdateFactory
 import com.google.android.gms.maps.model.LatLng
 import com.google.android.gms.tasks.CancellationTokenSource
 import com.google.android.libraries.places.api.Places
+import com.google.android.libraries.places.api.model.AutocompletePrediction
 import com.google.android.libraries.places.api.model.CircularBounds
 import com.google.android.libraries.places.api.model.PhotoMetadata
 import com.google.android.libraries.places.api.model.Place
@@ -78,6 +82,8 @@ import com.google.maps.android.compose.GoogleMap
 import com.google.maps.android.compose.MapProperties
 import com.google.maps.android.compose.MapUiSettings
 import com.google.maps.android.compose.rememberCameraPositionState
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.Locale
 
@@ -138,6 +144,7 @@ class MainActivity : ComponentActivity() {
             Places.initializeWithNewPlacesApiEnabled(applicationContext, "AIzaSyC7QTmdJE2fnRXMiKWrMZftkXIG20gNWrA")
         }
         requestPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
+
         setContent { Shuffle_CafeTheme { AppNav() } }
     }
 }
@@ -301,6 +308,7 @@ private fun fetchNearbyCafes(
     )
 }
 
+@SuppressLint("MissingPermission")
 private fun getCurrentOrLastLocation(
     fusedLocationClient: FusedLocationProviderClient,
     onSuccess: (Location) -> Unit,
@@ -427,12 +435,17 @@ fun MapScreen(navController: NavHostController) {
     val fusedLocationClient = remember { LocationServices.getFusedLocationProviderClient(context) }
     val hasLocationPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
     val defaultCamera = rememberCameraPositionState()
+    var searchQuery by remember { mutableStateOf("") }
+
+
     LaunchedEffect(hasLocationPermission){
         if(hasLocationPermission) {
             fusedLocationClient.lastLocation.addOnSuccessListener { it?.let{ defaultCamera.move(CameraUpdateFactory.newLatLngZoom(LatLng(it.latitude, it.longitude), 17f)) } }
         }
     }
-    Scaffold(topBar = { MapSearchBar() }, bottomBar = { BottomNavBar(navController) }) { innerPadding ->
+    Scaffold(topBar = { MapSearchBar(searchQuery = searchQuery, onQueryChanged = { searchQuery = it },onPlaceSelected = { latLng -> defaultCamera.move(CameraUpdateFactory.newLatLngZoom(latLng, 17f))
+    } ) },
+        bottomBar = { BottomNavBar(navController) }) { innerPadding ->
         GoogleMap(modifier = Modifier.padding(innerPadding).fillMaxSize(), cameraPositionState = defaultCamera, properties = MapProperties(isMyLocationEnabled = hasLocationPermission), uiSettings = MapUiSettings(myLocationButtonEnabled = true))
     }
 }
@@ -459,11 +472,63 @@ fun TopSearchBar() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MapSearchBar() {
-    var text by remember { mutableStateOf("") }
-    Surface(modifier = Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 16.dp, vertical = 10.dp), shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
-        TextField(value = text, onValueChange = { text = it }, placeholder = { Text("Search location...") }, leadingIcon = { Icon(Icons.Filled.Menu, null) }, trailingIcon = { Icon(Icons.Filled.Search, null) }, singleLine = true, modifier = Modifier.fillMaxWidth(), colors = TextFieldDefaults.colors(focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent, disabledContainerColor = Color.Transparent, focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent))
+fun MapSearchBar(searchQuery: String, onQueryChanged: (String) -> Unit, onPlaceSelected: (LatLng) -> Unit) {
+    var recommended by remember { mutableStateOf<List<AutocompletePrediction>> (emptyList()) }
+    val context = LocalContext.current
+    val placesClient = remember { Places.createClient(context) }
+
+    Column() {
+        Surface(modifier = Modifier.fillMaxWidth()
+            .statusBarsPadding()
+            .padding(horizontal = 16.dp, vertical = 10.dp), shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceVariant)
+        {
+            TextField(
+                value = searchQuery,
+                onValueChange = { it ->
+                    onQueryChanged(it)
+
+                    if(it.isNotEmpty())
+                    {
+                        val request = com.google.android.libraries.places.api.net.FindAutocompletePredictionsRequest.builder()
+                            .setQuery(it)
+                            .build()
+                        placesClient.findAutocompletePredictions(request)
+                            .addOnSuccessListener { response ->
+                                recommended = response.autocompletePredictions
+                            } .addOnFailureListener { recommended = emptyList() }
+
+
+                    }else recommended = emptyList()
+                },
+                placeholder = { Text("Search location...") },
+                leadingIcon = { Icon(Icons.Filled.Menu, null) },
+                trailingIcon = { IconButton(onClick = { searchQuery }) {Icon(Icons.Filled.Search, null) } },
+                singleLine = true,
+                modifier = Modifier.fillMaxWidth(), colors = TextFieldDefaults.colors(focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent, disabledContainerColor = Color.Transparent, focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent)
+            )
+
+        }
+        DropdownMenu( expanded = recommended.isNotEmpty(), onDismissRequest = {recommended = emptyList()},  properties = androidx.compose.ui.window.PopupProperties( focusable = false)) {
+            recommended.forEach { prediction -> DropdownMenuItem(text = {Text(prediction.getFullText(null).toString()) },
+                onClick = {
+                    val request = com.google.android.libraries.places.api.net.FetchPlaceRequest
+                        .builder(
+                            prediction.placeId,
+                            listOf(Place.Field.LAT_LNG)
+                        )
+                        .build()
+
+                    placesClient.fetchPlace(request)
+                        .addOnSuccessListener { response ->
+                            response.place.latLng?.let { latLng ->
+                                onPlaceSelected(latLng)
+                            }
+                        }
+                })
+            }
+        }
     }
+
 }
 
 @Composable
@@ -670,13 +735,13 @@ fun SwipeableCafeStack(cafes: SnapshotStateList<Cafe>, navController: NavHostCon
                         }
                         .pointerInput(cafe.id) {
                             detectDragGestures(
-                                onDrag = { change, drag -> 
+                                onDrag = { change, drag ->
                                     change.consume()
-                                    scope.launch { 
+                                    scope.launch {
                                         val newOffset = offsetX.value + drag.x
                                         offsetX.snapTo(newOffset)
-                                        cardRotation.snapTo((newOffset / 40f).coerceIn(-18f, 18f)) 
-                                    } 
+                                        cardRotation.snapTo((newOffset / 40f).coerceIn(-18f, 18f))
+                                    }
                                 },
                                 onDragEnd = {
                                     scope.launch {
@@ -696,7 +761,7 @@ fun SwipeableCafeStack(cafes: SnapshotStateList<Cafe>, navController: NavHostCon
 
                                             if (currentOffset > 0) onSwipeRight(cafe) else onSwipeLeft(cafe)
                                         }
-                                        else { 
+                                        else {
                                             launch {
                                                 offsetX.animateTo(
                                                     targetValue = 0f,
