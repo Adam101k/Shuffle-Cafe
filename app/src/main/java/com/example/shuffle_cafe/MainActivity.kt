@@ -41,6 +41,7 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalConfiguration
@@ -87,6 +88,24 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import java.util.Locale
 
+import io.github.jan.supabase.auth.Auth
+import io.github.jan.supabase.createSupabaseClient
+import io.github.jan.supabase.postgrest.Postgrest
+import io.github.jan.supabase.postgrest.from
+import io.github.jan.supabase.storage.storage
+import io.github.jan.supabase.auth.auth
+import io.github.jan.supabase.storage.Storage
+import kotlinx.serialization.Serializable
+
+val supabase = createSupabaseClient(
+    supabaseUrl = "https://sknyfkgltazosjmyjfhs.supabase.co",
+    supabaseKey = "sb_publishable_dCrTJjMXS6bw1WDaqTtewg_amytqZMf"
+) {
+    install(Auth)
+    install(Postgrest)
+    install(Storage)
+}
+
 data class Cafe(
     val id: String,
     val name: String,
@@ -129,6 +148,28 @@ object CafeRepository {
     fun getCafe(id: String): Cafe? = cafes.firstOrNull { it.id == id }
 }
 
+object BookmarkRepository {
+    // store just IDs
+    private val bookmarkedIds = mutableStateListOf<String>()
+
+    fun isBookmarked(cafeId: String): Boolean = bookmarkedIds.contains(cafeId)
+
+    fun toggle(cafeId: String) {
+        if (bookmarkedIds.contains(cafeId)) bookmarkedIds.remove(cafeId)
+        else bookmarkedIds.add(cafeId)
+    }
+
+    fun remove(cafeId: String) {
+        bookmarkedIds.remove(cafeId)
+    }
+
+    // Expose as List so callers can display it
+    fun ids(): List<String> = bookmarkedIds
+
+    fun cafes(): List<Cafe> = bookmarkedIds
+        .mapNotNull { id -> CafeRepository.getCafe(id) }
+}
+
 object ReviewRepository {
     private val reviewsByCafe = mutableStateMapOf<String, SnapshotStateList<String>>()
     fun reviewsFor(cafeId: String): SnapshotStateList<String> = reviewsByCafe.getOrPut(cafeId) { mutableStateListOf() }
@@ -159,11 +200,11 @@ fun AppNav(){
         composable(Screen.MapScreen.route) { MapScreen(navController) }
         composable(Screen.BookmarkScreen.route) { BookmarkScreen(navController) }
         composable(Screen.ProfileScreen.route) { ProfileScreen(navController) }
-        composable(Screen.CafeDetails.route, arguments = listOf(navArgument("cafeId") { type = NavType.StringType })) { 
-            CafeDetailsScreen(navController, it.arguments?.getString("cafeId") ?: "") 
+        composable(Screen.CafeDetails.route, arguments = listOf(navArgument("cafeId") { type = NavType.StringType })) {
+            CafeDetailsScreen(navController, it.arguments?.getString("cafeId") ?: "")
         }
-        composable(Screen.WriteReview.route, arguments = listOf(navArgument("cafeId") { type = NavType.StringType })) { 
-            WriteReviewScreen(navController, it.arguments?.getString("cafeId") ?: "") 
+        composable(Screen.WriteReview.route, arguments = listOf(navArgument("cafeId") { type = NavType.StringType })) {
+            WriteReviewScreen(navController, it.arguments?.getString("cafeId") ?: "")
         }
     }
 }
@@ -262,25 +303,25 @@ fun MainScreen(navController: NavHostController) {
                     Text("No nearby cafes found.", style = MaterialTheme.typography.headlineSmall)
                 }
                 else -> {
-                val onCafeSwiped: (Cafe) -> Unit = { swipedCafe ->
-                    val visibleSizeBeforeSwipe = currentVisibleCafes.size
-                    currentVisibleCafes.remove(swipedCafe)
+                    val onCafeSwiped: (Cafe) -> Unit = { swipedCafe ->
+                        val visibleSizeBeforeSwipe = currentVisibleCafes.size
+                        currentVisibleCafes.remove(swipedCafe)
 
-                    if (allCafes.size <= visibleSizeBeforeSwipe) {
-                        currentVisibleCafes.add(swipedCafe)
-                    } else {
-                        currentVisibleCafes.add(allCafes[nextCafeIndex])
-                        nextCafeIndex = (nextCafeIndex + 1) % allCafes.size
+                        if (allCafes.size <= visibleSizeBeforeSwipe) {
+                            currentVisibleCafes.add(swipedCafe)
+                        } else {
+                            currentVisibleCafes.add(allCafes[nextCafeIndex])
+                            nextCafeIndex = (nextCafeIndex + 1) % allCafes.size
+                        }
                     }
-                }
 
-                SwipeableCafeStack(
-                    cafes = currentVisibleCafes,
-                    navController = navController,
-                    onSwipeLeft = onCafeSwiped,
-                    onSwipeRight = onCafeSwiped
-                )
-            }
+                    SwipeableCafeStack(
+                        cafes = currentVisibleCafes,
+                        navController = navController,
+                        onSwipeLeft = onCafeSwiped,
+                        onSwipeRight = onCafeSwiped
+                    )
+                }
             }
         }
     }
@@ -453,10 +494,80 @@ fun MapScreen(navController: NavHostController) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BookmarkScreen(navController: NavHostController) {
-    Scaffold(topBar = { TopSearchBar() }, bottomBar = { BottomNavBar(navController) }) { innerPadding ->
-        Column(modifier = Modifier.padding(innerPadding).fillMaxSize().padding(horizontal = 16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Spacer(Modifier.height(16.dp))
-            PlaceSaved()
+    val savedCafes = BookmarkRepository.cafes()
+
+    Scaffold(
+        topBar = { TopSearchBar() },
+        bottomBar = { BottomNavBar(navController) },
+        containerColor = Color.White
+    ) { innerPadding ->
+        Column(
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize()
+                .padding(horizontal = 16.dp)
+        ) {
+            Spacer(Modifier.height(12.dp))
+            Text("Saved", style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold)
+            Spacer(Modifier.height(12.dp))
+
+            if (savedCafes.isEmpty()) {
+                Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                    Text("No saved cafes yet. Open a cafe and tap the bookmark.")
+                }
+            } else {
+                LazyColumn(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    items(savedCafes, key = { it.id }) { cafe ->
+                        SavedCafeRow(
+                            cafe = cafe,
+                            onOpen = { navController.navigate(Screen.CafeDetails.createRoute(cafe.id)) },
+                            onRemove = { BookmarkRepository.remove(cafe.id) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun SavedCafeRow(
+    cafe: Cafe,
+    onOpen: () -> Unit,
+    onRemove: () -> Unit
+) {
+    OutlinedCard(
+        modifier = Modifier.fillMaxWidth().clickable { onOpen() },
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Small thumbnail
+            Surface(
+                modifier = Modifier.size(56.dp),
+                shape = RoundedCornerShape(10.dp),
+                color = Color(0xFFF0F0F0)
+            ) {
+                AsyncImage(
+                    model = cafe.imageBitmap ?: cafe.imageUrl ?: cafe.imageResId,
+                    contentDescription = null,
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier.fillMaxSize()
+                )
+            }
+
+            Spacer(Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(cafe.name, fontWeight = FontWeight.SemiBold)
+                Text(cafe.address, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+            }
+
+            IconButton(onClick = onRemove) {
+                Icon(Icons.Filled.Bookmark, contentDescription = "Remove bookmark")
+            }
         }
     }
 }
@@ -535,18 +646,106 @@ fun MapSearchBar(searchQuery: String, onQueryChanged: (String) -> Unit, onPlaceS
 fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
     val cafe = remember(cafeId) { CafeRepository.getCafe(cafeId) }
     val reviews = ReviewRepository.reviewsFor(cafeId)
-    Scaffold(bottomBar = { BottomNavBar(navController) }, containerColor = Color.White) { innerPadding ->
-        if (cafe == null) { Box(modifier = Modifier.padding(innerPadding).fillMaxSize(), contentAlignment = Alignment.Center) { Text("Cafe not found") }; return@Scaffold }
-        LazyColumn(modifier = Modifier.padding(innerPadding).fillMaxSize().padding(horizontal = 16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            item { Spacer(Modifier.height(8.dp)); Text(cafe.name, style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.SemiBold, modifier = Modifier.fillMaxWidth(), textAlign = TextAlign.Center) }
-            item { Text("Address: ${cafe.address}"); Text("Phone: ${cafe.phone}"); Text(cafe.status); HoursDropdown(cafe.hours) }
-            item { OutlinedCard(modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(4.dp), border = BorderStroke(1.dp, Color.Black)) { Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) { Text("Menu", modifier = Modifier.weight(1f)); Icon(Icons.Filled.PlayArrow, null) } } }
+
+    val isBookmarked = BookmarkRepository.isBookmarked(cafeId)
+
+    Scaffold(
+        bottomBar = { BottomNavBar(navController) },
+        containerColor = Color.White
+    ) { innerPadding ->
+        if (cafe == null) {
+            Box(
+                modifier = Modifier.padding(innerPadding).fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) { Text("Cafe not found") }
+            return@Scaffold
+        }
+
+        LazyColumn(
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize()
+                .padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item {
+                Spacer(Modifier.height(8.dp))
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Spacer(Modifier.width(40.dp)) // keeps title centered-ish
+
+                    Text(
+                        cafe.name,
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f),
+                        textAlign = TextAlign.Center
+                    )
+
+                    IconButton(
+                        onClick = { BookmarkRepository.toggle(cafeId) }
+                    ) {
+                        Icon(
+                            imageVector = if (isBookmarked) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder,
+                            contentDescription = if (isBookmarked) "Remove bookmark" else "Add bookmark"
+                        )
+                    }
+                }
+            }
+
+            item {
+                Text("Address: ${cafe.address}")
+                Text("Phone: ${cafe.phone}")
+                Text(cafe.status)
+                HoursDropdown(cafe.hours)
+            }
+
+            item {
+                OutlinedCard(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(4.dp),
+                    border = BorderStroke(1.dp, Color.Black)
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Menu", modifier = Modifier.weight(1f))
+                        Icon(Icons.Filled.PlayArrow, null)
+                    }
+                }
+            }
+
             item { Text("Features:", fontWeight = FontWeight.SemiBold) }
             items(cafe.features) { Text("• $it") }
+
             item { Text("Ambience:", fontWeight = FontWeight.SemiBold) }
             items(cafe.ambience) { Text("• $it") }
-            item { Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Text("Reviews:", modifier = Modifier.weight(1f)); TextButton(onClick = { navController.navigate(Screen.WriteReview.createRoute(cafeId)) }) { Text("Write review") } } }
-            if (reviews.isEmpty()) { item { Text("No reviews yet.", color = Color.Gray) } } else { items(reviews) { OutlinedCard(modifier = Modifier.fillMaxWidth()) { Text(it, modifier = Modifier.padding(12.dp)) } } }
+
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text("Reviews:", modifier = Modifier.weight(1f))
+                    TextButton(onClick = { navController.navigate(Screen.WriteReview.createRoute(cafeId)) }) {
+                        Text("Write review")
+                    }
+                }
+            }
+
+            if (reviews.isEmpty()) {
+                item { Text("No reviews yet.", color = Color.Gray) }
+            } else {
+                items(reviews) {
+                    OutlinedCard(modifier = Modifier.fillMaxWidth()) {
+                        Text(it, modifier = Modifier.padding(12.dp))
+                    }
+                }
+            }
         }
     }
 }
@@ -582,17 +781,17 @@ fun WriteReviewScreen(navController: NavHostController, cafeId: String) {
 fun PlaceSaved() {
     val outlineColor = Color(0xFFE6E6E6)
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(22.dp)) {
-        Column { 
+        Column {
             Text("Saved", fontWeight = FontWeight.SemiBold); Spacer(Modifier.height(4.dp)); Box(Modifier.width(80.dp).height(1.dp).background(outlineColor))
-            Spacer(Modifier.height(10.dp)); Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) { SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f), true) } 
+            Spacer(Modifier.height(10.dp)); Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) { SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f), true) }
         }
-        Column { 
+        Column {
             Text("Collection", fontWeight = FontWeight.SemiBold); Spacer(Modifier.height(4.dp)); Box(Modifier.width(80.dp).height(1.dp).background(outlineColor))
-            Spacer(Modifier.height(10.dp)); Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) { Column(Modifier.weight(1f)) { SavedTile(); Text("Good Coffee", style = MaterialTheme.typography.bodySmall) }; Column(Modifier.weight(1f)) { SavedTile(); Text("Quiet Area", style = MaterialTheme.typography.bodySmall) }; SavedTile(Modifier.weight(1f), true) } 
+            Spacer(Modifier.height(10.dp)); Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) { Column(Modifier.weight(1f)) { SavedTile(); Text("Good Coffee", style = MaterialTheme.typography.bodySmall) }; Column(Modifier.weight(1f)) { SavedTile(); Text("Quiet Area", style = MaterialTheme.typography.bodySmall) }; SavedTile(Modifier.weight(1f), true) }
         }
-        Column { 
+        Column {
             Text("Study Plan", fontWeight = FontWeight.SemiBold); Spacer(Modifier.height(4.dp)); Box(Modifier.width(80.dp).height(1.dp).background(outlineColor))
-            Spacer(Modifier.height(10.dp)); Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) { SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f), true) } 
+            Spacer(Modifier.height(10.dp)); Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) { SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f), true) }
         }
     }
 }
@@ -666,26 +865,376 @@ fun BottomNavBar(navController: NavHostController) {
     }
 }
 
+@Serializable
+data class Profile(
+    val id: String,
+    val first_name: String,
+    val last_name: String,
+    val avatar_url: String? = null,
+    val bio: String? = null
+)
+
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileScreen(navController: NavHostController) {
-    var uri by remember { mutableStateOf<Uri?>(null) }
-    val pick = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri = it }
-    Scaffold(bottomBar = { BottomNavBar(navController) }, containerColor = Color.White) { innerPadding ->
-        LazyColumn(modifier = Modifier.padding(innerPadding).fillMaxSize().padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
-            item { Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) { IconButton(onClick = { }) { Icon(Icons.Filled.Notifications, null) } } }
-            item {
-                Column(modifier = Modifier.fillMaxWidth(), horizontalAlignment = Alignment.CenterHorizontally) {
-                    Surface(onClick = { pick.launch("image/*") }, modifier = Modifier.size(72.dp), shape = CircleShape, color = Color(0xFFEDE7FF)) {
-                        if (uri == null) Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { Icon(Icons.Filled.Person, null, Modifier.size(32.dp), Color(0xFF6B4EFF)) }
-                        else AsyncImage(model = uri, contentDescription = null, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop)
-                    }
-                    Text("User", style = MaterialTheme.typography.headlineSmall, fontWeight = FontWeight.SemiBold)
+
+    val scope = rememberCoroutineScope()
+    val context = LocalContext.current
+
+    var profile by remember { mutableStateOf<Profile?>(null) }
+    var bioText by remember { mutableStateOf("") }
+    var avatarUri by remember { mutableStateOf<Uri?>(null) }
+
+    var isLoading by remember { mutableStateOf(true) }
+
+    // Pick image + upload to DB
+    val pickImage = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetContent()
+    ) { uri ->
+
+        if (uri != null) {
+            avatarUri = uri
+
+            scope.launch {
+
+                val user = supabase.auth.currentUserOrNull()
+                if (user == null) return@launch
+
+                try {
+                    val inputStream = context.contentResolver.openInputStream(uri)
+                    val bytes = inputStream?.readBytes() ?: return@launch
+
+                    val fileName = "${user.id}.png"
+
+                    // Upload to storage
+                    supabase.storage
+                        .from("avatars")
+                        .upload(
+                            path = fileName,
+                            data = bytes
+                        ) {
+                            upsert = true
+                        }
+
+                    println("Upload success!")
+
+                    val publicUrl = supabase.storage
+                        .from("avatars")
+                        .publicUrl(fileName)
+
+                    // Save URL in profiles table
+                    supabase.from("profiles")
+                        .update(mapOf("avatar_url" to publicUrl)) {
+                            filter {
+                                eq("id", user.id)
+                            }
+                        }
+
+                    // update profile?? might not be needed
+                    profile = profile?.copy(avatar_url = publicUrl)
+
+                } catch (e: Exception) {
+                    println("Upload failed: ${e.message}")
+                    e.printStackTrace()
                 }
             }
-            item { Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceEvenly) { Column(horizontalAlignment = Alignment.CenterHorizontally) { Icon(Icons.Filled.Star, null); Text("Review") }; Column(horizontalAlignment = Alignment.CenterHorizontally) { Icon(Icons.Filled.CameraAlt, null); Text("Photos") }; Column(horizontalAlignment = Alignment.CenterHorizontally) { Icon(Icons.Filled.Group, null); Text("Groups") } } }
-            item { Text("Experience", fontWeight = FontWeight.SemiBold); OutlinedCard(modifier = Modifier.fillMaxWidth().height(80.dp)) { } }
-            item { Text("Recently Viewed", fontWeight = FontWeight.SemiBold) }
-            items(listOf("Klatch Coffee", "Aroma Craft Coffee")) { Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) { Box(modifier = Modifier.size(44.dp).background(Color.LightGray, RoundedCornerShape(8.dp))); Spacer(Modifier.width(12.dp)); Text(it, modifier = Modifier.weight(1f)); IconButton(onClick = { }) { Icon(Icons.Filled.BookmarkBorder, null) } } }
+        }
+    }
+
+    // Fetch the profile
+    LaunchedEffect(Unit) {
+        val user = supabase.auth.currentUserOrNull()
+
+        if (user != null) {
+            try {
+                val result = supabase
+                    .from("profiles")
+                    .select {
+                        filter {
+                            eq("id", user.id)
+                        }
+                    }
+                    .decodeSingle<Profile>()
+
+                profile = result
+                bioText = result.bio ?: ""
+
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+
+        isLoading = false;
+    }
+
+    if (isLoading) {
+
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator()
+                Spacer(modifier = Modifier.height(12.dp))
+                Text("Loading profile...")
+            }
+        }
+
+    }
+
+    else {
+        Scaffold(
+            bottomBar = { BottomNavBar(navController) },
+            containerColor = Color.White
+        ) { innerPadding ->
+
+            LazyColumn(
+                modifier = Modifier
+                    .padding(innerPadding)
+                    .fillMaxSize()
+                    .padding(horizontal = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+
+                // Notifications
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.End
+                    ) {
+                        IconButton(onClick = { }) {
+                            Icon(
+                                Icons.Filled.Notifications,
+                                contentDescription = "Notifications"
+                            )
+                        }
+                    }
+                }
+
+                // Avatar + Name
+                item {
+                    Column(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+
+                        Surface(
+                            shape = CircleShape,
+                            modifier = Modifier.size(72.dp),
+                            color = Color(0xFFEDE7FF),
+                            onClick = { pickImage.launch("image/*") }
+                        ) {
+
+                            when {
+                                avatarUri != null -> {
+                                    AsyncImage(
+                                        model = avatarUri,
+                                        contentDescription = "Profile picture",
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+
+                                profile?.avatar_url != null -> {
+                                    AsyncImage(
+                                        model = "${profile?.avatar_url}?t=${System.currentTimeMillis()}",
+                                        contentDescription = "Profile picture",
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+
+                                else -> {
+                                    Box(contentAlignment = Alignment.Center) {
+                                        Icon(
+                                            Icons.Filled.Person,
+                                            contentDescription = "Profile picture",
+                                            modifier = Modifier.size(32.dp),
+                                            tint = Color(0xFF6B4EFF)
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        Spacer(Modifier.height(8.dp))
+
+                        Text(
+                            text = profile?.let {
+                                val first = it.first_name.takeIf { it.isNotBlank() } ?: ""
+                                val last = it.last_name.takeIf { it.isNotBlank() } ?: ""
+                                if (first.isNotEmpty() || last.isNotEmpty()) "$first $last" else "User"
+                            } ?: "User",
+                            style = MaterialTheme.typography.headlineSmall,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+
+                // Quick Actions
+                item {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly
+                    ) {
+                        ProfileAction(Icons.Filled.Star, "Review")
+                        ProfileAction(Icons.Filled.CameraAlt, "Photos")
+                        ProfileAction(Icons.Filled.Group, "Groups")
+                    }
+                }
+
+                // Experience Title
+                item {
+                    Text(
+                        text = "Experience",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                // Bio/ experience
+                item {
+                    OutlinedCard(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(80.dp),
+                        shape = RoundedCornerShape(8.dp)
+                    ) {
+
+                        TextField(
+                            value = bioText,
+                            onValueChange = { bioText = it },
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .padding(horizontal = 8.dp),
+                            placeholder = { Text("Tell us about yourself...") },
+                            colors = TextFieldDefaults.colors(
+                                focusedContainerColor = Color.Transparent,
+                                unfocusedContainerColor = Color.Transparent
+                            )
+                        )
+                    }
+                }
+
+                // Save Bio
+                item {
+                    Button(
+                        onClick = {
+                            scope.launch {
+                                val user = supabase.auth.currentUserOrNull()
+                                if (user != null) {
+                                    supabase.from("profiles")
+                                        .update(mapOf("bio" to bioText)) {
+                                            filter {
+                                                eq("id", user.id)
+                                            }
+                                        }
+                                }
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text("Save")
+                    }
+                }
+
+                // Recently viewed
+                item {
+                    Text(
+                        text = "Recently View",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+
+                items(
+                    listOf(
+                        "Klatch Coffee" to "13855 City Center Dr #3015...",
+                        "Aroma Craft Coffee" to "20265 Valley Blvd Ste Q..."
+                    )
+                ) { item ->
+                    RecentItemRow(item.first, item.second)
+                }
+
+                item {
+
+                    Spacer(modifier = Modifier.height(32.dp))
+
+                    OutlinedButton(
+                        onClick = {
+                            scope.launch {
+                                supabase.auth.signOut()
+                                navController.navigate(Screen.LoginScreen.route) {
+                                    popUpTo(0) { inclusive = true }
+                                }
+                            }
+                        },
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(50.dp),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, Color.Red),
+                        colors = ButtonDefaults.outlinedButtonColors(
+                            containerColor = Color.Transparent
+                        )
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Person, // or Icons.Filled.ExitToApp
+                            contentDescription = "Logout",
+                            tint = Color.Red
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "Logout",
+                            color = Color.Red,
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+fun ProfileAction( // Removed private
+    icon: ImageVector,
+    label: String
+) {
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Icon(icon, contentDescription = label, modifier = Modifier.size(28.dp))
+        Spacer(Modifier.height(4.dp))
+        Text(text = label, style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable
+fun RecentItemRow(name: String, address: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Surface(
+            modifier = Modifier.size(44.dp),
+            shape = RoundedCornerShape(8.dp),
+            color = Color(0xFFF0F0F0)
+        ) {}
+
+        Spacer(Modifier.width(12.dp))
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(name, fontWeight = FontWeight.SemiBold)
+            Text(
+                address,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.Gray
+            )
+        }
+
+        IconButton(onClick = { }) {
+            Icon(
+                Icons.Filled.BookmarkBorder,
+                contentDescription = "Bookmark"
+            )
         }
     }
 }
@@ -701,9 +1250,9 @@ fun SwipeableCafeStack(cafes: SnapshotStateList<Cafe>, navController: NavHostCon
     val offsetX = remember { Animatable(0f) }
     val cardRotation = remember { Animatable(0f) }
 
-    LaunchedEffect(cafes.firstOrNull()?.id) { 
+    LaunchedEffect(cafes.firstOrNull()?.id) {
         offsetX.snapTo(0f)
-        cardRotation.snapTo(0f) 
+        cardRotation.snapTo(0f)
     }
 
     Box(modifier = Modifier.fillMaxWidth(0.9f).aspectRatio(0.58f), contentAlignment = Alignment.Center) {
