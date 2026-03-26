@@ -8,6 +8,7 @@ import android.location.Location
 import android.os.Bundle
 import android.net.Uri
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
@@ -20,15 +21,19 @@ import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.layout.* 
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -36,6 +41,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.FocusRequester
@@ -44,6 +50,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.boundsInRoot
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -51,6 +59,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.lerp
 import androidx.compose.ui.zIndex
 import androidx.core.content.ContextCompat
 import androidx.navigation.NavHostController
@@ -86,6 +95,7 @@ import com.google.maps.android.compose.rememberCameraPositionState
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.tasks.await
 import java.util.Locale
 
 import io.github.jan.supabase.auth.Auth
@@ -94,6 +104,7 @@ import io.github.jan.supabase.postgrest.Postgrest
 import io.github.jan.supabase.postgrest.from
 import io.github.jan.supabase.storage.storage
 import io.github.jan.supabase.auth.auth
+import io.github.jan.supabase.auth.status.SessionStatus
 import io.github.jan.supabase.storage.Storage
 import kotlinx.serialization.Serializable
 import androidx.compose.ui.text.font.Font
@@ -105,7 +116,12 @@ val supabase = createSupabaseClient(
     supabaseUrl = "https://sknyfkgltazosjmyjfhs.supabase.co",
     supabaseKey = "sb_publishable_dCrTJjMXS6bw1WDaqTtewg_amytqZMf"
 ) {
-    install(Auth)
+    install(Auth) {
+        // Keep mobile sessions restored and refreshed between app launches.
+        alwaysAutoRefresh = true
+        autoLoadFromStorage = true
+        autoSaveToStorage = true
+    }
     install(Postgrest)
     install(Storage)
 }
@@ -123,7 +139,85 @@ data class Cafe(
     val userRatingCount: Int? = null,
     val imageResId: Int = R.drawable.ic_launcher_foreground,
     val imageUrl: String? = null,
-    val imageBitmap: Bitmap? = null
+    val heroImageBitmap: Bitmap? = null,
+    val photoMetadatas: List<PhotoMetadata> = emptyList(),
+    val photoBitmaps: List<Bitmap?> = List(photoMetadatas.size) { null }
+)
+
+private fun Cafe.primaryImageModel(): Any = heroImageBitmap ?: imageUrl ?: imageResId
+
+private fun Cafe.photoPageCount(): Int = when {
+    photoMetadatas.isNotEmpty() -> photoMetadatas.size
+    else -> 1
+}
+
+private fun Cafe.photoPageModel(index: Int): Any? {
+    val loadedPhoto = photoBitmaps.getOrNull(index)
+    if (loadedPhoto != null) return loadedPhoto
+    if (index == 0) return primaryImageModel()
+    return null
+}
+
+private fun Cafe.withLoadedPhoto(index: Int, bitmap: Bitmap): Cafe {
+    if (photoMetadatas.isEmpty()) {
+        return copy(heroImageBitmap = bitmap)
+    }
+
+    val updatedPhotos = if (photoBitmaps.size == photoMetadatas.size) {
+        photoBitmaps.toMutableList()
+    } else {
+        MutableList(photoMetadatas.size) { photoBitmaps.getOrNull(it) }
+    }
+
+    if (index in updatedPhotos.indices) {
+        updatedPhotos[index] = bitmap
+    }
+
+    return copy(
+        heroImageBitmap = if (index == 0) bitmap else heroImageBitmap ?: updatedPhotos.firstOrNull { it != null },
+        photoBitmaps = updatedPhotos
+    )
+}
+
+private data class SelectedCafeTransitionState(
+    val cafeId: String,
+    val sourceBounds: Rect,
+    val heroModel: Any
+)
+
+private fun lerpFloat(start: Float, stop: Float, fraction: Float): Float {
+    return start + (stop - start) * fraction
+}
+
+private fun sCurve(progress: Float): Float {
+    val t = progress.coerceIn(0f, 1f)
+    return t * t * t * (t * (t * 6f - 15f) + 10f)
+}
+
+private fun transitionCardFadeAlpha(progress: Float): Float {
+    return 1f - sCurve((progress / 0.26f).coerceIn(0f, 1f))
+}
+
+private fun transitionStackFadeAlpha(progress: Float): Float {
+    return 1f - sCurve((progress / 0.24f).coerceIn(0f, 1f))
+}
+
+private fun transitionRevealAlpha(progress: Float): Float {
+    return sCurve(((progress - 0.08f) / 0.38f).coerceIn(0f, 1f))
+}
+
+private fun transitionDetailSurfaceAlpha(progress: Float): Float {
+    return sCurve(((progress - 0.16f) / 0.24f).coerceIn(0f, 1f))
+}
+
+private data class DetailOverlayLayoutSpec(
+    val horizontalInset: androidx.compose.ui.unit.Dp = 16.dp,
+    val topInset: androidx.compose.ui.unit.Dp = 34.dp,
+    val bottomInset: androidx.compose.ui.unit.Dp = 52.dp,
+    val collapsedCornerRadius: androidx.compose.ui.unit.Dp = 16.dp,
+    val expandedCornerRadius: androidx.compose.ui.unit.Dp = 24.dp,
+    val collapsedHeroHeight: androidx.compose.ui.unit.Dp = 340.dp,
+    val expandedHeroHeight: androidx.compose.ui.unit.Dp = 445.dp
 )
 
 private data class VisibleCafeStack(
@@ -244,8 +338,50 @@ class MainActivity : ComponentActivity() {
 @Composable
 fun AppNav(){
     val navController = rememberNavController()
-    val isUserLoggedIn by remember { mutableStateOf(false) }
-    NavHost(navController = navController, startDestination = if (isUserLoggedIn) Screen.MainScreen.route else Screen.LoginScreen.route) {
+    val sessionStatus by supabase.auth.sessionStatus.collectAsState()
+
+    LaunchedEffect(sessionStatus) {
+        when (sessionStatus) {
+            is SessionStatus.Authenticated -> {
+                if (navController.currentDestination?.route == Screen.LoginScreen.route) {
+                    navController.navigate(Screen.MainScreen.route) {
+                        popUpTo(navController.graph.id) { inclusive = true }
+                    }
+                }
+            }
+            is SessionStatus.NotAuthenticated -> {
+                val currentRoute = navController.currentDestination?.route
+                if (currentRoute != null && currentRoute != Screen.LoginScreen.route) {
+                    navController.navigate(Screen.LoginScreen.route) {
+                        popUpTo(navController.graph.id) { inclusive = true }
+                    }
+                }
+            }
+            SessionStatus.Initializing,
+            is SessionStatus.RefreshFailure -> Unit
+        }
+    }
+
+    if (sessionStatus is SessionStatus.Initializing) {
+        Box(
+            modifier = Modifier.fillMaxSize(),
+            contentAlignment = Alignment.Center
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                CircularProgressIndicator()
+                Spacer(modifier = Modifier.height(12.dp))
+                Text("Checking your session...")
+            }
+        }
+        return
+    }
+
+    val startDestination = when (sessionStatus) {
+        is SessionStatus.Authenticated -> Screen.MainScreen.route
+        else -> Screen.LoginScreen.route
+    }
+
+    NavHost(navController = navController, startDestination = startDestination) {
         composable(Screen.LoginScreen.route) { LoginScreen(navController) }
         composable(Screen.MainScreen.route) { MainScreen(navController) }
         composable(Screen.MapScreen.route) { MapScreen(navController) }
@@ -268,12 +404,67 @@ fun MainScreen(navController: NavHostController) {
     val fusedLocationClient = remember { LocationServices.getFusedLocationProviderClient(context) }
     val placesClient = remember(context) { if (Places.isInitialized()) Places.createClient(context) else null }
     val hasLocationPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
+    val scope = rememberCoroutineScope()
 
     var allCafes by remember { mutableStateOf<List<Cafe>>(emptyList()) }
     var currentVisibleCafes by remember { mutableStateOf<List<Cafe>>(emptyList()) }
     var nextCafeIndex by rememberSaveable { mutableIntStateOf(0) }
     var isLoading by remember { mutableStateOf(true) }
     var loadError by remember { mutableStateOf<String?>(null) }
+    var expandedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
+    var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
+    var transitionState by remember { mutableStateOf<SelectedCafeTransitionState?>(null) }
+    var overlayHostBounds by remember { mutableStateOf<Rect?>(null) }
+    var isPreparingDetailTransition by remember { mutableStateOf(false) }
+    val detailProgress = remember { Animatable(0f) }
+    val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
+
+    val expandedCafe = remember(allCafes, expandedCafeId) {
+        expandedCafeId?.let { cafeId ->
+            allCafes.firstOrNull { it.id == cafeId } ?: CafeRepository.getCafe(cafeId)
+        }
+    }
+    val isDetailExpanded = expandedCafe != null
+    val loadedExpandedPhotoCount = expandedCafe?.photoBitmaps?.count { it != null } ?: 0
+
+    LaunchedEffect(expandedCafe) {
+        if (expandedCafe != null) {
+            overlayCafe = expandedCafe
+        }
+    }
+
+    LaunchedEffect(expandedCafeId) {
+        if (expandedCafeId != null) {
+            isPreparingDetailTransition = false
+            detailProgress.animateTo(
+                targetValue = 1f,
+                animationSpec = tween(durationMillis = 460, easing = FastOutSlowInEasing)
+            )
+        } else if (overlayCafe != null || detailProgress.value > 0f) {
+            detailProgress.animateTo(
+                targetValue = 0f,
+                animationSpec = tween(durationMillis = 320, easing = FastOutSlowInEasing)
+            )
+            overlayCafe = null
+            transitionState = null
+            isPreparingDetailTransition = false
+        }
+    }
+
+    val updateCafePhoto: (String, Int, Bitmap) -> Unit = { cafeId, photoIndex, bitmap ->
+        val updatedCafes = allCafes.map { cafe ->
+            if (cafe.id == cafeId) cafe.withLoadedPhoto(photoIndex, bitmap) else cafe
+        }
+        allCafes = updatedCafes
+        CafeRepository.setLiveCafes(updatedCafes)
+
+        val replacement = updatedCafes.firstOrNull { it.id == cafeId }
+        if (replacement != null && currentVisibleCafes.any { it.id == cafeId }) {
+            currentVisibleCafes = currentVisibleCafes.map { visibleCafe ->
+                if (visibleCafe.id == cafeId) replacement else visibleCafe
+            }
+        }
+    }
 
     val setVisibleStack: (List<Cafe>) -> Unit = { cafes ->
         val visibleStack = buildVisibleCafeStack(cafes)
@@ -319,55 +510,242 @@ fun MainScreen(navController: NavHostController) {
                 setVisibleStack(emptyList())
                 isLoading = false
             },
-            onCafePhotoLoaded = { cafeId, bitmap ->
-                val updatedCafes = allCafes.map { cafe ->
-                    if (cafe.id == cafeId) cafe.copy(imageBitmap = bitmap) else cafe
-                }
-                allCafes = updatedCafes
-                CafeRepository.setLiveCafes(updatedCafes)
-
-                val replacement = updatedCafes.firstOrNull { it.id == cafeId } ?: return@fetchNearbyCafes
-                if (currentVisibleCafes.any { it.id == cafeId }) {
-                    currentVisibleCafes = currentVisibleCafes.map { visibleCafe ->
-                        if (visibleCafe.id == cafeId) replacement else visibleCafe
-                    }
-                }
-            }
+            onCafePhotoLoaded = updateCafePhoto
         )
     }
 
-    Scaffold(topBar = { TopSearchBar() }, bottomBar = { BottomNavBar(navController) }, containerColor = Color(0xFFC79A87)) { innerPadding ->
-        Column(modifier = Modifier.padding(innerPadding).fillMaxSize(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center) {
-            when {
-                isLoading -> {
-                    CircularProgressIndicator()
-                    Spacer(Modifier.height(12.dp))
-                    Text("Loading nearby cafes...")
-                }
-                loadError != null -> {
-                    Text(loadError ?: "Unable to load cafes.", style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
-                }
-                allCafes.isEmpty() -> {
-                    Text("No nearby cafes found.", style = MaterialTheme.typography.headlineSmall)
-                }
-                else -> {
-                    val onCafeSwiped: (Cafe) -> Unit = { swipedCafe ->
-                        val visibleStack = advanceVisibleCafeStack(
-                            visibleCafes = currentVisibleCafes,
-                            swipedCafe = swipedCafe,
-                            allCafes = allCafes,
-                            nextCafeIndex = nextCafeIndex
-                        )
-                        currentVisibleCafes = visibleStack.cafes
-                        nextCafeIndex = visibleStack.nextCafeIndex
-                    }
+    BackHandler(enabled = isDetailExpanded) {
+        expandedCafeId = null
+    }
 
-                    SwipeableCafeStack(
-                        cafes = currentVisibleCafes,
-                        navController = navController,
-                        onSwipeLeft = onCafeSwiped,
-                        onSwipeRight = onCafeSwiped
+    LaunchedEffect(expandedCafe?.id, loadedExpandedPhotoCount, placesClient) {
+        val cafe = expandedCafe ?: return@LaunchedEffect
+        val client = placesClient ?: return@LaunchedEffect
+        if (cafe.photoMetadatas.isEmpty()) return@LaunchedEffect
+
+        val nextPhotoIndex = cafe.photoBitmaps.indexOfFirst { it == null }
+        if (nextPhotoIndex == -1) return@LaunchedEffect
+
+        val bitmap = fetchCafePhotoBitmap(client, cafe.photoMetadatas[nextPhotoIndex]) ?: return@LaunchedEffect
+        updateCafePhoto(cafe.id, nextPhotoIndex, bitmap)
+    }
+
+    LaunchedEffect(
+        currentVisibleCafes.firstOrNull()?.id,
+        currentVisibleCafes.firstOrNull()?.photoBitmaps?.count { it != null } ?: 0,
+        placesClient,
+        expandedCafeId
+    ) {
+        if (expandedCafeId != null) return@LaunchedEffect
+        val cafe = currentVisibleCafes.firstOrNull() ?: return@LaunchedEffect
+        val client = placesClient ?: return@LaunchedEffect
+        if (cafe.photoMetadatas.size <= 1) return@LaunchedEffect
+
+        val preloadIndices = cafe.photoMetadatas.indices.filter { index ->
+            index <= 1 && cafe.photoBitmaps.getOrNull(index) == null
+        }
+
+        for (photoIndex in preloadIndices) {
+            val bitmap = fetchCafePhotoBitmap(client, cafe.photoMetadatas[photoIndex]) ?: break
+            updateCafePhoto(cafe.id, photoIndex, bitmap)
+        }
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .onGloballyPositioned { coordinates ->
+                overlayHostBounds = coordinates.boundsInRoot()
+            }
+    ) {
+        Scaffold(
+            topBar = {
+                TopSearchBar(
+                    modifier = Modifier.graphicsLayer {
+                        alpha = 1f - detailProgress.value
+                    },
+                    enabled = detailProgress.value < 0.01f
+                )
+            },
+            bottomBar = {
+                BottomNavBar(
+                    navController = navController,
+                    enabled = detailProgress.value < 0.01f,
+                    dimFraction = detailProgress.value
+                )
+            },
+            containerColor = Color(0xFFC79A87)
+        ) { innerPadding ->
+            Box(
+                modifier = Modifier
+                    .padding(innerPadding)
+                    .fillMaxSize()
+            ) {
+                val stackAlpha by animateFloatAsState(
+                    targetValue = transitionStackFadeAlpha(detailProgress.value),
+                    animationSpec = tween(durationMillis = 90, easing = FastOutSlowInEasing),
+                    label = "stackAlpha"
+                )
+                val stackScale by animateFloatAsState(
+                    targetValue = 1f - (0.015f * detailProgress.value),
+                    animationSpec = tween(durationMillis = 120, easing = FastOutSlowInEasing),
+                    label = "stackScale"
+                )
+
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer {
+                            alpha = stackAlpha
+                            scaleX = stackScale
+                            scaleY = stackScale
+                        },
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    when {
+                        isLoading -> {
+                            CircularProgressIndicator()
+                            Spacer(Modifier.height(12.dp))
+                            Text("Loading nearby cafes...")
+                        }
+                        loadError != null -> {
+                            Text(loadError ?: "Unable to load cafes.", style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
+                        }
+                        allCafes.isEmpty() -> {
+                            Text("No nearby cafes found.", style = MaterialTheme.typography.headlineSmall)
+                        }
+                        else -> {
+                            val renderTopCardOnly = isPreparingDetailTransition ||
+                                transitionState != null ||
+                                expandedCafeId != null ||
+                                detailProgress.value > 0f
+                            val onCafeSwiped: (Cafe) -> Unit = { swipedCafe ->
+                                if (expandedCafeId == swipedCafe.id) {
+                                    expandedCafeId = null
+                                }
+                                val visibleStack = advanceVisibleCafeStack(
+                                    visibleCafes = currentVisibleCafes,
+                                    swipedCafe = swipedCafe,
+                                    allCafes = allCafes,
+                                    nextCafeIndex = nextCafeIndex
+                                )
+                                currentVisibleCafes = visibleStack.cafes
+                                nextCafeIndex = visibleStack.nextCafeIndex
+                            }
+
+                            SwipeableCafeStack(
+                                cafes = currentVisibleCafes,
+                                transitioningCafeId = transitionState?.cafeId,
+                                transitionProgress = detailProgress.value,
+                                renderTopCardOnly = renderTopCardOnly,
+                                onCafeSelected = { cafe, sourceBounds, heroModel ->
+                                    transitionState = SelectedCafeTransitionState(
+                                        cafeId = cafe.id,
+                                        sourceBounds = sourceBounds,
+                                        heroModel = heroModel
+                                    )
+                                    overlayCafe = cafe
+                                    isPreparingDetailTransition = true
+                                    scope.launch {
+                                        detailProgress.snapTo(0f)
+                                        withFrameNanos { }
+                                        expandedCafeId = cafe.id
+                                    }
+                                },
+                                enabled = !isDetailExpanded,
+                                onSwipeLeft = onCafeSwiped,
+                                onSwipeRight = onCafeSwiped
+                            )
+                        }
+                    }
+                }
+            }
+        }
+
+        if (overlayCafe != null && transitionState != null && (expandedCafeId != null || detailProgress.value > 0f)) {
+            val scrimAlpha by animateFloatAsState(
+                targetValue = 0.18f * detailProgress.value,
+                animationSpec = tween(durationMillis = 120, easing = FastOutSlowInEasing),
+                label = "detailScrimAlpha"
+            )
+
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .background(Color.Black.copy(alpha = scrimAlpha))
+            ) {
+                BoxWithConstraints(
+                    modifier = Modifier.matchParentSize()
+                ) {
+                    val density = LocalDensity.current
+                    val sourceBounds = transitionState?.sourceBounds
+                    val hostBounds = overlayHostBounds
+
+                    val endHorizontalInsetPx = with(density) { detailOverlayLayoutSpec.horizontalInset.toPx() }
+                    val endTopInsetPx = with(density) { detailOverlayLayoutSpec.topInset.toPx() }
+                    val endBottomInsetPx = with(density) { detailOverlayLayoutSpec.bottomInset.toPx() }
+                    val endWidthPx = with(density) { maxWidth.toPx() } - (endHorizontalInsetPx * 2f)
+                    val endHeightPx = with(density) { maxHeight.toPx() } - endTopInsetPx - endBottomInsetPx
+                    val endLeftPx = endHorizontalInsetPx
+                    val endTopPx = endTopInsetPx
+
+                    val animatedCornerRadius = lerp(
+                        detailOverlayLayoutSpec.collapsedCornerRadius,
+                        detailOverlayLayoutSpec.expandedCornerRadius,
+                        detailProgress.value
                     )
+                    val animatedHeroHeight = lerp(
+                        detailOverlayLayoutSpec.collapsedHeroHeight,
+                        detailOverlayLayoutSpec.expandedHeroHeight,
+                        detailProgress.value
+                    )
+
+                    val fallbackStartWidthPx = with(density) { (maxWidth * 0.9f).toPx() }
+                    val fallbackStartHeightPx = fallbackStartWidthPx / 0.58f
+                    val hasValidSourceBounds = sourceBounds != null &&
+                        hostBounds != null &&
+                        sourceBounds.width > 0f &&
+                        sourceBounds.height > 0f
+
+                    val startLeftPx = if (hasValidSourceBounds) {
+                        sourceBounds.left - hostBounds.left
+                    } else {
+                        endLeftPx
+                    }
+                    val startTopPx = if (hasValidSourceBounds) {
+                        sourceBounds.top - hostBounds.top
+                    } else {
+                        endTopPx
+                    }
+                    val startWidthPx = if (hasValidSourceBounds) sourceBounds.width else fallbackStartWidthPx
+                    val startHeightPx = if (hasValidSourceBounds) sourceBounds.height else fallbackStartHeightPx
+
+                    val animatedLeftPx = lerpFloat(startLeftPx, endLeftPx, detailProgress.value)
+                    val animatedTopPx = lerpFloat(startTopPx, endTopPx, detailProgress.value)
+                    val animatedWidthPx = lerpFloat(startWidthPx, endWidthPx, detailProgress.value)
+                    val animatedHeightPx = lerpFloat(startHeightPx, endHeightPx, detailProgress.value)
+
+                    overlayCafe?.let { cafe ->
+                        transitionState?.let { transition ->
+                            ExpandedCafeDetailOverlay(
+                                navController = navController,
+                                cafe = cafe,
+                                onClose = { expandedCafeId = null },
+                                cornerRadius = animatedCornerRadius,
+                                heroHeight = animatedHeroHeight,
+                                sharedHeroModel = transition.heroModel,
+                                transitionProgress = detailProgress.value,
+                                modifier = Modifier
+                                    .graphicsLayer {
+                                        translationX = animatedLeftPx
+                                        translationY = animatedTopPx
+                                    }
+                                    .width(with(density) { animatedWidthPx.toDp() })
+                                    .height(with(density) { animatedHeightPx.toDp() })
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -379,7 +757,7 @@ private fun fetchNearbyCafes(
     placesClient: PlacesClient,
     onSuccess: (List<Cafe>) -> Unit,
     onError: (String) -> Unit,
-    onCafePhotoLoaded: (String, Bitmap) -> Unit
+    onCafePhotoLoaded: (String, Int, Bitmap) -> Unit
 ) {
     getCurrentOrLastLocation(
         fusedLocationClient = fusedLocationClient,
@@ -433,7 +811,7 @@ private fun searchNearbyCafes(
     location: Location,
     onSuccess: (List<Cafe>) -> Unit,
     onError: (String) -> Unit,
-    onCafePhotoLoaded: (String, Bitmap) -> Unit
+    onCafePhotoLoaded: (String, Int, Bitmap) -> Unit
 ) {
     val locationRestriction = CircularBounds.newInstance(LatLng(location.latitude, location.longitude), 2_000.0)
     val placeFields = listOf(
@@ -463,6 +841,7 @@ private fun searchNearbyCafes(
                 fetchCafePhoto(
                     placesClient = placesClient,
                     placeId = placeId,
+                    photoIndex = 0,
                     photoMetadata = metadata,
                     onSuccess = onCafePhotoLoaded
                 )
@@ -476,8 +855,9 @@ private fun searchNearbyCafes(
 private fun fetchCafePhoto(
     placesClient: PlacesClient,
     placeId: String,
+    photoIndex: Int,
     photoMetadata: PhotoMetadata,
-    onSuccess: (String, Bitmap) -> Unit
+    onSuccess: (String, Int, Bitmap) -> Unit
 ) {
     val request = FetchPhotoRequest.builder(photoMetadata)
         .setMaxWidth(1200)
@@ -486,8 +866,21 @@ private fun fetchCafePhoto(
 
     placesClient.fetchPhoto(request)
         .addOnSuccessListener { response ->
-            onSuccess(placeId, response.bitmap)
+            onSuccess(placeId, photoIndex, response.bitmap)
         }
+}
+
+private suspend fun fetchCafePhotoBitmap(
+    placesClient: PlacesClient,
+    photoMetadata: PhotoMetadata
+): Bitmap? {
+    return runCatching {
+        val request = FetchPhotoRequest.builder(photoMetadata)
+            .setMaxWidth(1400)
+            .setMaxHeight(1100)
+            .build()
+        placesClient.fetchPhoto(request).await().bitmap
+    }.getOrNull()
 }
 
 private fun Place.toCafe(): Cafe? {
@@ -512,7 +905,8 @@ private fun Place.toCafe(): Cafe? {
         features = listOf("Nearby"),
         ambience = listOf("Coffee"),
         rating = ratingValue,
-        userRatingCount = ratingCount
+        userRatingCount = ratingCount,
+        photoMetadatas = photoMetadatas.orEmpty()
     )
 }
 
@@ -570,7 +964,7 @@ fun SavedCafeRow(
                 color = Color(0xFFF0F0F0)
             ) {
                 AsyncImage(
-                    model = cafe.imageBitmap ?: cafe.imageUrl ?: cafe.imageResId,
+                    model = cafe.primaryImageModel(),
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
@@ -593,10 +987,10 @@ fun SavedCafeRow(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun TopSearchBar() {
+fun TopSearchBar(modifier: Modifier = Modifier, enabled: Boolean = true) {
     var text by remember { mutableStateOf("") }
-    Surface(modifier = Modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 16.dp, vertical = 10.dp), shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
-        TextField(value = text, onValueChange = { text = it }, placeholder = { Text("Search cafes...") }, leadingIcon = { Icon(Icons.Filled.Menu, null) }, trailingIcon = { Icon(Icons.Filled.Search, null) }, singleLine = true, modifier = Modifier.fillMaxWidth(), colors = TextFieldDefaults.colors(focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent, disabledContainerColor = Color.Transparent, focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent))
+    Surface(modifier = modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 16.dp, vertical = 10.dp), shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
+        TextField(value = text, onValueChange = { text = it }, placeholder = { Text("Search cafes...") }, leadingIcon = { Icon(Icons.Filled.Menu, null) }, trailingIcon = { Icon(Icons.Filled.Search, null) }, singleLine = true, enabled = enabled, modifier = Modifier.fillMaxWidth(), colors = TextFieldDefaults.colors(focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent, disabledContainerColor = Color.Transparent, focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent))
     }
 }
 
@@ -828,21 +1222,36 @@ fun SavedTile(modifier: Modifier = Modifier, plus: Boolean = false) {
 @Composable
 fun SavedCafeTile(cafe: Cafe, navController: NavHostController, modifier: Modifier = Modifier) {
     val outlineColor = Color(0xFFE6E6E6)
-    OutlinedCard(modifier = modifier.aspectRatio(1f), shape = RoundedCornerShape(4.dp), border = BorderStroke(1.dp, outlineColor)) { Box(modifier = Modifier.fillMaxSize()) { Box(modifier = Modifier.fillMaxSize().clickable { navController.navigate(Screen.CafeDetails.createRoute(cafe.id)) }) { AsyncImage(model = cafe.imageBitmap ?: cafe.imageUrl ?: cafe.imageResId, contentDescription = cafe.name, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }; IconButton(onClick = { BookmarkRepository.toggle(cafe.id) }, modifier = Modifier.align(Alignment.TopEnd)) { Icon(Icons.Filled.Bookmark, contentDescription = "Remove", tint = Color.White) } } }
+    OutlinedCard(modifier = modifier.aspectRatio(1f), shape = RoundedCornerShape(4.dp), border = BorderStroke(1.dp, outlineColor)) { Box(modifier = Modifier.fillMaxSize()) { Box(modifier = Modifier.fillMaxSize().clickable { navController.navigate(Screen.CafeDetails.createRoute(cafe.id)) }) { AsyncImage(model = cafe.primaryImageModel(), contentDescription = cafe.name, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }; IconButton(onClick = { BookmarkRepository.toggle(cafe.id) }, modifier = Modifier.align(Alignment.TopEnd)) { Icon(Icons.Filled.Bookmark, contentDescription = "Remove", tint = Color.White) } } }
 }
 @Composable
-fun PlaceCard(navController: NavHostController, cafe: Cafe, modifier: Modifier = Modifier) {
+fun PlaceCard(
+    cafe: Cafe,
+    onOpen: (Rect, Any) -> Unit,
+    modifier: Modifier = Modifier,
+    transitionAlpha: Float = 1f
+) {
+    var cardBounds by remember(cafe.id) { mutableStateOf<Rect?>(null) }
     Card(
-        modifier = modifier.fillMaxWidth(),
+        modifier = modifier
+            .fillMaxWidth()
+            .graphicsLayer {
+                alpha = transitionAlpha
+            }
+            .onGloballyPositioned { coordinates ->
+                cardBounds = coordinates.boundsInRoot()
+            },
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = Color.White),
         border = BorderStroke(2.dp, Color.Black),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column {
-            Box(modifier = Modifier.fillMaxWidth().height(340.dp).clickable { navController.navigate(Screen.CafeDetails.createRoute(cafe.id)) }) {
+            Box(modifier = Modifier.fillMaxWidth().height(340.dp).clickable {
+                onOpen(cardBounds ?: Rect.Zero, cafe.primaryImageModel())
+            }) {
                 AsyncImage(
-                    model = cafe.imageBitmap ?: cafe.imageUrl ?: cafe.imageResId,
+                    model = cafe.primaryImageModel(),
                     contentDescription = null,
                     modifier = Modifier.fillMaxSize(),
                     contentScale = ContentScale.Crop
@@ -876,20 +1285,287 @@ fun PlaceCard(navController: NavHostController, cafe: Cafe, modifier: Modifier =
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+fun ExpandedCafeDetailOverlay(
+    navController: NavHostController,
+    cafe: Cafe,
+    onClose: () -> Unit,
+    cornerRadius: androidx.compose.ui.unit.Dp,
+    heroHeight: androidx.compose.ui.unit.Dp,
+    sharedHeroModel: Any,
+    transitionProgress: Float,
+    modifier: Modifier = Modifier
+) {
+    val reviews = ReviewRepository.reviewsFor(cafe.id)
+    val isBookmarked = BookmarkRepository.isBookmarked(cafe.id)
+    val pageCount = cafe.photoPageCount()
+    val pagerState = rememberPagerState(pageCount = { pageCount })
+    val detailRevealAlpha = transitionRevealAlpha(transitionProgress)
+    val detailSurfaceAlpha = transitionDetailSurfaceAlpha(transitionProgress)
+    val pagerAlpha = ((transitionProgress - 0.22f) / 0.18f).coerceIn(0f, 1f)
+    val overlayAlpha = sCurve(((transitionProgress - 0.04f) / 0.34f).coerceIn(0f, 1f))
+
+    Card(
+        modifier = modifier.graphicsLayer { alpha = overlayAlpha },
+        shape = RoundedCornerShape(cornerRadius),
+        colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = detailSurfaceAlpha)),
+        elevation = CardDefaults.cardElevation(defaultElevation = 10.dp),
+        border = BorderStroke(2.dp, Color(0xFF4A231C).copy(alpha = 0.75f))
+    ) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            AsyncImage(
+                model = sharedHeroModel,
+                contentDescription = cafe.name,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(heroHeight)
+                    .graphicsLayer {
+                        // Keep the tapped card's image visible until the detail content has actually appeared.
+                        alpha = 1f - detailRevealAlpha
+                    },
+                contentScale = ContentScale.Crop
+            )
+
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .graphicsLayer {
+                        alpha = detailRevealAlpha
+                    },
+                contentPadding = PaddingValues(bottom = 28.dp),
+                verticalArrangement = Arrangement.spacedBy(18.dp)
+            ) {
+                item {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(heroHeight)
+                    ) {
+                        AsyncImage(
+                            model = sharedHeroModel,
+                            contentDescription = cafe.name,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .graphicsLayer {
+                                    alpha = 1f - pagerAlpha
+                                },
+                            contentScale = ContentScale.Crop
+                        )
+
+                        HorizontalPager(
+                            state = pagerState,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .graphicsLayer {
+                                    alpha = pagerAlpha
+                                }
+                        ) { page ->
+                            val pageModel = cafe.photoPageModel(page)
+                            if (pageModel != null) {
+                                AsyncImage(
+                                    model = pageModel,
+                                    contentDescription = cafe.name,
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentScale = ContentScale.Crop
+                                )
+                            } else {
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize(),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    AsyncImage(
+                                        model = sharedHeroModel,
+                                        contentDescription = cafe.name,
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .graphicsLayer { alpha = 0.35f },
+                                        contentScale = ContentScale.Crop
+                                    )
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxSize()
+                                            .background(Color(0xFF4A231C).copy(alpha = 0.12f))
+                                    )
+                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                        CircularProgressIndicator(color = Color(0xFF4A231C))
+                                        Spacer(modifier = Modifier.height(12.dp))
+                                        Text("Loading photo...", color = Color(0xFF4A231C))
+                                    }
+                                }
+                            }
+                        }
+
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(100.dp)
+                                .align(Alignment.BottomCenter)
+                                .background(
+                                    Brush.verticalGradient(
+                                        listOf(Color.Transparent, Color.Black.copy(alpha = 0.5f))
+                                    )
+                                )
+                        )
+
+                        IconButton(
+                            onClick = onClose,
+                            modifier = Modifier
+                                .align(Alignment.TopStart)
+                                .padding(16.dp)
+                                .background(Color.Black.copy(alpha = 0.35f), CircleShape)
+                        ) {
+                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close details", tint = Color.White)
+                        }
+
+                        IconButton(
+                            onClick = { BookmarkRepository.toggle(cafe.id) },
+                            modifier = Modifier
+                                .align(Alignment.TopEnd)
+                                .padding(16.dp)
+                                .background(Color.Black.copy(alpha = 0.35f), CircleShape)
+                        ) {
+                            Icon(
+                                imageVector = if (isBookmarked) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder,
+                                contentDescription = if (isBookmarked) "Remove bookmark" else "Add bookmark",
+                                tint = Color.White
+                            )
+                        }
+
+                        Column(
+                            modifier = Modifier
+                                .align(Alignment.BottomStart)
+                                .padding(horizontal = 20.dp, vertical = 18.dp)
+                        ) {
+                            Text(
+                                text = cafe.name,
+                                style = MaterialTheme.typography.headlineSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = Color.White
+                            )
+                            if (pageCount > 1) {
+                                Spacer(modifier = Modifier.height(10.dp))
+                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                    repeat(pageCount) { page ->
+                                        Box(
+                                            modifier = Modifier
+                                                .size(if (page == pagerState.currentPage) 9.dp else 7.dp)
+                                                .background(
+                                                    color = if (page == pagerState.currentPage) Color.White else Color.White.copy(alpha = 0.45f),
+                                                    shape = CircleShape
+                                                )
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            
+
+                item {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 20.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        if (cafe.rating != null && (cafe.userRatingCount ?: 0) > 0) {
+                            Row(verticalAlignment = Alignment.CenterVertically) {
+                                RatingStars(cafe.rating)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text(
+                                    text = String.format(Locale.US, "%.1f (%d reviews)", cafe.rating, cafe.userRatingCount ?: 0),
+                                    color = Color.Gray
+                                )
+                            }
+                        }
+
+                        Text(cafe.status, color = Color(0xFF4A231C), style = MaterialTheme.typography.bodyMedium)
+                        Text("Address: ${cafe.address}", style = MaterialTheme.typography.bodyLarge)
+                        Text("Phone: ${cafe.phone}", style = MaterialTheme.typography.bodyLarge)
+                        HoursDropdown(cafe.hours)
+                    }
+                }
+
+                item {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 20.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("Features", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        cafe.features.forEach { feature ->
+                            Text("- $feature", style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                }
+
+                item {
+                    Column(
+                        modifier = Modifier.padding(horizontal = 20.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Text("Ambience", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        cafe.ambience.forEach { vibe ->
+                            Text("- $vibe", style = MaterialTheme.typography.bodyMedium)
+                        }
+                    }
+                }
+
+                item {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Reviews", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
+                        TextButton(onClick = { navController.navigate(Screen.WriteReview.createRoute(cafe.id)) }) {
+                            Text("Write review")
+                        }
+                    }
+                }
+
+                if (reviews.isEmpty()) {
+                    item {
+                        Text(
+                            text = "No reviews yet.",
+                            color = Color.Gray,
+                            modifier = Modifier.padding(horizontal = 20.dp)
+                        )
+                    }
+                } else {
+                    items(reviews) { review ->
+                        OutlinedCard(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 20.dp)
+                        ) {
+                            Text(review, modifier = Modifier.padding(12.dp))
+                        }
+                    }
+                }
+            }
+
+        }
+    }
+}
+
 @Composable
 fun RatingStars(rating: Float) {
     Row { repeat(rating.toInt()) { Icon(Icons.Filled.Star, contentDescription = null, tint = Color(0xFFFFC107)) }; repeat(5 - rating.toInt()) { Icon(Icons.Filled.Star, contentDescription = null, tint = Color.LightGray) } }
 }
 
 @Composable
-fun BottomNavBar(navController: NavHostController) {
+fun BottomNavBar(navController: NavHostController, enabled: Boolean = true, dimFraction: Float = if (enabled) 0f else 1f) {
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val route = navBackStackEntry?.destination?.route
-    NavigationBar {
-        NavigationBarItem(selected = route == Screen.MainScreen.route, onClick = { navController.navigate(Screen.MainScreen.route) }, icon = { Icon(Icons.Filled.Search, null) })
-        NavigationBarItem(selected = route == Screen.MapScreen.route, onClick = { navController.navigate(Screen.MapScreen.route) }, icon = { Icon(Icons.Filled.Place, null) })
-        NavigationBarItem(selected = route == Screen.BookmarkScreen.route, onClick = { navController.navigate(Screen.BookmarkScreen.route) }, icon = { Icon(Icons.Filled.Bookmark, null) })
-        NavigationBarItem(selected = route == Screen.ProfileScreen.route, onClick = { navController.navigate(Screen.ProfileScreen.route) }, icon = { Icon(Icons.Filled.Person, null) })
+    NavigationBar(
+        modifier = Modifier.graphicsLayer { alpha = 1f - (0.55f * dimFraction) }
+    ) {
+        NavigationBarItem(selected = route == Screen.MainScreen.route, enabled = enabled, onClick = { navController.navigate(Screen.MainScreen.route) }, icon = { Icon(Icons.Filled.Search, null) })
+        NavigationBarItem(selected = route == Screen.MapScreen.route, enabled = enabled, onClick = { navController.navigate(Screen.MapScreen.route) }, icon = { Icon(Icons.Filled.Place, null) })
+        NavigationBarItem(selected = route == Screen.BookmarkScreen.route, enabled = enabled, onClick = { navController.navigate(Screen.BookmarkScreen.route) }, icon = { Icon(Icons.Filled.Bookmark, null) })
+        NavigationBarItem(selected = route == Screen.ProfileScreen.route, enabled = enabled, onClick = { navController.navigate(Screen.ProfileScreen.route) }, icon = { Icon(Icons.Filled.Person, null) })
     }
 }
 
@@ -1268,7 +1944,16 @@ fun RecentItemRow(name: String, address: String) {
 }
 
 @Composable
-fun SwipeableCafeStack(cafes: List<Cafe>, navController: NavHostController, onSwipeLeft: (Cafe) -> Unit, onSwipeRight: (Cafe) -> Unit) {
+fun SwipeableCafeStack(
+    cafes: List<Cafe>,
+    transitioningCafeId: String?,
+    transitionProgress: Float,
+    renderTopCardOnly: Boolean,
+    onCafeSelected: (Cafe, Rect, Any) -> Unit,
+    enabled: Boolean,
+    onSwipeLeft: (Cafe) -> Unit,
+    onSwipeRight: (Cafe) -> Unit
+) {
     if (cafes.isEmpty()) return
     val scope = rememberCoroutineScope()
     val density = LocalDensity.current
@@ -1280,13 +1965,19 @@ fun SwipeableCafeStack(cafes: List<Cafe>, navController: NavHostController, onSw
     var exitingCafe by remember { mutableStateOf<Cafe?>(null) }
     var isSwipeTransitionRunning by remember { mutableStateOf(false) }
 
-    val renderedCafes = remember(cafes, exitingCafe, isSwipeTransitionRunning) {
+    val stackCafes = remember(cafes, renderTopCardOnly) {
+        if (renderTopCardOnly) cafes.take(1) else cafes
+    }
+
+    val renderedCafes = remember(stackCafes, exitingCafe, isSwipeTransitionRunning) {
         if (isSwipeTransitionRunning) {
-            cafes.filterNot { it.id == exitingCafe?.id }
+            stackCafes.filterNot { it.id == exitingCafe?.id }
         } else {
-            cafes
+            stackCafes
         }
     }
+
+    if (renderedCafes.isEmpty() && exitingCafe == null) return
 
     Box(modifier = Modifier.fillMaxWidth(0.9f).aspectRatio(0.58f), contentAlignment = Alignment.Center) {
         // Draw from back to front
@@ -1314,19 +2005,24 @@ fun SwipeableCafeStack(cafes: List<Cafe>, navController: NavHostController, onSw
                     animationSpec = tween(durationMillis = 120, easing = FastOutSlowInEasing),
                     label = "stackYOffset-${cafe.id}"
                 )
+                val transitionAlpha = if (cafe.id == transitioningCafeId) {
+                    transitionCardFadeAlpha(transitionProgress)
+                } else {
+                    1f
+                }
                 val baseModifier = Modifier
                     .zIndex(if (isTopCard) 100f else 10f - i.toFloat())
                     .offset(y = animatedYOffset)
                     .scale(animatedScale)
 
-                val modifier = if (isTopCard && !isSwipeTransitionRunning) {
+                val modifier = if (isTopCard && enabled && !isSwipeTransitionRunning) {
                     baseModifier
                         .graphicsLayer {
                             translationX = offsetX.value
                             rotationZ = cardRotation.value
                         }
-                        .pointerInput(cafe.id, isSwipeTransitionRunning) {
-                            if (!isSwipeTransitionRunning) {
+                        .pointerInput(cafe.id, isSwipeTransitionRunning, enabled) {
+                            if (enabled && !isSwipeTransitionRunning) {
                                 detectDragGestures(
                                     onDrag = { change, drag ->
                                         change.consume()
@@ -1375,7 +2071,7 @@ fun SwipeableCafeStack(cafes: List<Cafe>, navController: NavHostController, onSw
                                                             dampingRatio = Spring.DampingRatioNoBouncy,
                                                             stiffness = Spring.StiffnessMediumLow
                                                         )
-                                                    )
+                                                    ) 
                                                 }
                                             }
                                         }
@@ -1386,21 +2082,27 @@ fun SwipeableCafeStack(cafes: List<Cafe>, navController: NavHostController, onSw
                 } else {
                     baseModifier
                 }
-                PlaceCard(navController = navController, cafe = cafe, modifier = modifier)
+                PlaceCard(
+                    cafe = cafe,
+                    onOpen = { bounds, heroModel -> onCafeSelected(cafe, bounds, heroModel) },
+                    modifier = modifier,
+                    transitionAlpha = transitionAlpha
+                )
             }
         }
 
         exitingCafe?.let { overlayCafe ->
             key("overlay-${overlayCafe.id}") {
                 PlaceCard(
-                    navController = navController,
                     cafe = overlayCafe,
+                    onOpen = { bounds, heroModel -> onCafeSelected(overlayCafe, bounds, heroModel) },
                     modifier = Modifier
                         .zIndex(200f)
                         .graphicsLayer {
                             translationX = offsetX.value
                             rotationZ = cardRotation.value
-                        }
+                        },
+                    transitionAlpha = 1f
                 )
             }
         }
