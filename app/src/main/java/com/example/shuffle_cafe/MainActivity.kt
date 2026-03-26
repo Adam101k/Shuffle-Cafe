@@ -27,7 +27,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
-import androidx.compose.foundation.layout.* 
+import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
@@ -55,6 +55,8 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.Font
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.tooling.preview.Preview
@@ -72,6 +74,8 @@ import androidx.navigation.compose.rememberNavController
 import androidx.navigationevent.NavigationEventInfo
 import coil.compose.AsyncImage
 import com.example.shuffle_cafe.ui.screens.LoginScreen
+import com.example.shuffle_cafe.ui.theme.CafeBrown
+import com.example.shuffle_cafe.ui.theme.CafeDark
 import com.example.shuffle_cafe.ui.theme.Shuffle_CafeTheme
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationServices
@@ -107,10 +111,6 @@ import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.status.SessionStatus
 import io.github.jan.supabase.storage.Storage
 import kotlinx.serialization.Serializable
-import androidx.compose.ui.text.font.Font
-import androidx.compose.ui.text.font.FontFamily
-import com.example.shuffle_cafe.ui.theme.CafeBrown
-import com.example.shuffle_cafe.ui.theme.CafeDark
 
 val supabase = createSupabaseClient(
     supabaseUrl = "https://sknyfkgltazosjmyjfhs.supabase.co",
@@ -617,9 +617,9 @@ fun MainScreen(navController: NavHostController) {
                         }
                         else -> {
                             val renderTopCardOnly = isPreparingDetailTransition ||
-                                transitionState != null ||
-                                expandedCafeId != null ||
-                                detailProgress.value > 0f
+                                    transitionState != null ||
+                                    expandedCafeId != null ||
+                                    detailProgress.value > 0f
                             val onCafeSwiped: (Cafe) -> Unit = { swipedCafe ->
                                 if (expandedCafeId == swipedCafe.id) {
                                     expandedCafeId = null
@@ -704,9 +704,9 @@ fun MainScreen(navController: NavHostController) {
                     val fallbackStartWidthPx = with(density) { (maxWidth * 0.9f).toPx() }
                     val fallbackStartHeightPx = fallbackStartWidthPx / 0.58f
                     val hasValidSourceBounds = sourceBounds != null &&
-                        hostBounds != null &&
-                        sourceBounds.width > 0f &&
-                        sourceBounds.height > 0f
+                            hostBounds != null &&
+                            sourceBounds.width > 0f &&
+                            sourceBounds.height > 0f
 
                     val startLeftPx = if (hasValidSourceBounds) {
                         sourceBounds.left - hostBounds.left
@@ -1462,7 +1462,7 @@ fun ExpandedCafeDetailOverlay(
                         }
                     }
                 }
-            
+
 
                 item {
                     Column(
@@ -2071,7 +2071,7 @@ fun SwipeableCafeStack(
                                                             dampingRatio = Spring.DampingRatioNoBouncy,
                                                             stiffness = Spring.StiffnessMediumLow
                                                         )
-                                                    ) 
+                                                    )
                                                 }
                                             }
                                         }
@@ -2108,6 +2108,7 @@ fun SwipeableCafeStack(
         }
     }
 }
+
 // For the user preferences
 @Serializable
 data class UserPreferences(
@@ -2307,7 +2308,6 @@ fun PreferenceSlider(
         )
     }
 }
-
 
 @Preview(showBackground = true, showSystemUi = true)
 @Composable

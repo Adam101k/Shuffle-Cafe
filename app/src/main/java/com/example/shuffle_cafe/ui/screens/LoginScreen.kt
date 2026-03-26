@@ -35,6 +35,7 @@ import androidx.navigation.NavHostController
 import androidx.navigation.compose.rememberNavController
 import com.example.shuffle_cafe.R
 import com.example.shuffle_cafe.Screen
+import com.example.shuffle_cafe.UserPreferences
 import com.example.shuffle_cafe.supabase
 import com.example.shuffle_cafe.ui.theme.Shuffle_CafeTheme
 import io.github.jan.supabase.auth.exception.AuthErrorCode
@@ -201,7 +202,7 @@ fun LoginScreen(navController: NavHostController) {
                                 Spacer(modifier = Modifier.height(12.dp))
 
                                 Text(
-                                    text = "find your space.\nDont settle for the closestest.\nFit how you study, work, and hang out.",
+                                    text = "Find your space.\nDon't settle for the closest.\nFit how you study, work, and hang out.",
                                     style = subtitleStyle,
                                     color = Color.Black,
                                     modifier = Modifier
@@ -312,8 +313,27 @@ fun LoginScreen(navController: NavHostController) {
                                                     this.password = password
                                                 }
 
-                                                navController.navigate(Screen.MainScreen.route) {
-                                                    popUpTo(navController.graph.id) { inclusive = true }
+                                                val user = supabase.auth.currentUserOrNull()
+
+                                                if (user != null) {
+                                                    val prefs = supabase
+                                                        .from("user_preferences")
+                                                        .select {
+                                                            filter { eq("user_id", user.id) }
+                                                        }
+                                                        .decodeSingleOrNull<UserPreferences>()
+
+                                                    if (prefs == null) {
+                                                        // No preferences → go to setup
+                                                        navController.navigate(Screen.Preferences.route) {
+                                                            popUpTo(navController.graph.id) { inclusive = true }
+                                                        }
+                                                    } else {
+                                                        // Has preferences → go to main
+                                                        navController.navigate(Screen.MainScreen.route) {
+                                                            popUpTo(navController.graph.id) { inclusive = true }
+                                                        }
+                                                    }
                                                 }
 
                                             } catch (e: Exception) {
@@ -489,7 +509,7 @@ fun LoginScreen(navController: NavHostController) {
                                 showSignUpDialog = false
 
                                 if (user != null) {
-                                    navController.navigate(Screen.MainScreen.route) {
+                                    navController.navigate(Screen.Preferences.route) {
                                         popUpTo(navController.graph.id) { inclusive = true }
                                     }
                                 } else {
