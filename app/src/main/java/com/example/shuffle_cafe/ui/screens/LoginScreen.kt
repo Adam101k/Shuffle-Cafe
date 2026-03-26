@@ -23,7 +23,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.res.painterResource
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -35,6 +34,7 @@ import androidx.navigation.NavHostController
 import androidx.navigation.compose.rememberNavController
 import com.example.shuffle_cafe.R
 import com.example.shuffle_cafe.Screen
+import com.example.shuffle_cafe.UserPreferences
 import com.example.shuffle_cafe.supabase
 import com.example.shuffle_cafe.ui.theme.Shuffle_CafeTheme
 import io.github.jan.supabase.auth.auth
@@ -133,7 +133,7 @@ fun LoginScreen(navController: NavHostController) {
                                 Spacer(modifier = Modifier.height(32.dp))
 
                                 Text(
-                                    text = "Shuffel Cafe:",
+                                    text = "Shuffle Cafe:",
                                     style = welcomeTitleStyle,
                                     color = Color.Black
 
@@ -142,7 +142,7 @@ fun LoginScreen(navController: NavHostController) {
                                 Spacer(modifier = Modifier.height(12.dp))
 
                                 Text(
-                                    text = "find your space.\nDont settle for the closestest.\nFit how you study, work, and hang out.",
+                                    text = "Find your space.\nDon't settle for the closest.\nFit how you study, work, and hang out.",
                                     style = subtitleStyle,
                                     color = Color.Black,
                                     modifier = Modifier
@@ -239,8 +239,28 @@ fun LoginScreen(navController: NavHostController) {
                                                 this.password = password
                                             }
 
-                                            navController.navigate(Screen.MainScreen.route) {
-                                                popUpTo(navController.graph.id) { inclusive = true }
+                                            val user = supabase.auth.currentUserOrNull()
+
+                                            if (user != null) {
+
+                                                val prefs = supabase
+                                                    .from("user_preferences")
+                                                    .select {
+                                                        filter { eq("user_id", user.id) }
+                                                    }
+                                                    .decodeSingleOrNull<UserPreferences>()
+
+                                                if (prefs == null) {
+                                                    // No preferences, send to setup
+                                                    navController.navigate(Screen.Preferences.route) {
+                                                        popUpTo(navController.graph.id) { inclusive = true }
+                                                    }
+                                                } else {
+                                                    // Already set, go to main app
+                                                    navController.navigate(Screen.MainScreen.route) {
+                                                        popUpTo(navController.graph.id) { inclusive = true }
+                                                    }
+                                                }
                                             }
 
                                         } catch (e: Exception) {
@@ -363,7 +383,7 @@ fun LoginScreen(navController: NavHostController) {
 
                                 showSignUpDialog = false
 
-                                navController.navigate(Screen.MainScreen.route) {
+                                navController.navigate(Screen.Preferences.route) {
                                     popUpTo(navController.graph.id) { inclusive = true }
                                 }
 

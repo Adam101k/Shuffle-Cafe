@@ -96,6 +96,10 @@ import io.github.jan.supabase.storage.storage
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.storage.Storage
 import kotlinx.serialization.Serializable
+import androidx.compose.ui.text.font.Font
+import androidx.compose.ui.text.font.FontFamily
+import com.example.shuffle_cafe.ui.theme.CafeBrown
+import com.example.shuffle_cafe.ui.theme.CafeDark
 
 val supabase = createSupabaseClient(
     supabaseUrl = "https://sknyfkgltazosjmyjfhs.supabase.co",
@@ -247,6 +251,7 @@ fun AppNav(){
         composable(Screen.MapScreen.route) { MapScreen(navController) }
         composable(Screen.BookmarkScreen.route) { BookmarkScreen(navController) }
         composable(Screen.ProfileScreen.route) { ProfileScreen(navController) }
+        composable(Screen.Preferences.route) { PreferencesScreen(navController) }
         composable(Screen.CafeDetails.route, arguments = listOf(navArgument("cafeId") { type = NavType.StringType })) {
             CafeDetailsScreen(navController, it.arguments?.getString("cafeId") ?: "")
         }
@@ -1401,6 +1406,206 @@ fun SwipeableCafeStack(cafes: List<Cafe>, navController: NavHostController, onSw
         }
     }
 }
+// For the user preferences
+@Serializable
+data class UserPreferences(
+    val user_id: String,
+    val noise_level: Int,
+    val outlet_importance: Int,
+    val seating_importance: Int,
+    val wifi_importance: Int
+)
+
+@Composable
+fun PreferencesScreen(navController: NavHostController) {
+    val scope = rememberCoroutineScope()
+
+    var noise by remember { mutableIntStateOf(3) }
+    var outlet by remember { mutableIntStateOf(3) }
+    var seating by remember { mutableIntStateOf(3) }
+    var wifi by remember { mutableIntStateOf(3) }
+
+    var isLoading by remember { mutableStateOf(true) }
+
+    // Fonts
+    val playfairDisplay = FontFamily(Font(R.font.playfair_display))
+    val headlineStyle = MaterialTheme.typography.headlineMedium.copy(fontFamily = playfairDisplay)
+    val bodyStyle = MaterialTheme.typography.bodyMedium.copy(fontFamily = playfairDisplay)
+
+    // To match the theme
+    val backgroundColor = CafeBrown
+    val cardColor = Color(0xFFEAD7CE)
+    val textColor = Color.Black
+
+    // Load existing preferences
+    LaunchedEffect(Unit) {
+        val user = supabase.auth.currentUserOrNull()
+        if (user != null) {
+            try {
+                val prefs = supabase
+                    .from("user_preferences")
+                    .select { filter { eq("user_id", user.id) } }
+                    .decodeSingleOrNull<UserPreferences>()
+
+                prefs?.let {
+                    noise = it.noise_level
+                    outlet = it.outlet_importance
+                    seating = it.seating_importance
+                    wifi = it.wifi_importance
+                }
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+        }
+        isLoading = false
+    }
+
+    if (isLoading) {
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(backgroundColor),
+            contentAlignment = Alignment.Center
+        ) {
+            CircularProgressIndicator(color = CafeDark)
+        }
+        return
+    }
+
+    Scaffold(
+        containerColor = backgroundColor,
+        bottomBar = { BottomNavBar(navController) }
+    ) { padding ->
+
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(backgroundColor)
+                .padding(padding)
+                .padding(16.dp)
+        ) {
+
+            Text(
+                text = "Your Preferences",
+                style = headlineStyle,
+                color = textColor
+            )
+
+            Spacer(Modifier.height(8.dp))
+
+            Text(
+                text = "Help us find your perfect cafe!☕",
+                style = bodyStyle,
+                color = textColor.copy(alpha = 0.9f)
+            )
+
+            Spacer(Modifier.height(20.dp))
+
+            Card(
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = cardColor),
+                modifier = Modifier.fillMaxWidth(),
+                elevation = CardDefaults.cardElevation(defaultElevation = 6.dp)
+            ) {
+                Column(modifier = Modifier.padding(16.dp)) {
+                    PreferenceSlider("Noise Level", noise) { noise = it }
+                    PreferenceSlider("Outlet Importance", outlet) { outlet = it }
+                    PreferenceSlider("Seating Comfort", seating) { seating = it }
+                    PreferenceSlider("WiFi Quality", wifi) { wifi = it }
+                }
+            }
+
+            Spacer(Modifier.height(24.dp))
+
+            Button(
+                onClick = {
+                    scope.launch {
+                        val user = supabase.auth.currentUserOrNull()
+                        if (user != null) {
+                            val prefs = UserPreferences(
+                                user_id = user.id,
+                                noise_level = noise,
+                                outlet_importance = outlet,
+                                seating_importance = seating,
+                                wifi_importance = wifi
+                            )
+                            try {
+                                supabase.from("user_preferences").upsert(prefs)
+                                navController.navigate(Screen.MainScreen.route) {
+                                    popUpTo(0)
+                                }
+                            } catch (e: Exception) {
+                                e.printStackTrace()
+                            }
+                        }
+                    }
+                },
+                // Design
+                shape = RoundedCornerShape(20.dp),
+
+                elevation = ButtonDefaults.buttonElevation(
+                    defaultElevation = 8.dp,
+                    pressedElevation = 3.dp
+                ),
+
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = CafeDark,
+                    contentColor = Color.White
+                ),
+
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 16.dp) // spacing
+                    .height(56.dp)
+            ) {
+
+                Text("Save Preferences",
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.SemiBold)
+            }
+        }
+    }
+}
+@Composable
+fun PreferenceSlider(
+    label: String,
+    value: Int,
+    onChange: (Int) -> Unit
+) {
+    val playfairDisplay = FontFamily(Font(R.font.playfair_display))
+
+    Column(modifier = Modifier.padding(vertical = 10.dp)) {
+
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.bodyLarge.copy(fontFamily = playfairDisplay)
+            )
+
+            Text(
+                text = value.toString(),
+                style = MaterialTheme.typography.bodyMedium.copy(fontFamily = playfairDisplay),
+                color = CafeDark
+            )
+        }
+
+        Slider(
+            value = value.toFloat(),
+            onValueChange = { onChange(it.toInt()) },
+            valueRange = 1f..5f,
+            steps = 3,
+            colors = SliderDefaults.colors(
+                thumbColor = CafeDark,
+                activeTrackColor = CafeDark,
+                inactiveTrackColor = Color.LightGray
+            )
+        )
+    }
+}
+
 
 @Preview(showBackground = true, showSystemUi = true)
 @Composable
