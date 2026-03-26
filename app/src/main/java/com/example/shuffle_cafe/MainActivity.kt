@@ -1508,7 +1508,9 @@ private suspend fun searchCoffeeHousesNearLocation(
         Place.Field.PHOTO_METADATAS,
         Place.Field.LAT_LNG,
         Place.Field.PRIMARY_TYPE,
-        Place.Field.TYPES
+        Place.Field.TYPES,
+        Place.Field.OPENING_HOURS,
+        Place.Field.CURRENT_OPENING_HOURS
     )
     val locationBias = CircularBounds.newInstance(
         LatLng(location.latitude, location.longitude),
@@ -1706,6 +1708,39 @@ private suspend fun buildCafeMarkerDescriptorAsync(
     }
 }
 
+private fun parseWeekdayTextToHoursMap(lines: List<String>): LinkedHashMap<String, String> {
+    val result = linkedMapOf<String, String>()
+
+    lines.forEach { line ->
+        val separatorIndex = line.indexOfFirst { it == ':' || it == '：' }
+        if (separatorIndex > 0) {
+            val day = line.substring(0, separatorIndex).trim()
+            val value = line.substring(separatorIndex + 1).trim()
+            if (day.isNotBlank() && value.isNotBlank()) {
+                result[day] = value
+            }
+        }
+    }
+
+    return LinkedHashMap(result)
+}
+
+private fun Place.toHoursMap(): LinkedHashMap<String, String> {
+    val weekdayText = openingHours?.weekdayText
+        ?.takeIf { it.isNotEmpty() }
+        ?: currentOpeningHours?.weekdayText
+            ?.takeIf { it.isNotEmpty() }
+        ?: emptyList()
+
+    val parsed = parseWeekdayTextToHoursMap(weekdayText)
+
+    return if (parsed.isNotEmpty()) {
+        parsed
+    } else {
+        linkedMapOf("Hours" to "Hours unavailable")
+    }
+}
+
 private fun Place.toCafe(userLocation: Location): Cafe? {
     val placeId = id ?: return null
     val cafeName = name?.trim().takeIf { !it.isNullOrBlank() } ?: return null
@@ -1730,13 +1765,15 @@ private fun Place.toCafe(userLocation: Location): Cafe? {
         "No ratings yet"
     }
 
+    val cafeHours = toHoursMap()
+
     return Cafe(
         id = placeId,
         name = cafeName,
         address = cafeAddress,
         phone = "Phone unavailable",
         status = statusText,
-        hours = linkedMapOf("Hours" to "Check Google Maps"),
+        hours = cafeHours,
         features = listOfNotNull(formatDistanceAway(distanceToCafe), "Coffee house"),
         ambience = listOf("Coffee"),
         rating = ratingValue,
@@ -2379,14 +2416,63 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
 
 @Composable
 fun HoursDropdown(hours: LinkedHashMap<String, String>) {
+    val displayHours = remember(hours) {
+        if (hours.isEmpty()) linkedMapOf("Hours" to "Hours unavailable") else hours
+    }
+
+    val days = displayHours.keys.toList()
     var expanded by remember { mutableStateOf(false) }
-    val days = hours.keys.toList()
-    var selectedDay by rememberSaveable { mutableStateOf(days.firstOrNull() ?: "") }
+    var selectedDay by remember(displayHours) {
+        mutableStateOf(days.firstOrNull().orEmpty())
+    }
+
     Box(modifier = Modifier.fillMaxWidth()) {
-        OutlinedCard(modifier = Modifier.fillMaxWidth().clickable { expanded = true }, shape = RoundedCornerShape(4.dp), border = BorderStroke(1.dp, Color.Black)) {
-            Row(modifier = Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) { Text("Hours: $selectedDay: ${hours[selectedDay] ?: ""}", modifier = Modifier.weight(1f)); Icon(Icons.Filled.ArrowDropDown, null) }
+        OutlinedCard(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(enabled = days.isNotEmpty()) { expanded = true },
+            shape = RoundedCornerShape(4.dp),
+            border = BorderStroke(1.dp, Color.Black)
+        ) {
+            Row(
+                modifier = Modifier.padding(12.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                val summaryText = if (selectedDay == "Hours") {
+                    displayHours[selectedDay].orEmpty()
+                } else {
+                    "$selectedDay: ${displayHours[selectedDay].orEmpty()}"
+                }
+
+                Text(
+                    text = summaryText,
+                    modifier = Modifier.weight(1f)
+                )
+
+                Icon(Icons.Filled.ArrowDropDown, contentDescription = null)
+            }
         }
-        DropdownMenu(expanded, { expanded = false }) { days.forEach { day -> DropdownMenuItem(text = { Text("$day: ${hours[day]}") }, onClick = { selectedDay = day; expanded = false }) } }
+
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            days.forEach { day ->
+                val label = if (day == "Hours") {
+                    displayHours[day].orEmpty()
+                } else {
+                    "$day: ${displayHours[day].orEmpty()}"
+                }
+
+                DropdownMenuItem(
+                    text = { Text(label) },
+                    onClick = {
+                        selectedDay = day
+                        expanded = false
+                    }
+                )
+            }
+        }
     }
 }
 
