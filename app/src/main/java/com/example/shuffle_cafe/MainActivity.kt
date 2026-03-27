@@ -2,7 +2,9 @@ package com.example.shuffle_cafe
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ActivityNotFoundException
 import android.content.Context
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.content.SharedPreferences
 import android.graphics.Bitmap
@@ -87,6 +89,8 @@ import coil.compose.AsyncImage
 import com.example.shuffle_cafe.ui.screens.LoginScreen
 import com.example.shuffle_cafe.ui.theme.CafeBrown
 import com.example.shuffle_cafe.ui.theme.CafeDark
+import com.example.shuffle_cafe.ui.theme.CoffeeDark
+import com.example.shuffle_cafe.ui.theme.CoffeeLight
 import com.example.shuffle_cafe.ui.theme.Shuffle_CafeTheme
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationServices
@@ -125,7 +129,11 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import java.util.Locale
+import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.roundToInt
+import kotlin.math.sin
+import kotlin.math.sqrt
 
 import io.github.jan.supabase.auth.Auth
 import io.github.jan.supabase.createSupabaseClient
@@ -140,18 +148,20 @@ import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
-val supabase = createSupabaseClient(
-    supabaseUrl = "https://sknyfkgltazosjmyjfhs.supabase.co",
-    supabaseKey = "sb_publishable_dCrTJjMXS6bw1WDaqTtewg_amytqZMf"
-) {
-    install(Auth) {
-        // Keep mobile sessions restored and refreshed between app launches.
-        alwaysAutoRefresh = true
-        autoLoadFromStorage = true
-        autoSaveToStorage = true
+val supabase by lazy(LazyThreadSafetyMode.NONE) {
+    createSupabaseClient(
+        supabaseUrl = "https://sknyfkgltazosjmyjfhs.supabase.co",
+        supabaseKey = "sb_publishable_dCrTJjMXS6bw1WDaqTtewg_amytqZMf"
+    ) {
+        install(Auth) {
+            // Keep mobile sessions restored and refreshed between app launches.
+            alwaysAutoRefresh = true
+            autoLoadFromStorage = true
+            autoSaveToStorage = true
+        }
+        install(Postgrest)
+        install(Storage)
     }
-    install(Postgrest)
-    install(Storage)
 }
 
 data class Cafe(
@@ -175,7 +185,7 @@ data class Cafe(
 )
 
 @Serializable
-private data class CachedCafeDto(
+internal data class CachedCafeDto(
     val id: String,
     val name: String,
     val address: String,
@@ -186,13 +196,12 @@ private data class CachedCafeDto(
     val ambience: List<String>,
     val rating: Float? = null,
     val userRatingCount: Int? = null,
-    val distanceMeters: Float? = null,
     val latitude: Double? = null,
     val longitude: Double? = null
 )
 
 @Serializable
-private data class CachedCafeEnvelope(
+internal data class CachedCafeEnvelope(
     val cityKey: String,
     val savedAtEpochMillis: Long,
     val cafes: List<CachedCafeDto>
@@ -206,6 +215,12 @@ data class CafeFeedUiState(
     val cityKey: String? = null,
     val cityName: String? = null,
     val lastUpdatedEpochMillis: Long? = null
+)
+
+private data class ResolvedViewportCoffeeContext(
+    val searchLocation: Location,
+    val cityName: String?,
+    val cityKey: String
 )
 
 private data class ResolvedCityCoffeeContext(
@@ -244,16 +259,32 @@ private fun LatLng.toLocation(provider: String = "map_viewport"): Location {
     }
 }
 
-private fun distanceBetween(start: LatLng, end: LatLng): Float {
-    val results = FloatArray(1)
-    Location.distanceBetween(
-        start.latitude,
-        start.longitude,
-        end.latitude,
-        end.longitude,
-        results
-    )
-    return results[0]
+private fun Location.toLatLng(): LatLng = LatLng(latitude, longitude)
+
+internal fun distanceBetweenMeters(start: LatLng, end: LatLng): Float {
+    val startLatitudeRadians = Math.toRadians(start.latitude)
+    val endLatitudeRadians = Math.toRadians(end.latitude)
+    val latitudeDeltaRadians = Math.toRadians(end.latitude - start.latitude)
+    val longitudeDeltaRadians = Math.toRadians(end.longitude - start.longitude)
+
+    val haversine = sin(latitudeDeltaRadians / 2).let { it * it } +
+        cos(startLatitudeRadians) * cos(endLatitudeRadians) *
+        sin(longitudeDeltaRadians / 2).let { it * it }
+    val clampedHaversine = haversine.coerceIn(0.0, 1.0)
+    val centralAngle = 2 * atan2(sqrt(clampedHaversine), sqrt(1 - clampedHaversine))
+    return (6_371_000.0 * centralAngle).toFloat()
+}
+
+private fun distanceBetween(start: LatLng, end: LatLng): Float = distanceBetweenMeters(start, end)
+
+internal fun computeCafeDistanceMeters(cafeLatLng: LatLng?, distanceReference: LatLng?): Float? {
+    if (cafeLatLng == null || distanceReference == null) return null
+    return distanceBetweenMeters(distanceReference, cafeLatLng)
+}
+
+internal fun isCafeWithinMapArea(cafeLatLng: LatLng?, searchCenter: LatLng, maxDistanceMeters: Float): Boolean {
+    val coordinates = cafeLatLng ?: return false
+    return distanceBetweenMeters(searchCenter, coordinates) <= maxDistanceMeters
 }
 
 private fun inferCurrentViewportSourceKey(
@@ -425,6 +456,26 @@ private fun Cafe.withLoadedPhoto(index: Int, bitmap: Bitmap): Cafe {
     )
 }
 
+private fun Cafe.mergeLoadedMedia(existing: Cafe?): Cafe {
+    val existingCafe = existing ?: return this
+    val mergedPhotoMetadatas = if (photoMetadatas.isNotEmpty()) photoMetadatas else existingCafe.photoMetadatas
+    val mergedPhotoBitmaps = if (mergedPhotoMetadatas.isNotEmpty()) {
+        List(mergedPhotoMetadatas.size) { index ->
+            photoBitmaps.getOrNull(index) ?: existingCafe.photoBitmaps.getOrNull(index)
+        }
+    } else {
+        emptyList()
+    }
+
+    return copy(
+        photoMetadatas = mergedPhotoMetadatas,
+        heroImageBitmap = heroImageBitmap
+            ?: mergedPhotoBitmaps.firstOrNull { it != null }
+            ?: existingCafe.heroImageBitmap,
+        photoBitmaps = mergedPhotoBitmaps
+    )
+}
+
 private fun Cafe.toCachedDto(): CachedCafeDto {
     return CachedCafeDto(
         id = id,
@@ -437,13 +488,13 @@ private fun Cafe.toCachedDto(): CachedCafeDto {
         ambience = ambience,
         rating = rating,
         userRatingCount = userRatingCount,
-        distanceMeters = distanceMeters,
         latitude = latLng?.latitude,
         longitude = latLng?.longitude
     )
 }
 
-private fun CachedCafeDto.toCafe(): Cafe {
+internal fun CachedCafeDto.toCafe(distanceReference: LatLng? = null): Cafe {
+    val cafeLatLng = if (latitude != null && longitude != null) LatLng(latitude, longitude) else null
     return Cafe(
         id = id,
         name = name,
@@ -455,8 +506,8 @@ private fun CachedCafeDto.toCafe(): Cafe {
         ambience = ambience,
         rating = rating,
         userRatingCount = userRatingCount,
-        distanceMeters = distanceMeters,
-        latLng = if (latitude != null && longitude != null) LatLng(latitude, longitude) else null
+        distanceMeters = computeCafeDistanceMeters(cafeLatLng, distanceReference),
+        latLng = cafeLatLng
     )
 }
 
@@ -614,66 +665,131 @@ object CafeRepository {
         Cafe("5", "Brewed Awakening", "321 Coffee Lane", "(777) 888-9999", "Open", linkedMapOf("Saturday" to "8:00AM - 8:00 PM"), listOf("Live Music"), listOf("Hip")),
         Cafe("6", "The Daily Grind", "555 Bean St", "(000) 111-2222", "Busy", linkedMapOf("Sunday" to "9:00AM - 5:00 PM"), listOf("Pastries"), listOf("Bustling"))
     )
-    private var feedState by mutableStateOf(CafeFeedUiState())
-    private val loadMutex = Mutex()
+    private var homeFeedState by mutableStateOf(CafeFeedUiState())
+    private var mapFeedState by mutableStateOf(CafeFeedUiState())
+    private var cafeIndexById by mutableStateOf<Map<String, Cafe>>(emptyMap())
+    private val homeLoadMutex = Mutex()
+    private val mapLoadMutex = Mutex()
 
-    val cafes: List<Cafe>
-        get() = if (feedState.cafes.isNotEmpty()) feedState.cafes else fallbackCafes
+    val homeUiState: CafeFeedUiState
+        get() = homeFeedState
 
-    val uiState: CafeFeedUiState
-        get() = feedState
+    val mapUiState: CafeFeedUiState
+        get() = mapFeedState
 
-    fun setLiveCafes(
+    private fun indexCafes(cafes: List<Cafe>): List<Cafe> {
+        if (cafes.isEmpty()) return emptyList()
+
+        val updatedCatalog = cafeIndexById.toMutableMap()
+        val indexedCafes = cafes.map { cafe ->
+            val mergedCafe = cafe.mergeLoadedMedia(updatedCatalog[cafe.id])
+            updatedCatalog[cafe.id] = mergedCafe
+            mergedCafe
+        }
+        cafeIndexById = updatedCatalog
+        return indexedCafes
+    }
+
+    private fun replaceHomeFeed(
         cafes: List<Cafe>,
-        cityKey: String? = feedState.cityKey,
-        cityName: String? = feedState.cityName,
-        lastUpdatedEpochMillis: Long? = feedState.lastUpdatedEpochMillis
+        cityKey: String? = homeFeedState.cityKey,
+        cityName: String? = homeFeedState.cityName,
+        lastUpdatedEpochMillis: Long? = homeFeedState.lastUpdatedEpochMillis
     ) {
-        feedState = feedState.copy(
-            cafes = cafes,
+        homeFeedState = homeFeedState.copy(
+            cafes = indexCafes(cafes),
             cityKey = cityKey,
             cityName = cityName,
             lastUpdatedEpochMillis = lastUpdatedEpochMillis
         )
     }
 
-    fun clearLiveCafes() {
-        feedState = feedState.copy(cafes = emptyList())
-    }
-
-    fun getCafe(id: String): Cafe? = cafes.firstOrNull { it.id == id }
-
-    fun updateCafePhoto(cafeId: String, photoIndex: Int, bitmap: Bitmap) {
-        val updatedCafes = feedState.cafes.map { cafe ->
-            if (cafe.id == cafeId) cafe.withLoadedPhoto(photoIndex, bitmap) else cafe
-        }
-
-        if (updatedCafes != feedState.cafes) {
-            feedState = feedState.copy(cafes = updatedCafes)
-        }
-    }
-
-    fun setPreviewCafes() {
-        if (feedState.cafes.isNotEmpty()) return
-        feedState = CafeFeedUiState(
-            cafes = fallbackCafes,
-            isLoading = false,
-            isRefreshing = false,
-            loadError = null,
-            cityKey = "preview",
-            cityName = "Preview"
+    private fun replaceMapFeed(
+        cafes: List<Cafe>,
+        cityKey: String? = mapFeedState.cityKey,
+        cityName: String? = mapFeedState.cityName,
+        lastUpdatedEpochMillis: Long? = mapFeedState.lastUpdatedEpochMillis
+    ) {
+        mapFeedState = mapFeedState.copy(
+            cafes = indexCafes(cafes),
+            cityKey = cityKey,
+            cityName = cityName,
+            lastUpdatedEpochMillis = lastUpdatedEpochMillis
         )
     }
 
-    suspend fun ensureLoaded(
+    private fun updateFeedCafe(cafes: List<Cafe>, cafeId: String, transform: (Cafe) -> Cafe): List<Cafe> {
+        var changed = false
+        val updatedCafes = cafes.map { cafe ->
+            if (cafe.id == cafeId) {
+                changed = true
+                transform(cafe)
+            } else {
+                cafe
+            }
+        }
+        return if (changed) updatedCafes else cafes
+    }
+
+    private fun applyCafeUpdate(cafeId: String, transform: (Cafe) -> Cafe) {
+        cafeIndexById[cafeId]?.let { existingCafe ->
+            cafeIndexById = cafeIndexById + (cafeId to transform(existingCafe))
+        }
+
+        val updatedHomeCafes = updateFeedCafe(homeFeedState.cafes, cafeId, transform)
+        if (updatedHomeCafes !== homeFeedState.cafes) {
+            homeFeedState = homeFeedState.copy(cafes = updatedHomeCafes)
+        }
+
+        val updatedMapCafes = updateFeedCafe(mapFeedState.cafes, cafeId, transform)
+        if (updatedMapCafes !== mapFeedState.cafes) {
+            mapFeedState = mapFeedState.copy(cafes = updatedMapCafes)
+        }
+    }
+
+    fun getCafe(id: String): Cafe? = cafeIndexById[id] ?: fallbackCafes.firstOrNull { it.id == id }
+
+    fun updateCafePhoto(cafeId: String, photoIndex: Int, bitmap: Bitmap) {
+        applyCafeUpdate(cafeId) { cafe -> cafe.withLoadedPhoto(photoIndex, bitmap) }
+    }
+
+    fun setHomePreviewCafes() {
+        if (homeFeedState.cafes.isNotEmpty()) return
+        replaceHomeFeed(
+            cafes = fallbackCafes,
+            cityKey = "preview_home",
+            cityName = "Preview"
+        )
+        homeFeedState = homeFeedState.copy(
+            isLoading = false,
+            isRefreshing = false,
+            loadError = null
+        )
+    }
+
+    fun setMapPreviewCafes() {
+        if (mapFeedState.cafes.isNotEmpty()) return
+        replaceMapFeed(
+            cafes = fallbackCafes,
+            cityKey = "preview_map",
+            cityName = "Preview"
+        )
+        mapFeedState = mapFeedState.copy(
+            isLoading = false,
+            isRefreshing = false,
+            loadError = null
+        )
+    }
+
+    suspend fun ensureHomeLoaded(
         context: Context,
         fusedLocationClient: FusedLocationProviderClient,
         placesClient: PlacesClient?,
         hasLocationPermission: Boolean
     ) {
-        loadMutex.withLock {
+        homeLoadMutex.withLock {
             if (!hasLocationPermission) {
-                feedState = CafeFeedUiState(
+                homeFeedState = CafeFeedUiState(
                     cafes = emptyList(),
                     isLoading = false,
                     isRefreshing = false,
@@ -683,8 +799,8 @@ object CafeRepository {
             }
 
             if (placesClient == null) {
-                if (feedState.cafes.isEmpty()) {
-                    feedState = CafeFeedUiState(
+                if (homeFeedState.cafes.isEmpty()) {
+                    homeFeedState = CafeFeedUiState(
                         cafes = emptyList(),
                         isLoading = false,
                         isRefreshing = false,
@@ -695,30 +811,35 @@ object CafeRepository {
             }
 
             val queryContext = resolveCurrentCityCoffeeContext(context, fusedLocationClient)
+            val distanceReference = queryContext.location.toLatLng()
             val cachedEnvelope = CafeCacheStore.load(context, queryContext.cityKey)
-            val cachedCafes = cachedEnvelope?.cafes?.map { it.toCafe() }.orEmpty()
+            val cachedCafes = cachedEnvelope?.cafes?.map { dto ->
+                dto.toCafe(distanceReference = distanceReference)
+            }.orEmpty()
 
             if (
-                feedState.cityKey == queryContext.cityKey &&
-                feedState.cafes.isNotEmpty() &&
-                !feedState.isLoading &&
-                !feedState.isRefreshing
+                homeFeedState.cityKey == queryContext.cityKey &&
+                homeFeedState.cafes.isNotEmpty() &&
+                !homeFeedState.isLoading &&
+                !homeFeedState.isRefreshing
             ) {
                 return
             }
 
             if (cachedCafes.isNotEmpty()) {
-                feedState = CafeFeedUiState(
+                replaceHomeFeed(
                     cafes = cachedCafes,
-                    isLoading = false,
-                    isRefreshing = true,
-                    loadError = null,
                     cityKey = queryContext.cityKey,
                     cityName = queryContext.cityName,
                     lastUpdatedEpochMillis = cachedEnvelope?.savedAtEpochMillis
                 )
+                homeFeedState = homeFeedState.copy(
+                    isLoading = false,
+                    isRefreshing = true,
+                    loadError = null
+                )
             } else {
-                feedState = CafeFeedUiState(
+                homeFeedState = CafeFeedUiState(
                     cafes = emptyList(),
                     isLoading = true,
                     isRefreshing = false,
@@ -736,13 +857,13 @@ object CafeRepository {
                     onCafePhotoLoaded = ::updateCafePhoto
                 ).distinctBy { it.id }
 
-                setLiveCafes(
+                replaceHomeFeed(
                     cafes = freshCafes,
                     cityKey = queryContext.cityKey,
                     cityName = queryContext.cityName,
                     lastUpdatedEpochMillis = System.currentTimeMillis()
                 )
-                feedState = feedState.copy(
+                homeFeedState = homeFeedState.copy(
                     isLoading = false,
                     isRefreshing = false,
                     loadError = null
@@ -751,14 +872,13 @@ object CafeRepository {
             } catch (error: Exception) {
                 val errorMessage = error.localizedMessage ?: "Failed to fetch coffee houses in your city."
                 if (cachedCafes.isNotEmpty()) {
-                    feedState = feedState.copy(
-                        cafes = cachedCafes,
+                    homeFeedState = homeFeedState.copy(
                         isLoading = false,
                         isRefreshing = false,
                         loadError = errorMessage
                     )
                 } else {
-                    feedState = CafeFeedUiState(
+                    homeFeedState = CafeFeedUiState(
                         cafes = emptyList(),
                         isLoading = false,
                         isRefreshing = false,
@@ -771,16 +891,17 @@ object CafeRepository {
         }
     }
 
-    suspend fun ensureLoadedForViewport(
+    suspend fun ensureMapLoadedForViewport(
         context: Context,
+        fusedLocationClient: FusedLocationProviderClient,
         placesClient: PlacesClient?,
         hasLocationPermission: Boolean,
         center: LatLng,
         searchRadiusMeters: Double
     ) {
-        loadMutex.withLock {
+        mapLoadMutex.withLock {
             if (!hasLocationPermission) {
-                feedState = CafeFeedUiState(
+                mapFeedState = CafeFeedUiState(
                     cafes = emptyList(),
                     isLoading = false,
                     isRefreshing = false,
@@ -790,8 +911,8 @@ object CafeRepository {
             }
 
             if (placesClient == null) {
-                if (feedState.cafes.isEmpty()) {
-                    feedState = CafeFeedUiState(
+                if (mapFeedState.cafes.isEmpty()) {
+                    mapFeedState = CafeFeedUiState(
                         cafes = emptyList(),
                         isLoading = false,
                         isRefreshing = false,
@@ -806,33 +927,40 @@ object CafeRepository {
                 center = center,
                 searchRadiusMeters = searchRadiusMeters
             )
+            val distanceReference = runCatching {
+                getCurrentOrLastLocation(fusedLocationClient).toLatLng()
+            }.getOrNull()
             val cachedEnvelope = CafeCacheStore.load(context, queryContext.cityKey)
-            val cachedCafes = cachedEnvelope?.cafes?.map { it.toCafe() }.orEmpty()
+            val cachedCafes = cachedEnvelope?.cafes?.map { dto ->
+                dto.toCafe(distanceReference = distanceReference)
+            }.orEmpty()
 
             if (
-                feedState.cityKey == queryContext.cityKey &&
-                feedState.cafes.isNotEmpty() &&
-                !feedState.isLoading &&
-                !feedState.isRefreshing
+                mapFeedState.cityKey == queryContext.cityKey &&
+                mapFeedState.cafes.isNotEmpty() &&
+                !mapFeedState.isLoading &&
+                !mapFeedState.isRefreshing
             ) {
                 return
             }
 
             when {
                 cachedCafes.isNotEmpty() -> {
-                    feedState = CafeFeedUiState(
+                    replaceMapFeed(
                         cafes = cachedCafes,
-                        isLoading = false,
-                        isRefreshing = true,
-                        loadError = null,
                         cityKey = queryContext.cityKey,
                         cityName = queryContext.cityName,
                         lastUpdatedEpochMillis = cachedEnvelope?.savedAtEpochMillis
                     )
+                    mapFeedState = mapFeedState.copy(
+                        isLoading = false,
+                        isRefreshing = true,
+                        loadError = null
+                    )
                 }
 
-                feedState.cafes.isNotEmpty() -> {
-                    feedState = feedState.copy(
+                mapFeedState.cafes.isNotEmpty() -> {
+                    mapFeedState = mapFeedState.copy(
                         isLoading = false,
                         isRefreshing = true,
                         loadError = null,
@@ -842,7 +970,7 @@ object CafeRepository {
                 }
 
                 else -> {
-                    feedState = CafeFeedUiState(
+                    mapFeedState = CafeFeedUiState(
                         cafes = emptyList(),
                         isLoading = true,
                         isRefreshing = false,
@@ -856,19 +984,20 @@ object CafeRepository {
             try {
                 val freshCafes = fetchCoffeeHousesForViewport(
                     placesClient = placesClient,
-                    location = queryContext.location,
+                    searchLocation = queryContext.searchLocation,
+                    distanceReference = distanceReference,
                     cityName = queryContext.cityName,
                     searchRadiusMeters = searchRadiusMeters,
                     onCafePhotoLoaded = ::updateCafePhoto
                 ).distinctBy { it.id }
 
-                setLiveCafes(
+                replaceMapFeed(
                     cafes = freshCafes,
                     cityKey = queryContext.cityKey,
                     cityName = queryContext.cityName,
                     lastUpdatedEpochMillis = System.currentTimeMillis()
                 )
-                feedState = feedState.copy(
+                mapFeedState = mapFeedState.copy(
                     isLoading = false,
                     isRefreshing = false,
                     loadError = null
@@ -878,16 +1007,15 @@ object CafeRepository {
                 val errorMessage = error.localizedMessage ?: "Failed to load coffee houses for this map area."
                 when {
                     cachedCafes.isNotEmpty() -> {
-                        feedState = feedState.copy(
-                            cafes = cachedCafes,
+                        mapFeedState = mapFeedState.copy(
                             isLoading = false,
                             isRefreshing = false,
                             loadError = errorMessage
                         )
                     }
 
-                    feedState.cafes.isNotEmpty() -> {
-                        feedState = feedState.copy(
+                    mapFeedState.cafes.isNotEmpty() -> {
+                        mapFeedState = mapFeedState.copy(
                             isLoading = false,
                             isRefreshing = false,
                             loadError = errorMessage
@@ -895,7 +1023,7 @@ object CafeRepository {
                     }
 
                     else -> {
-                        feedState = CafeFeedUiState(
+                        mapFeedState = CafeFeedUiState(
                             cafes = emptyList(),
                             isLoading = false,
                             isRefreshing = false,
@@ -908,6 +1036,34 @@ object CafeRepository {
             }
         }
     }
+
+    internal fun resetForTest() {
+        homeFeedState = CafeFeedUiState()
+        mapFeedState = CafeFeedUiState()
+        cafeIndexById = emptyMap()
+    }
+
+    internal fun setHomeFeedForTest(
+        cafes: List<Cafe>,
+        cityKey: String = "home_test",
+        cityName: String = "Home Test"
+    ) {
+        replaceHomeFeed(cafes = cafes, cityKey = cityKey, cityName = cityName)
+        homeFeedState = homeFeedState.copy(isLoading = false, isRefreshing = false, loadError = null)
+    }
+
+    internal fun setMapFeedForTest(
+        cafes: List<Cafe>,
+        cityKey: String = "map_test",
+        cityName: String = "Map Test"
+    ) {
+        replaceMapFeed(cafes = cafes, cityKey = cityKey, cityName = cityName)
+        mapFeedState = mapFeedState.copy(isLoading = false, isRefreshing = false, loadError = null)
+    }
+
+    internal fun updateCafeForTest(cafeId: String, transform: (Cafe) -> Cafe) {
+        applyCafeUpdate(cafeId, transform)
+    }
 }
 
 object BookmarkRepository {
@@ -916,9 +1072,14 @@ object BookmarkRepository {
 
     fun isBookmarked(cafeId: String): Boolean = bookmarkedIds.contains(cafeId)
 
+    fun add(cafeId: String) {
+        bookmarkedIds.remove(cafeId)
+        bookmarkedIds.add(0, cafeId)
+    }
+
     fun toggle(cafeId: String) {
         if (bookmarkedIds.contains(cafeId)) bookmarkedIds.remove(cafeId)
-        else bookmarkedIds.add(cafeId)
+        else add(cafeId)
     }
 
     fun remove(cafeId: String) {
@@ -926,10 +1087,14 @@ object BookmarkRepository {
     }
 
     // Expose as List so callers can display it
-    fun ids(): List<String> = bookmarkedIds
+    fun ids(): List<String> = bookmarkedIds.toList()
 
-    fun cafes(): List<Cafe> = bookmarkedIds
+    fun cafes(): List<Cafe> = bookmarkedIds.toList()
         .mapNotNull { id -> CafeRepository.getCafe(id) }
+
+    internal fun resetForTest() {
+        bookmarkedIds.clear()
+    }
 }
 
 object RecentRepository {
@@ -1044,7 +1209,7 @@ fun MainScreen(navController: NavHostController) {
     val inspectionMode = LocalInspectionMode.current
     val scope = rememberCoroutineScope()
 
-    val cafeFeedState = CafeRepository.uiState
+    val cafeFeedState = CafeRepository.homeUiState
     val allCafes = cafeFeedState.cafes
     val isLoading = cafeFeedState.isLoading && allCafes.isEmpty()
     val loadError = cafeFeedState.loadError.takeIf { allCafes.isEmpty() }
@@ -1065,6 +1230,20 @@ fun MainScreen(navController: NavHostController) {
     }
     val isDetailExpanded = expandedCafe != null
     val loadedExpandedPhotoCount = expandedCafe?.photoBitmaps?.count { it != null } ?: 0
+
+    LaunchedEffect(hasLocationPermission, placesClient, inspectionMode) {
+        if (inspectionMode) {
+            CafeRepository.setHomePreviewCafes()
+            return@LaunchedEffect
+        }
+
+        CafeRepository.ensureHomeLoaded(
+            context = context,
+            fusedLocationClient = fusedLocationClient,
+            placesClient = placesClient,
+            hasLocationPermission = hasLocationPermission
+        )
+    }
 
     LaunchedEffect(expandedCafe) {
         if (expandedCafe != null) {
@@ -1233,7 +1412,7 @@ fun MainScreen(navController: NavHostController) {
                                     transitionState != null ||
                                     expandedCafeId != null ||
                                     detailProgress.value > 0f
-                            val onCafeSwiped: (Cafe) -> Unit = { swipedCafe ->
+                            val advanceCafeStack: (Cafe) -> Unit = { swipedCafe ->
                                 if (expandedCafeId == swipedCafe.id) {
                                     expandedCafeId = null
                                 }
@@ -1245,6 +1424,13 @@ fun MainScreen(navController: NavHostController) {
                                 )
                                 currentVisibleCafes = visibleStack.cafes
                                 nextCafeIndex = visibleStack.nextCafeIndex
+                            }
+                            val onCafeSwipedLeft: (Cafe) -> Unit = { swipedCafe ->
+                                advanceCafeStack(swipedCafe)
+                            }
+                            val onCafeSwipedRight: (Cafe) -> Unit = { swipedCafe ->
+                                BookmarkRepository.add(swipedCafe.id)
+                                advanceCafeStack(swipedCafe)
                             }
 
                             SwipeableCafeStack(
@@ -1268,8 +1454,8 @@ fun MainScreen(navController: NavHostController) {
                                     }
                                 },
                                 enabled = !isDetailExpanded,
-                                onSwipeLeft = onCafeSwiped,
-                                onSwipeRight = onCafeSwiped
+                                onSwipeLeft = onCafeSwipedLeft,
+                                onSwipeRight = onCafeSwipedRight
                             )
                         }
                     }
@@ -1383,11 +1569,11 @@ private suspend fun resolveViewportCoffeeContext(
     context: Context,
     center: LatLng,
     searchRadiusMeters: Double
-): ResolvedCityCoffeeContext {
-    val location = center.toLocation()
-    val cityName = resolveCurrentCityName(context, location)
-    return ResolvedCityCoffeeContext(
-        location = location,
+): ResolvedViewportCoffeeContext {
+    val searchLocation = center.toLocation()
+    val cityName = resolveCurrentCityName(context, searchLocation)
+    return ResolvedViewportCoffeeContext(
+        searchLocation = searchLocation,
         cityName = cityName,
         cityKey = normalizeViewportCacheKey(center, searchRadiusMeters)
     )
@@ -1430,21 +1616,23 @@ private suspend fun fetchCoffeeHousesForResolvedCity(
     }
 
     return filteredPlaces
-        .mapNotNull { place -> place.toCafe(userLocation = location) }
+        .mapNotNull { place -> place.toCafe(distanceReference = location.toLatLng()) }
         .sortedBy { it.distanceMeters ?: Float.MAX_VALUE }
 }
 
 private suspend fun fetchCoffeeHousesForViewport(
     placesClient: PlacesClient,
-    location: Location,
+    searchLocation: Location,
+    distanceReference: LatLng?,
     cityName: String?,
     searchRadiusMeters: Double,
     onCafePhotoLoaded: (String, Int, Bitmap) -> Unit
 ): List<Cafe> {
     val maxDistanceMeters = (searchRadiusMeters * 1.2).toFloat()
+    val searchCenter = searchLocation.toLatLng()
     val places = searchCoffeeHousesNearLocation(
         placesClient = placesClient,
-        location = location,
+        location = searchLocation,
         cityName = cityName,
         searchRadiusMeters = searchRadiusMeters,
         useCitySpecificQueries = false
@@ -1453,11 +1641,8 @@ private suspend fun fetchCoffeeHousesForViewport(
     val filteredCafes = places
         .filter { it.isLikelyCoffeeHouse() }
         .distinctBy { it.id }
-        .mapNotNull { place -> place.toCafe(userLocation = location) }
-        .filter { cafe ->
-            val distanceMeters = cafe.distanceMeters
-            distanceMeters == null || distanceMeters <= maxDistanceMeters
-        }
+        .mapNotNull { place -> place.toCafe(distanceReference = distanceReference) }
+        .filter { cafe -> isCafeWithinMapArea(cafe.latLng, searchCenter, maxDistanceMeters) }
         .sortedBy { it.distanceMeters ?: Float.MAX_VALUE }
 
     if (filteredCafes.isEmpty()) {
@@ -1613,6 +1798,47 @@ private fun formatDistanceAway(distanceMeters: Float?): String? {
     }
 }
 
+private fun Cafe.directionsDestination(): String? {
+    latLng?.let { coordinates ->
+        return "${coordinates.latitude},${coordinates.longitude}"
+    }
+
+    return address
+        .takeUnless { it.isBlank() || it.equals("Address unavailable", ignoreCase = true) }
+        ?: name.takeIf { it.isNotBlank() }
+}
+
+private fun openDirectionsInGoogleMaps(context: Context, cafe: Cafe) {
+    val destination = cafe.directionsDestination() ?: return
+    val encodedDestination = Uri.encode(destination)
+    val packageManager = context.packageManager
+
+    val appIntent = Intent(
+        Intent.ACTION_VIEW,
+        Uri.parse("google.navigation:q=$encodedDestination")
+    ).apply {
+        setPackage("com.google.android.apps.maps")
+    }
+
+    val fallbackIntent = Intent(
+        Intent.ACTION_VIEW,
+        Uri.parse("https://www.google.com/maps/dir/?api=1&destination=$encodedDestination")
+    )
+
+    val launchIntent = when {
+        appIntent.resolveActivity(packageManager) != null -> appIntent
+        fallbackIntent.resolveActivity(packageManager) != null -> fallbackIntent
+        else -> null
+    }
+
+    if (launchIntent != null) {
+        try {
+            context.startActivity(launchIntent)
+        } catch (_: ActivityNotFoundException) {
+        }
+    }
+}
+
 private fun createCafeMarkerDescriptor(
     context: Context,
     title: String,
@@ -1762,24 +1988,14 @@ private fun Place.toHoursMap(): LinkedHashMap<String, String> {
     }
 }
 
-private fun Place.toCafe(userLocation: Location): Cafe? {
+private fun Place.toCafe(distanceReference: LatLng?): Cafe? {
     val placeId = id ?: return null
     val cafeName = name?.trim().takeIf { !it.isNullOrBlank() } ?: return null
     val cafeAddress = address?.trim().takeIf { !it.isNullOrBlank() } ?: "Address unavailable"
     val ratingValue = rating?.toFloat()
     val ratingCount = userRatingsTotal
     val cafeLatLng = latLng
-    val distanceToCafe = latLng?.let { cafeLatLng ->
-        val distanceResult = FloatArray(1)
-        Location.distanceBetween(
-            userLocation.latitude,
-            userLocation.longitude,
-            cafeLatLng.latitude,
-            cafeLatLng.longitude,
-            distanceResult
-        )
-        distanceResult[0]
-    }
+    val distanceToCafe = computeCafeDistanceMeters(cafeLatLng, distanceReference)
     val statusText = if (ratingValue != null && ratingCount != null && ratingCount > 0) {
         String.format(Locale.US, "%.1f (%d reviews)", ratingValue, ratingCount)
     } else {
@@ -1795,7 +2011,7 @@ private fun Place.toCafe(userLocation: Location): Cafe? {
         phone = "Phone unavailable",
         status = statusText,
         hours = cafeHours,
-        features = listOfNotNull(formatDistanceAway(distanceToCafe), "Coffee house"),
+        features = listOf("Coffee house"),
         ambience = listOf("Coffee"),
         rating = ratingValue,
         userRatingCount = ratingCount,
@@ -1814,7 +2030,7 @@ fun MapScreen(navController: NavHostController) {
     val hasLocationPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
     val defaultCamera = rememberCameraPositionState()
     var searchQuery by remember { mutableStateOf("") }
-    val cafeFeedState = CafeRepository.uiState
+    val cafeFeedState = CafeRepository.mapUiState
     val allCafes = cafeFeedState.cafes
     val isLoading = cafeFeedState.isLoading && allCafes.isEmpty()
     val loadError = cafeFeedState.loadError.takeIf { allCafes.isEmpty() }
@@ -1968,13 +2184,14 @@ fun MapScreen(navController: NavHostController) {
 
     LaunchedEffect(hasLocationPermission, placesClient, inspectionMode, isMapLoaded) {
         if (inspectionMode) {
-            CafeRepository.setPreviewCafes()
+            CafeRepository.setMapPreviewCafes()
             return@LaunchedEffect
         }
 
         if (!hasLocationPermission || placesClient == null) {
-            CafeRepository.ensureLoadedForViewport(
+            CafeRepository.ensureMapLoadedForViewport(
                 context = context,
+                fusedLocationClient = fusedLocationClient,
                 placesClient = placesClient,
                 hasLocationPermission = hasLocationPermission,
                 center = defaultCamera.position.target,
@@ -1995,8 +2212,9 @@ fun MapScreen(navController: NavHostController) {
                     selectedCafeId = null
                 }
 
-                CafeRepository.ensureLoadedForViewport(
+                CafeRepository.ensureMapLoadedForViewport(
                     context = context,
+                    fusedLocationClient = fusedLocationClient,
                     placesClient = placesClient,
                     hasLocationPermission = hasLocationPermission,
                     center = request.center,
@@ -2204,10 +2422,155 @@ fun MapScreen(navController: NavHostController) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BookmarkScreen(navController: NavHostController) {
-    Scaffold(topBar = { TopSearchBar() }, bottomBar = { BottomNavBar(navController) }) { innerPadding ->
-        Column(modifier = Modifier.padding(innerPadding).fillMaxSize().padding(horizontal = 16.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-            Spacer(Modifier.height(16.dp))
-            PlaceSaved(navController)
+    val context = LocalContext.current
+    val placesClient = remember(context) { if (Places.isInitialized()) Places.createClient(context) else null }
+    val savedCafes = BookmarkRepository.cafes()
+    var showAllSaved by rememberSaveable { mutableStateOf(false) }
+    var selectedSavedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
+    var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
+    val detailProgress = remember { Animatable(0f) }
+    val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
+    val interactionSource = remember { MutableInteractionSource() }
+    val selectedSavedCafe = remember(savedCafes, selectedSavedCafeId) {
+        selectedSavedCafeId?.let { cafeId ->
+            savedCafes.firstOrNull { it.id == cafeId } ?: CafeRepository.getCafe(cafeId)
+        }
+    }
+    val loadedSelectedPhotoCount = selectedSavedCafe?.photoBitmaps?.count { it != null } ?: 0
+
+    LaunchedEffect(selectedSavedCafe) {
+        if (selectedSavedCafe != null) {
+            overlayCafe = selectedSavedCafe
+        }
+    }
+
+    LaunchedEffect(selectedSavedCafeId) {
+        if (selectedSavedCafeId != null) {
+            detailProgress.animateTo(
+                targetValue = 1f,
+                animationSpec = tween(durationMillis = 320, easing = FastOutSlowInEasing)
+            )
+        } else if (overlayCafe != null || detailProgress.value > 0f) {
+            detailProgress.animateTo(
+                targetValue = 0f,
+                animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing)
+            )
+            overlayCafe = null
+        }
+    }
+
+    BackHandler(enabled = selectedSavedCafeId != null) {
+        selectedSavedCafeId = null
+    }
+
+    LaunchedEffect(selectedSavedCafe?.id, loadedSelectedPhotoCount, placesClient) {
+        val cafe = selectedSavedCafe ?: return@LaunchedEffect
+        val client = placesClient ?: return@LaunchedEffect
+        if (cafe.photoMetadatas.isEmpty()) return@LaunchedEffect
+
+        val nextPhotoIndex = cafe.photoBitmaps.indexOfFirst { it == null }
+        if (nextPhotoIndex == -1) return@LaunchedEffect
+
+        val bitmap = fetchCafePhotoBitmap(client, cafe.photoMetadatas[nextPhotoIndex]) ?: return@LaunchedEffect
+        CafeRepository.updateCafePhoto(cafe.id, nextPhotoIndex, bitmap)
+    }
+
+    Box(modifier = Modifier.fillMaxSize()) {
+        Scaffold(
+            topBar = {
+                TopSearchBar(
+                    modifier = Modifier.graphicsLayer {
+                        alpha = 1f - detailProgress.value
+                    },
+                    enabled = detailProgress.value < 0.01f
+                )
+            },
+            bottomBar = {
+                BottomNavBar(
+                    navController = navController,
+                    enabled = detailProgress.value < 0.01f,
+                    dimFraction = detailProgress.value
+                )
+            },
+            containerColor = CoffeeLight
+        ) { innerPadding ->
+            LazyColumn(
+                modifier = Modifier
+                    .padding(innerPadding)
+                    .fillMaxSize()
+                    .padding(horizontal = 16.dp),
+                contentPadding = PaddingValues(top = 16.dp, bottom = 24.dp)
+            ) {
+                item {
+                    PlaceSaved(
+                        savedCafes = savedCafes,
+                        showAllSaved = showAllSaved,
+                        onToggleShowAllSaved = { showAllSaved = !showAllSaved },
+                        onSavedCafeSelected = { cafe ->
+                            selectedSavedCafeId = cafe.id
+                        }
+                    )
+                }
+            }
+        }
+
+        if (overlayCafe != null && detailProgress.value > 0f) {
+            val scrimAlpha by animateFloatAsState(
+                targetValue = 0.2f * detailProgress.value,
+                animationSpec = tween(durationMillis = 120, easing = FastOutSlowInEasing),
+                label = "savedDetailScrimAlpha"
+            )
+            val overlayScale by animateFloatAsState(
+                targetValue = 0.94f + (0.06f * detailProgress.value),
+                animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
+                label = "savedDetailOverlayScale"
+            )
+
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .background(Color.Black.copy(alpha = scrimAlpha))
+                    .clickable(
+                        interactionSource = interactionSource,
+                        indication = null
+                    ) {
+                        selectedSavedCafeId = null
+                    }
+            )
+
+            ExpandedCafeDetailOverlay(
+                navController = navController,
+                cafe = overlayCafe!!,
+                onClose = { selectedSavedCafeId = null },
+                cornerRadius = lerp(
+                    detailOverlayLayoutSpec.collapsedCornerRadius,
+                    detailOverlayLayoutSpec.expandedCornerRadius,
+                    detailProgress.value
+                ),
+                heroHeight = lerp(
+                    detailOverlayLayoutSpec.collapsedHeroHeight,
+                    detailOverlayLayoutSpec.expandedHeroHeight,
+                    detailProgress.value
+                ),
+                sharedHeroModel = overlayCafe!!.primaryImageModel(),
+                transitionProgress = detailProgress.value,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .statusBarsPadding()
+                    .navigationBarsPadding()
+                    .padding(
+                        start = detailOverlayLayoutSpec.horizontalInset,
+                        end = detailOverlayLayoutSpec.horizontalInset,
+                        top = detailOverlayLayoutSpec.topInset,
+                        bottom = detailOverlayLayoutSpec.bottomInset
+                    )
+                    .fillMaxWidth()
+                    .graphicsLayer {
+                        alpha = detailProgress.value
+                        scaleX = overlayScale
+                        scaleY = overlayScale
+                    }
+            )
         }
     }
 }
@@ -2219,7 +2582,9 @@ fun SavedCafeRow(
     onRemove: () -> Unit
 ) {
     OutlinedCard(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onOpen() },
         shape = RoundedCornerShape(12.dp)
     ) {
         Row(
@@ -2244,7 +2609,25 @@ fun SavedCafeRow(
 
             Column(modifier = Modifier.weight(1f)) {
                 Text(cafe.name, fontWeight = FontWeight.SemiBold)
-                Text(cafe.address, style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                val reviewCount = cafe.userRatingCount ?: 0
+                if (cafe.rating != null && reviewCount > 0) {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        RatingStars(cafe.rating)
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = String.format(Locale.US, "%.1f", cafe.rating),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color.Gray
+                        )
+                    }
+                } else {
+                    Text("No ratings yet", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                }
+                Text(
+                    text = formatDistanceAway(cafe.distanceMeters) ?: "Distance unavailable",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color(0xFF4A231C)
+                )
             }
 
             IconButton(onClick = onRemove) {
@@ -2252,6 +2635,19 @@ fun SavedCafeRow(
             }
         }
     }
+}
+
+@Composable
+private fun SavedSectionHeading(title: String) {
+    val outlineColor = Color(0xFFE6E6E6)
+    Text(title, fontWeight = FontWeight.SemiBold)
+    Spacer(Modifier.height(4.dp))
+    Box(
+        Modifier
+            .width(80.dp)
+            .height(1.dp)
+            .background(outlineColor)
+    )
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -2329,6 +2725,7 @@ fun MapSearchBar(searchQuery: String, onQueryChanged: (String) -> Unit, onPlaceS
 
 @Composable
 fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
+    val context = LocalContext.current
 
     LaunchedEffect(cafeId) {
         RecentRepository.add(cafeId)
@@ -2391,6 +2788,16 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
                 Text("Phone: ${cafe.phone}")
                 Text(cafe.status)
                 HoursDropdown(cafe.hours)
+                Spacer(Modifier.height(12.dp))
+                Button(
+                    onClick = { openDirectionsInGoogleMaps(context, cafe) },
+                    enabled = cafe.directionsDestination() != null,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Icon(Icons.Filled.Directions, contentDescription = null)
+                    Spacer(Modifier.width(8.dp))
+                    Text("Directions")
+                }
             }
 
             item {
@@ -2560,24 +2967,104 @@ fun WriteReviewScreen(navController: NavHostController, cafeId: String) {
 }
 
 @Composable
-fun PlaceSaved(navController: NavHostController) {
+fun PlaceSaved(
+    savedCafes: List<Cafe>,
+    showAllSaved: Boolean,
+    onToggleShowAllSaved: () -> Unit,
+    onSavedCafeSelected: (Cafe) -> Unit
+) {
     val outlineColor = Color(0xFFE6E6E6)
-    val savedCafes = BookmarkRepository.cafes()
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(22.dp)) {
         Column {
-            Text("Saved", fontWeight = FontWeight.SemiBold); Spacer(Modifier.height(4.dp)); Box(Modifier.width(80.dp).height(1.dp).background(outlineColor))
-            Spacer(Modifier.height(10.dp)); Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-            if (savedCafes.isEmpty()) { SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f), true) }
-            else { savedCafes.take(3).forEach { cafe -> SavedCafeTile(cafe = cafe, navController = navController, modifier = Modifier.weight(1f)) }; if (savedCafes.size < 3) { repeat(3 - savedCafes.size) { if (savedCafes.size + it == 2) SavedTile(Modifier.weight(1f), true) else SavedTile(Modifier.weight(1f)) } } }
-        }
+            SavedSectionHeading("Saved")
+            Spacer(Modifier.height(10.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                if (savedCafes.isEmpty()) {
+                    SavedTile(Modifier.weight(1f))
+                    SavedTile(Modifier.weight(1f))
+                    SavedTile(Modifier.weight(1f), true)
+                } else {
+                    savedCafes.take(3).forEach { cafe ->
+                        SavedCafeTile(
+                            cafe = cafe,
+                            onOpen = { onSavedCafeSelected(cafe) },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                    if (savedCafes.size < 3) {
+                        repeat(3 - savedCafes.size) { index ->
+                            if (savedCafes.size + index == 2) {
+                                SavedTile(Modifier.weight(1f), true)
+                            } else {
+                                SavedTile(Modifier.weight(1f))
+                            }
+                        }
+                    }
+                }
+            }
+            Spacer(Modifier.height(12.dp))
+            OutlinedButton(
+                onClick = onToggleShowAllSaved,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = CoffeeDark,
+                    contentColor = Color.White
+                ),
+                border = BorderStroke(1.dp, CoffeeDark)
+            ) {
+                Text(if (showAllSaved) "Hide saved" else "Show all saved")
+            }
+            if (showAllSaved) {
+                Spacer(Modifier.height(12.dp))
+                if (savedCafes.isEmpty()) {
+                    OutlinedCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(12.dp),
+                        border = BorderStroke(1.dp, outlineColor)
+                    ) {
+                        Text(
+                            text = "No saved places yet. Swipe right on a cafe to add it here.",
+                            modifier = Modifier.padding(16.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color.Gray
+                        )
+                    }
+                } else {
+                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                        savedCafes.forEach { cafe ->
+                            SavedCafeRow(
+                                cafe = cafe,
+                                onOpen = { onSavedCafeSelected(cafe) },
+                                onRemove = { BookmarkRepository.remove(cafe.id) }
+                            )
+                        }
+                    }
+                }
+            }
         }
         Column {
-            Text("Collection", fontWeight = FontWeight.SemiBold); Spacer(Modifier.height(4.dp)); Box(Modifier.width(80.dp).height(1.dp).background(outlineColor))
-            Spacer(Modifier.height(10.dp)); Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) { Column(Modifier.weight(1f)) { SavedTile(); Text("Good Coffee", style = MaterialTheme.typography.bodySmall) }; Column(Modifier.weight(1f)) { SavedTile(); Text("Quiet Area", style = MaterialTheme.typography.bodySmall) }; SavedTile(Modifier.weight(1f), true) }
+            SavedSectionHeading("Collection")
+            Spacer(Modifier.height(10.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(Modifier.weight(1f)) {
+                    SavedTile()
+                    Text("Good Coffee", style = MaterialTheme.typography.bodySmall)
+                }
+                Column(Modifier.weight(1f)) {
+                    SavedTile()
+                    Text("Quiet Area", style = MaterialTheme.typography.bodySmall)
+                }
+                SavedTile(Modifier.weight(1f), true)
+            }
         }
         Column {
-            Text("Study Plan", fontWeight = FontWeight.SemiBold); Spacer(Modifier.height(4.dp)); Box(Modifier.width(80.dp).height(1.dp).background(outlineColor))
-            Spacer(Modifier.height(10.dp)); Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) { SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f)); SavedTile(Modifier.weight(1f), true) }
+            SavedSectionHeading("Study Plan")
+            Spacer(Modifier.height(10.dp))
+            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                SavedTile(Modifier.weight(1f))
+                SavedTile(Modifier.weight(1f))
+                SavedTile(Modifier.weight(1f), true)
+            }
         }
     }
 }
@@ -2589,9 +3076,30 @@ fun SavedTile(modifier: Modifier = Modifier, plus: Boolean = false) {
 }
 
 @Composable
-fun SavedCafeTile(cafe: Cafe, navController: NavHostController, modifier: Modifier = Modifier) {
+fun SavedCafeTile(cafe: Cafe, onOpen: () -> Unit, modifier: Modifier = Modifier) {
     val outlineColor = Color(0xFFE6E6E6)
-    OutlinedCard(modifier = modifier.aspectRatio(1f), shape = RoundedCornerShape(4.dp), border = BorderStroke(1.dp, outlineColor)) { Box(modifier = Modifier.fillMaxSize()) { Box(modifier = Modifier.fillMaxSize().clickable { navController.navigate(Screen.CafeDetails.createRoute(cafe.id)) }) { AsyncImage(model = cafe.primaryImageModel(), contentDescription = cafe.name, modifier = Modifier.fillMaxSize(), contentScale = ContentScale.Crop) }; IconButton(onClick = { BookmarkRepository.toggle(cafe.id) }, modifier = Modifier.align(Alignment.TopEnd)) { Icon(Icons.Filled.Bookmark, contentDescription = "Remove", tint = Color.White) } } }
+    OutlinedCard(
+        modifier = modifier.aspectRatio(1f),
+        shape = RoundedCornerShape(4.dp),
+        border = BorderStroke(1.dp, outlineColor)
+    ) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            Box(modifier = Modifier.fillMaxSize().clickable { onOpen() }) {
+                AsyncImage(
+                    model = cafe.primaryImageModel(),
+                    contentDescription = cafe.name,
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop
+                )
+            }
+            IconButton(
+                onClick = { BookmarkRepository.toggle(cafe.id) },
+                modifier = Modifier.align(Alignment.TopEnd)
+            ) {
+                Icon(Icons.Filled.Bookmark, contentDescription = "Remove", tint = Color.White)
+            }
+        }
+    }
 }
 @Composable
 fun PlaceCard(
@@ -2673,6 +3181,7 @@ fun ExpandedCafeDetailOverlay(
     transitionProgress: Float,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     val reviews = ReviewRepository.reviewsFor(cafe.id)
     val isBookmarked = BookmarkRepository.isBookmarked(cafe.id)
     val pageCount = cafe.photoPageCount()
@@ -2866,6 +3375,15 @@ fun ExpandedCafeDetailOverlay(
                         Text("Address: ${cafe.address}", style = MaterialTheme.typography.bodyLarge)
                         Text("Phone: ${cafe.phone}", style = MaterialTheme.typography.bodyLarge)
                         HoursDropdown(cafe.hours)
+                        Button(
+                            onClick = { openDirectionsInGoogleMaps(context, cafe) },
+                            enabled = cafe.directionsDestination() != null,
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Icon(Icons.Filled.Directions, contentDescription = null)
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Directions")
+                        }
                     }
                 }
 
