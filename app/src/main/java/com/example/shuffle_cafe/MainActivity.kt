@@ -932,6 +932,26 @@ object BookmarkRepository {
         .mapNotNull { id -> CafeRepository.getCafe(id) }
 }
 
+object RecentRepository {
+    private val recentIds = mutableStateListOf<String>()
+
+    fun add(cafeId: String) {
+        recentIds.remove(cafeId)
+        recentIds.add(0, cafeId)
+        if (recentIds.size > 20) {
+            recentIds.removeAt(recentIds.lastIndex)
+        }
+    }
+
+    fun cafes(): List<Cafe> {
+        return recentIds.mapNotNull { id -> CafeRepository.getCafe(id) }
+    }
+
+    fun previewCafes(limit: Int = 3): List<Cafe> {
+        return cafes().take(limit)
+    }
+}
+
 object ReviewRepository {
     private val reviewsByCafe = mutableStateMapOf<String, SnapshotStateList<String>>()
     fun reviewsFor(cafeId: String): SnapshotStateList<String> = reviewsByCafe.getOrPut(cafeId) { mutableStateListOf() }
@@ -1233,6 +1253,7 @@ fun MainScreen(navController: NavHostController) {
                                 transitionProgress = detailProgress.value,
                                 renderTopCardOnly = renderTopCardOnly,
                                 onCafeSelected = { cafe, sourceBounds, heroModel ->
+                                    RecentRepository.add(cafe.id)
                                     transitionState = SelectedCafeTransitionState(
                                         cafeId = cafe.id,
                                         sourceBounds = sourceBounds,
@@ -2308,6 +2329,11 @@ fun MapSearchBar(searchQuery: String, onQueryChanged: (String) -> Unit, onPlaceS
 
 @Composable
 fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
+
+    LaunchedEffect(cafeId) {
+        RecentRepository.add(cafeId)
+    }
+
     val cafe = CafeRepository.getCafe(cafeId)
     val reviews = ReviewRepository.reviewsFor(cafeId)
 
@@ -2473,6 +2499,49 @@ fun HoursDropdown(hours: LinkedHashMap<String, String>) {
                 )
             }
         }
+    }
+}
+
+@Composable
+fun RecentCafeRow(
+    cafe: Cafe,
+    onClick: () -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() },
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Surface(
+            modifier = Modifier.size(44.dp),
+            shape = RoundedCornerShape(8.dp),
+            color = Color(0xFFF0F0F0)
+        ) {
+            AsyncImage(
+                model = cafe.heroImageBitmap ?: cafe.imageUrl ?: cafe.imageResId,
+                contentDescription = null,
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        }
+
+        Spacer(Modifier.width(12.dp))
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(cafe.name, fontWeight = FontWeight.SemiBold)
+            Text(
+                cafe.address,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.Gray,
+                maxLines = 1
+            )
+        }
+
+        Icon(
+            Icons.Filled.ChevronRight,
+            contentDescription = "Open"
+        )
     }
 }
 
@@ -3155,20 +3224,40 @@ fun ProfileScreen(navController: NavHostController) {
 
                 // Recently viewed
                 item {
-                    Text(
-                        text = "Recently View",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Recently View",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+
+                        Spacer(Modifier.width(4.dp))
+
+                        Icon(
+                            imageVector = Icons.Filled.ChevronRight,
+                            contentDescription = "View more",
+                            modifier = Modifier.clickable { }
+                        )
+                    }
                 }
 
-                items(
-                    listOf(
-                        "Klatch Coffee" to "13855 City Center Dr #3015...",
-                        "Aroma Craft Coffee" to "20265 Valley Blvd Ste Q..."
-                    )
-                ) { item ->
-                    RecentItemRow(item.first, item.second)
+                val recentCafes = RecentRepository.previewCafes()
+
+                if (recentCafes.isEmpty()) {
+                    item {
+                        Text("No recently viewed cafes yet.", color = Color.Gray)
+                    }
+                } else {
+                    items(recentCafes, key = { it.id }) { cafe ->
+                        RecentCafeRow(
+                            cafe = cafe,
+                            onClick = {
+                                navController.navigate(Screen.CafeDetails.createRoute(cafe.id))
+                            }
+                        )
+                    }
                 }
 
                 item {
