@@ -196,6 +196,9 @@ internal data class CachedCafeDto(
     val ambience: List<String>,
     val rating: Float? = null,
     val userRatingCount: Int? = null,
+    val distanceMeters: Float? = null,
+    val imageResId: Int? = null,
+    val imageUrl: String? = null,
     val latitude: Double? = null,
     val longitude: Double? = null
 )
@@ -203,6 +206,12 @@ internal data class CachedCafeDto(
 @Serializable
 internal data class CachedCafeEnvelope(
     val cityKey: String,
+    val savedAtEpochMillis: Long,
+    val cafes: List<CachedCafeDto>
+)
+
+@Serializable
+internal data class CachedBookmarkEnvelope(
     val savedAtEpochMillis: Long,
     val cafes: List<CachedCafeDto>
 )
@@ -245,6 +254,8 @@ private const val CITY_COFFEE_SEARCH_RADIUS_METERS = 35_000.0
 private const val CITY_COFFEE_SEARCH_MAX_RESULTS = 20
 private const val CAFE_CACHE_PREFS_NAME = "shuffle_cafe_city_cache"
 private const val CAFE_CACHE_ENTRY_PREFIX = "city_cache_"
+private const val BOOKMARK_CACHE_PREFS_NAME = "shuffle_cafe_bookmark_cache"
+private const val BOOKMARK_CACHE_ENTRY_KEY = "saved_bookmark_cafes"
 private const val UNKNOWN_CITY_CACHE_KEY = "nearby_unknown_city"
 private const val CAFE_CACHE_MAX_AGE_MILLIS = 7L * 24L * 60L * 60L * 1000L
 private const val MAP_VIEWPORT_QUERY_DEBOUNCE_MILLIS = 650L
@@ -488,6 +499,9 @@ private fun Cafe.toCachedDto(): CachedCafeDto {
         ambience = ambience,
         rating = rating,
         userRatingCount = userRatingCount,
+        distanceMeters = distanceMeters,
+        imageResId = imageResId,
+        imageUrl = imageUrl,
         latitude = latLng?.latitude,
         longitude = latLng?.longitude
     )
@@ -506,7 +520,9 @@ internal fun CachedCafeDto.toCafe(distanceReference: LatLng? = null): Cafe {
         ambience = ambience,
         rating = rating,
         userRatingCount = userRatingCount,
-        distanceMeters = computeCafeDistanceMeters(cafeLatLng, distanceReference),
+        distanceMeters = computeCafeDistanceMeters(cafeLatLng, distanceReference) ?: distanceMeters,
+        imageResId = imageResId ?: R.drawable.ic_launcher_foreground,
+        imageUrl = imageUrl,
         latLng = cafeLatLng
     )
 }
@@ -564,6 +580,52 @@ private object CafeCacheStore {
         prefs(context)
             .edit()
             .putString(cacheEntryKey(cityKey), json.encodeToString(envelope))
+            .apply()
+    }
+}
+
+private object BookmarkCacheStore {
+    private val json = Json {
+        ignoreUnknownKeys = true
+        encodeDefaults = true
+    }
+
+    private fun prefs(context: Context): SharedPreferences {
+        return context.applicationContext.getSharedPreferences(BOOKMARK_CACHE_PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    fun load(context: Context): List<Cafe> {
+        val encoded = prefs(context).getString(BOOKMARK_CACHE_ENTRY_KEY, null) ?: return emptyList()
+        val envelope = runCatching {
+            json.decodeFromString<CachedBookmarkEnvelope>(encoded)
+        }.getOrNull() ?: return emptyList()
+
+        return envelope.cafes
+            .distinctBy { dto -> dto.id }
+            .map { dto -> dto.toCafe(distanceReference = null) }
+    }
+
+    fun save(context: Context, cafes: List<Cafe>) {
+        if (cafes.isEmpty()) {
+            clear(context)
+            return
+        }
+
+        val envelope = CachedBookmarkEnvelope(
+            savedAtEpochMillis = System.currentTimeMillis(),
+            cafes = cafes.map { it.toCachedDto() }
+        )
+
+        prefs(context)
+            .edit()
+            .putString(BOOKMARK_CACHE_ENTRY_KEY, json.encodeToString(envelope))
+            .apply()
+    }
+
+    fun clear(context: Context) {
+        prefs(context)
+            .edit()
+            .remove(BOOKMARK_CACHE_ENTRY_KEY)
             .apply()
     }
 }
@@ -745,6 +807,17 @@ object CafeRepository {
         if (updatedMapCafes !== mapFeedState.cafes) {
             mapFeedState = mapFeedState.copy(cafes = updatedMapCafes)
         }
+    }
+
+    fun cacheCafes(cafes: List<Cafe>) {
+        if (cafes.isEmpty()) return
+
+        val updatedCatalog = cafeIndexById.toMutableMap()
+        cafes.forEach { cafe ->
+            val mergedCafe = cafe.mergeLoadedMedia(updatedCatalog[cafe.id])
+            updatedCatalog[cafe.id] = mergedCafe
+        }
+        cafeIndexById = updatedCatalog
     }
 
     fun getCafe(id: String): Cafe? = cafeIndexById[id] ?: fallbackCafes.firstOrNull { it.id == id }
@@ -1069,21 +1142,43 @@ object CafeRepository {
 object BookmarkRepository {
     // store just IDs
     private val bookmarkedIds = mutableStateListOf<String>()
+    private var appContext: Context? = null
+    private var isInitialized = false
+
+    fun initialize(context: Context) {
+        val applicationContext = context.applicationContext
+        appContext = applicationContext
+        if (isInitialized) return
+
+        val cachedBookmarks = BookmarkCacheStore.load(applicationContext)
+        if (cachedBookmarks.isNotEmpty()) {
+            CafeRepository.cacheCafes(cachedBookmarks)
+            bookmarkedIds.clear()
+            bookmarkedIds.addAll(cachedBookmarks.map { cafe -> cafe.id })
+        }
+
+        isInitialized = true
+    }
 
     fun isBookmarked(cafeId: String): Boolean = bookmarkedIds.contains(cafeId)
 
     fun add(cafeId: String) {
         bookmarkedIds.remove(cafeId)
         bookmarkedIds.add(0, cafeId)
+        persistBookmarks()
     }
 
     fun toggle(cafeId: String) {
-        if (bookmarkedIds.contains(cafeId)) bookmarkedIds.remove(cafeId)
+        if (bookmarkedIds.contains(cafeId)) {
+            bookmarkedIds.remove(cafeId)
+            persistBookmarks()
+        }
         else add(cafeId)
     }
 
     fun remove(cafeId: String) {
         bookmarkedIds.remove(cafeId)
+        persistBookmarks()
     }
 
     // Expose as List so callers can display it
@@ -1092,8 +1187,15 @@ object BookmarkRepository {
     fun cafes(): List<Cafe> = bookmarkedIds.toList()
         .mapNotNull { id -> CafeRepository.getCafe(id) }
 
+    private fun persistBookmarks() {
+        val context = appContext ?: return
+        BookmarkCacheStore.save(context, cafes())
+    }
+
     internal fun resetForTest() {
         bookmarkedIds.clear()
+        appContext = null
+        isInitialized = false
     }
 }
 
@@ -1131,6 +1233,7 @@ class MainActivity : ComponentActivity() {
         if (!Places.isInitialized()) {
             Places.initializeWithNewPlacesApiEnabled(applicationContext, "AIzaSyC7QTmdJE2fnRXMiKWrMZftkXIG20gNWrA")
         }
+        BookmarkRepository.initialize(applicationContext)
         requestPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
 
         setContent { Shuffle_CafeTheme { AppNav() } }

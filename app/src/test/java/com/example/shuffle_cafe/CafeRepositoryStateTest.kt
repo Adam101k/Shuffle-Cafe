@@ -140,6 +140,25 @@ class CafeRepositoryStateTest {
         assertNull(cachedCafe.toCafe(distanceReference = null).distanceMeters)
     }
 
+    @Test
+    fun cachedCafeFallsBackToPersistedDistanceWhenReferenceLocationIsUnavailable() {
+        val cachedCafe = CachedCafeDto(
+            id = "persisted_distance",
+            name = "Persisted Distance Cafe",
+            address = "123 Bean Street",
+            phone = "555-0100",
+            status = "Open",
+            hours = linkedMapOf("Monday" to "7:00 AM - 5:00 PM"),
+            features = listOf("Coffee house"),
+            ambience = listOf("Coffee"),
+            distanceMeters = 1450f
+        )
+
+        val restoredCafe = cachedCafe.toCafe(distanceReference = null)
+
+        assertEquals(1450f, restoredCafe.distanceMeters ?: 0f, 0.001f)
+    }
+
     private fun testCafe(
         id: String,
         status: String = "Open",
