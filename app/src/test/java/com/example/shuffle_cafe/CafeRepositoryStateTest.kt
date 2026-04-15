@@ -159,6 +159,23 @@ class CafeRepositoryStateTest {
         assertEquals(1450f, restoredCafe.distanceMeters ?: 0f, 0.001f)
     }
 
+    @Test
+    fun resetForTestClearsMapSessionCache() {
+        CafeRepository.cacheMapViewportForTest(
+            viewportKey = "viewport_a",
+            cafes = listOf(testCafe(id = "cached_map_ping"))
+        )
+
+        assertEquals(
+            listOf("cached_map_ping"),
+            CafeRepository.mapSessionCacheSnapshotForTest().map { cafe -> cafe.id }
+        )
+
+        CafeRepository.resetForTest()
+
+        assertTrue(CafeRepository.mapSessionCacheSnapshotForTest().isEmpty())
+    }
+
     private fun testCafe(
         id: String,
         status: String = "Open",

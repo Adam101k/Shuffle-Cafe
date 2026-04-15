@@ -3,6 +3,8 @@ package com.example.shuffle_cafe
 import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ActivityNotFoundException
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -107,7 +109,6 @@ import com.google.android.libraries.places.api.model.PhotoMetadata
 import com.google.android.libraries.places.api.model.Place
 import com.google.android.libraries.places.api.net.FetchPhotoRequest
 import com.google.android.libraries.places.api.net.PlacesClient
-import com.google.android.libraries.places.api.net.SearchNearbyRequest
 import com.google.maps.android.compose.CameraPositionState
 import com.google.maps.android.compose.GoogleMap
 import com.google.maps.android.compose.MapProperties
@@ -121,6 +122,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.filterNotNull
 import kotlinx.coroutines.launch
@@ -262,6 +264,7 @@ private const val MAP_VIEWPORT_QUERY_DEBOUNCE_MILLIS = 650L
 private const val MAP_VIEWPORT_MIN_QUERY_ZOOM = 6f
 private const val MAP_VIEWPORT_SEARCH_MIN_RADIUS_METERS = 1_500.0
 private const val MAP_VIEWPORT_SEARCH_MAX_RADIUS_METERS = 18_000.0
+internal const val MAP_SESSION_CACHE_TTL_MILLIS = 15L * 60L * 1000L
 
 private fun LatLng.toLocation(provider: String = "map_viewport"): Location {
     return Location(provider).apply {
@@ -485,6 +488,78 @@ private fun Cafe.mergeLoadedMedia(existing: Cafe?): Cafe {
             ?: existingCafe.heroImageBitmap,
         photoBitmaps = mergedPhotoBitmaps
     )
+}
+
+private fun Cafe.withDistanceReference(distanceReference: LatLng?): Cafe {
+    return copy(distanceMeters = computeCafeDistanceMeters(latLng, distanceReference) ?: distanceMeters)
+}
+
+private data class MapSessionCafeCacheEntry(
+    val cafe: Cafe,
+    val savedAtEpochMillis: Long
+)
+
+internal class MapSessionCafeCache(
+    private val ttlMillis: Long = MAP_SESSION_CACHE_TTL_MILLIS,
+    private val nowMillis: () -> Long = { System.currentTimeMillis() }
+) {
+    private val cafesById = linkedMapOf<String, MapSessionCafeCacheEntry>()
+    private val viewportLoadedAtMillis = mutableMapOf<String, Long>()
+
+    fun recordViewport(viewportKey: String, cafes: List<Cafe>) {
+        if (viewportKey.isBlank() || cafes.isEmpty()) return
+
+        val now = nowMillis()
+        prune(now)
+        viewportLoadedAtMillis[viewportKey] = now
+        cafes.distinctBy { cafe -> cafe.id }.forEach { cafe ->
+            val existingCafe = cafesById[cafe.id]?.cafe
+            cafesById[cafe.id] = MapSessionCafeCacheEntry(
+                cafe = cafe.mergeLoadedMedia(existingCafe),
+                savedAtEpochMillis = now
+            )
+        }
+    }
+
+    fun isViewportFresh(viewportKey: String): Boolean {
+        if (viewportKey.isBlank()) return false
+
+        val now = nowMillis()
+        prune(now)
+        val loadedAt = viewportLoadedAtMillis[viewportKey] ?: return false
+        return isFresh(loadedAt, now)
+    }
+
+    fun latestLoadedAtEpochMillis(): Long? {
+        val now = nowMillis()
+        prune(now)
+        return viewportLoadedAtMillis.values.maxOrNull()
+    }
+
+    fun snapshot(distanceReference: LatLng? = null): List<Cafe> {
+        val now = nowMillis()
+        prune(now)
+        return cafesById.values
+            .map { entry -> entry.cafe.withDistanceReference(distanceReference) }
+            .sortedWith(
+                compareBy<Cafe> { cafe -> cafe.distanceMeters ?: Float.MAX_VALUE }
+                    .thenBy { cafe -> cafe.name }
+            )
+    }
+
+    fun clear() {
+        cafesById.clear()
+        viewportLoadedAtMillis.clear()
+    }
+
+    private fun prune(now: Long) {
+        cafesById.entries.removeAll { (_, entry) -> !isFresh(entry.savedAtEpochMillis, now) }
+        viewportLoadedAtMillis.entries.removeAll { (_, loadedAt) -> !isFresh(loadedAt, now) }
+    }
+
+    private fun isFresh(savedAt: Long, now: Long): Boolean {
+        return now - savedAt < ttlMillis
+    }
 }
 
 private fun Cafe.toCachedDto(): CachedCafeDto {
@@ -732,6 +807,7 @@ object CafeRepository {
     private var cafeIndexById by mutableStateOf<Map<String, Cafe>>(emptyMap())
     private val homeLoadMutex = Mutex()
     private val mapLoadMutex = Mutex()
+    private val mapSessionCafeCache = MapSessionCafeCache()
 
     val homeUiState: CafeFeedUiState
         get() = homeFeedState
@@ -1003,55 +1079,36 @@ object CafeRepository {
             val distanceReference = runCatching {
                 getCurrentOrLastLocation(fusedLocationClient).toLatLng()
             }.getOrNull()
-            val cachedEnvelope = CafeCacheStore.load(context, queryContext.cityKey)
-            val cachedCafes = cachedEnvelope?.cafes?.map { dto ->
-                dto.toCafe(distanceReference = distanceReference)
-            }.orEmpty()
+            val sessionCachedCafes = mapSessionCafeCache.snapshot(distanceReference)
+            val isViewportFresh = mapSessionCafeCache.isViewportFresh(queryContext.cityKey)
+            val sessionLastUpdated = mapSessionCafeCache.latestLoadedAtEpochMillis()
 
-            if (
-                mapFeedState.cityKey == queryContext.cityKey &&
-                mapFeedState.cafes.isNotEmpty() &&
-                !mapFeedState.isLoading &&
-                !mapFeedState.isRefreshing
-            ) {
-                return
-            }
+            if (sessionCachedCafes.isNotEmpty()) {
+                replaceMapFeed(
+                    cafes = sessionCachedCafes,
+                    cityKey = queryContext.cityKey,
+                    cityName = queryContext.cityName,
+                    lastUpdatedEpochMillis = sessionLastUpdated
+                )
+                mapFeedState = mapFeedState.copy(
+                    isLoading = false,
+                    isRefreshing = !isViewportFresh,
+                    loadError = null,
+                    cityKey = queryContext.cityKey,
+                    cityName = queryContext.cityName,
+                    lastUpdatedEpochMillis = sessionLastUpdated
+                )
 
-            when {
-                cachedCafes.isNotEmpty() -> {
-                    replaceMapFeed(
-                        cafes = cachedCafes,
-                        cityKey = queryContext.cityKey,
-                        cityName = queryContext.cityName,
-                        lastUpdatedEpochMillis = cachedEnvelope?.savedAtEpochMillis
-                    )
-                    mapFeedState = mapFeedState.copy(
-                        isLoading = false,
-                        isRefreshing = true,
-                        loadError = null
-                    )
-                }
-
-                mapFeedState.cafes.isNotEmpty() -> {
-                    mapFeedState = mapFeedState.copy(
-                        isLoading = false,
-                        isRefreshing = true,
-                        loadError = null,
-                        cityKey = queryContext.cityKey,
-                        cityName = queryContext.cityName
-                    )
-                }
-
-                else -> {
-                    mapFeedState = CafeFeedUiState(
-                        cafes = emptyList(),
-                        isLoading = true,
-                        isRefreshing = false,
-                        loadError = null,
-                        cityKey = queryContext.cityKey,
-                        cityName = queryContext.cityName
-                    )
-                }
+                if (isViewportFresh) return
+            } else {
+                mapFeedState = CafeFeedUiState(
+                    cafes = emptyList(),
+                    isLoading = true,
+                    isRefreshing = false,
+                    loadError = null,
+                    cityKey = queryContext.cityKey,
+                    cityName = queryContext.cityName
+                )
             }
 
             try {
@@ -1064,47 +1121,48 @@ object CafeRepository {
                     onCafePhotoLoaded = ::updateCafePhoto
                 ).distinctBy { it.id }
 
+                mapSessionCafeCache.recordViewport(queryContext.cityKey, freshCafes)
+                val updatedSessionCafes = mapSessionCafeCache.snapshot(distanceReference)
+                val updatedLastUpdated = mapSessionCafeCache.latestLoadedAtEpochMillis()
+                    ?: System.currentTimeMillis()
+
                 replaceMapFeed(
-                    cafes = freshCafes,
+                    cafes = updatedSessionCafes,
                     cityKey = queryContext.cityKey,
                     cityName = queryContext.cityName,
-                    lastUpdatedEpochMillis = System.currentTimeMillis()
+                    lastUpdatedEpochMillis = updatedLastUpdated
                 )
                 mapFeedState = mapFeedState.copy(
                     isLoading = false,
                     isRefreshing = false,
                     loadError = null
                 )
-                CafeCacheStore.save(context, queryContext.cityKey, freshCafes)
             } catch (error: Exception) {
                 val errorMessage = error.localizedMessage ?: "Failed to load coffee houses for this map area."
-                when {
-                    cachedCafes.isNotEmpty() -> {
-                        mapFeedState = mapFeedState.copy(
-                            isLoading = false,
-                            isRefreshing = false,
-                            loadError = errorMessage
-                        )
-                    }
-
-                    mapFeedState.cafes.isNotEmpty() -> {
-                        mapFeedState = mapFeedState.copy(
-                            isLoading = false,
-                            isRefreshing = false,
-                            loadError = errorMessage
-                        )
-                    }
-
-                    else -> {
-                        mapFeedState = CafeFeedUiState(
-                            cafes = emptyList(),
-                            isLoading = false,
-                            isRefreshing = false,
-                            loadError = errorMessage,
-                            cityKey = queryContext.cityKey,
-                            cityName = queryContext.cityName
-                        )
-                    }
+                val fallbackSessionCafes = mapSessionCafeCache.snapshot(distanceReference)
+                if (fallbackSessionCafes.isNotEmpty()) {
+                    replaceMapFeed(
+                        cafes = fallbackSessionCafes,
+                        cityKey = queryContext.cityKey,
+                        cityName = queryContext.cityName,
+                        lastUpdatedEpochMillis = mapSessionCafeCache.latestLoadedAtEpochMillis()
+                    )
+                    mapFeedState = mapFeedState.copy(
+                        isLoading = false,
+                        isRefreshing = false,
+                        loadError = errorMessage,
+                        cityKey = queryContext.cityKey,
+                        cityName = queryContext.cityName
+                    )
+                } else {
+                    mapFeedState = CafeFeedUiState(
+                        cafes = emptyList(),
+                        isLoading = false,
+                        isRefreshing = false,
+                        loadError = errorMessage,
+                        cityKey = queryContext.cityKey,
+                        cityName = queryContext.cityName
+                    )
                 }
             }
         }
@@ -1114,6 +1172,7 @@ object CafeRepository {
         homeFeedState = CafeFeedUiState()
         mapFeedState = CafeFeedUiState()
         cafeIndexById = emptyMap()
+        mapSessionCafeCache.clear()
     }
 
     internal fun setHomeFeedForTest(
@@ -1136,6 +1195,14 @@ object CafeRepository {
 
     internal fun updateCafeForTest(cafeId: String, transform: (Cafe) -> Cafe) {
         applyCafeUpdate(cafeId, transform)
+    }
+
+    internal fun cacheMapViewportForTest(viewportKey: String, cafes: List<Cafe>) {
+        mapSessionCafeCache.recordViewport(viewportKey, cafes)
+    }
+
+    internal fun mapSessionCacheSnapshotForTest(distanceReference: LatLng? = null): List<Cafe> {
+        return mapSessionCafeCache.snapshot(distanceReference)
     }
 }
 
@@ -2310,7 +2377,7 @@ fun MapScreen(navController: NavHostController) {
         }
             .debounce(MAP_VIEWPORT_QUERY_DEBOUNCE_MILLIS)
             .filterNotNull()
-            .collect { request ->
+            .collectLatest { request ->
                 if (selectedCafeId != null) {
                     selectedCafeId = null
                 }
@@ -2417,7 +2484,7 @@ fun MapScreen(navController: NavHostController) {
                                     strokeWidth = 2.5.dp
                                 )
                                 Spacer(Modifier.width(14.dp))
-                                Text("Loading coffee houses in your city...")
+                                Text("Loading coffee houses in this map area...")
                             }
                         }
                     }
@@ -2450,7 +2517,7 @@ fun MapScreen(navController: NavHostController) {
                             tonalElevation = 8.dp
                         ) {
                             Text(
-                                text = "No coffee houses found in your city.",
+                                text = "No coffee houses found in this map area.",
                                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 18.dp),
                                 textAlign = TextAlign.Center,
                                 style = MaterialTheme.typography.bodyLarge
@@ -2829,6 +2896,8 @@ fun MapSearchBar(searchQuery: String, onQueryChanged: (String) -> Unit, onPlaceS
 @Composable
 fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
     val context = LocalContext.current
+    val detailTextColor = Color.White
+    val detailSecondaryTextColor = Color.White.copy(alpha = 0.78f)
 
     LaunchedEffect(cafeId) {
         RecentRepository.add(cafeId)
@@ -2841,15 +2910,17 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
 
     Scaffold(
         bottomBar = { BottomNavBar(navController) },
-        containerColor = Color.White
+        containerColor = CoffeeDark,
+        contentColor = detailTextColor
     ) { innerPadding ->
         if (cafe == null) {
             Box(
                 modifier = Modifier.padding(innerPadding).fillMaxSize(),
                 contentAlignment = Alignment.Center
-            ) { Text("Cafe not found") }
+            ) { Text("Cafe not found", color = detailTextColor) }
             return@Scaffold
         }
+        val crowdAttributes = CrowdAttributeRepository.attributesFor(cafe.id)
 
         LazyColumn(
             modifier = Modifier
@@ -2872,7 +2943,8 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.SemiBold,
                         modifier = Modifier.weight(1f),
-                        textAlign = TextAlign.Center
+                        textAlign = TextAlign.Center,
+                        color = detailTextColor
                     )
 
                     IconButton(
@@ -2880,16 +2952,17 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
                     ) {
                         Icon(
                             imageVector = if (isBookmarked) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder,
-                            contentDescription = if (isBookmarked) "Remove bookmark" else "Add bookmark"
+                            contentDescription = if (isBookmarked) "Remove bookmark" else "Add bookmark",
+                            tint = detailTextColor
                         )
                     }
                 }
             }
 
             item {
-                Text("Address: ${cafe.address}")
-                Text("Phone: ${cafe.phone}")
-                Text(cafe.status)
+                Text("Address: ${cafe.address}", color = detailTextColor)
+                Text("Phone: ${cafe.phone}", color = detailTextColor)
+                Text(cafe.status, color = detailTextColor)
                 HoursDropdown(cafe.hours)
                 Spacer(Modifier.height(12.dp))
                 Button(
@@ -2904,25 +2977,36 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
             }
 
             item {
+                CafeCrowdAttributesPanel(
+                    cafe = cafe,
+                    attributes = crowdAttributes
+                )
+            }
+
+            item {
                 OutlinedCard(
                     modifier = Modifier.fillMaxWidth(),
                     shape = RoundedCornerShape(4.dp),
-                    border = BorderStroke(1.dp, Color.Black)
+                    border = BorderStroke(1.dp, Color.Black),
+                    colors = CardDefaults.outlinedCardColors(
+                        containerColor = CoffeeDark,
+                        contentColor = detailTextColor
+                    )
                 ) {
                     Row(
                         modifier = Modifier.padding(12.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Menu", modifier = Modifier.weight(1f))
-                        Icon(Icons.Filled.PlayArrow, null)
+                        Text("Menu", modifier = Modifier.weight(1f), color = detailTextColor)
+                        Icon(Icons.Filled.PlayArrow, null, tint = detailTextColor)
                     }
                 }
             }
 
-            item { Text("Features:", fontWeight = FontWeight.SemiBold) }
+            item { Text("Features:", fontWeight = FontWeight.SemiBold, color = detailTextColor) }
             items(cafe.features) { Text("• $it") }
 
-            item { Text("Ambience:", fontWeight = FontWeight.SemiBold) }
+            item { Text("Ambience:", fontWeight = FontWeight.SemiBold, color = detailTextColor) }
             items(cafe.ambience) { Text("• $it") }
 
             item {
@@ -2930,19 +3014,29 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Text("Reviews:", modifier = Modifier.weight(1f))
-                    TextButton(onClick = { navController.navigate(Screen.WriteReview.createRoute(cafeId)) }) {
+                    Text("Reviews:", modifier = Modifier.weight(1f), color = detailTextColor)
+                    TextButton(
+                        onClick = { navController.navigate(Screen.WriteReview.createRoute(cafeId)) },
+                        colors = ButtonDefaults.textButtonColors(contentColor = detailTextColor)
+                    ) {
                         Text("Write review")
                     }
                 }
             }
 
             if (reviews.isEmpty()) {
-                item { Text("No reviews yet.", color = Color.Gray) }
+                item { Text("No reviews yet.", color = detailSecondaryTextColor) }
             } else {
                 items(reviews) {
-                    OutlinedCard(modifier = Modifier.fillMaxWidth()) {
-                        Text(it, modifier = Modifier.padding(12.dp))
+                    OutlinedCard(
+                        modifier = Modifier.fillMaxWidth(),
+                        border = BorderStroke(1.dp, Color.Black),
+                        colors = CardDefaults.outlinedCardColors(
+                            containerColor = CoffeeDark,
+                            contentColor = detailTextColor
+                        )
+                    ) {
+                        Text(it, modifier = Modifier.padding(12.dp), color = detailTextColor)
                     }
                 }
             }
@@ -2952,6 +3046,7 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
 
 @Composable
 fun HoursDropdown(hours: LinkedHashMap<String, String>) {
+    val dropdownTextColor = Color.White
     val displayHours = remember(hours) {
         if (hours.isEmpty()) linkedMapOf("Hours" to "Hours unavailable") else hours
     }
@@ -2968,7 +3063,11 @@ fun HoursDropdown(hours: LinkedHashMap<String, String>) {
                 .fillMaxWidth()
                 .clickable(enabled = days.isNotEmpty()) { expanded = true },
             shape = RoundedCornerShape(4.dp),
-            border = BorderStroke(1.dp, Color.Black)
+            border = BorderStroke(1.dp, Color.Black),
+            colors = CardDefaults.outlinedCardColors(
+                containerColor = CoffeeDark,
+                contentColor = dropdownTextColor
+            )
         ) {
             Row(
                 modifier = Modifier.padding(12.dp),
@@ -2982,10 +3081,11 @@ fun HoursDropdown(hours: LinkedHashMap<String, String>) {
 
                 Text(
                     text = summaryText,
-                    modifier = Modifier.weight(1f)
+                    modifier = Modifier.weight(1f),
+                    color = dropdownTextColor
                 )
 
-                Icon(Icons.Filled.ArrowDropDown, contentDescription = null)
+                Icon(Icons.Filled.ArrowDropDown, contentDescription = null, tint = dropdownTextColor)
             }
         }
 
@@ -3010,6 +3110,625 @@ fun HoursDropdown(hours: LinkedHashMap<String, String>) {
             }
         }
     }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CafeCrowdAttributesPanel(
+    cafe: Cafe,
+    attributes: CafeCrowdAttributes,
+    modifier: Modifier = Modifier
+) {
+    var showSuggestionSheet by remember { mutableStateOf(false) }
+    val panelTextColor = LocalContentColor.current
+
+    Column(
+        modifier = modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "Cafe details from visitors",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                modifier = Modifier.weight(1f),
+                color = panelTextColor
+            )
+            TextButton(
+                onClick = { showSuggestionSheet = true },
+                colors = ButtonDefaults.textButtonColors(contentColor = panelTextColor)
+            ) {
+                Text("Suggest changes")
+            }
+        }
+
+        CrowdAttributeSection(title = "Work setup") {
+            CrowdAttributeRow("Outlets", attributes.outletAvailability.label)
+            CrowdAttributeRow("Wi-Fi speed", attributes.wifiSpeed.label)
+            ProtectedSecretAttributeRow(
+                title = "Wi-Fi password",
+                secret = attributes.wifiPassword,
+                isAvailable = attributes.wifiSpeed.toAvailabilityFlag(),
+                cafeLatLng = cafe.latLng,
+                clipboardLabel = "${cafe.name} Wi-Fi password"
+            )
+            CrowdAttributeRow("Seating availability", attributes.seatingAvailability.label)
+            CrowdAttributeRow("Seating space", attributes.seatingSpace.label)
+            CrowdAttributeRow("Seating comfort", attributes.seatingComfort.label)
+        }
+
+        CrowdAttributeSection(title = "On-site details") {
+            CrowdAttributeRow("Bathroom", attributes.bathroomAvailability.label)
+            ProtectedSecretAttributeRow(
+                title = "Bathroom code",
+                secret = attributes.bathroomCode,
+                isAvailable = attributes.bathroomAvailability.toAvailabilityFlag(),
+                cafeLatLng = cafe.latLng,
+                clipboardLabel = "${cafe.name} bathroom code"
+            )
+            CrowdAttributeRow("Pet-friendly", attributes.petFriendly.label)
+            CrowdAttributeRow("Cleanliness", attributes.cleanlinessRating.label)
+        }
+
+        CrowdAttributeSection(title = "Today") {
+            CrowdAttributeRow("Crowd level", attributes.crowdLevel.label)
+            CrowdAttributeRow("Noise level", attributes.noiseLevel.label)
+            VibeTagSummary(attributes.vibeTags)
+        }
+
+        CrowdAttributeSection(title = "Photos from visitors") {
+            DraftPhotoList(
+                title = "Seating photos",
+                photoUris = attributes.seatingPhotoUris
+            )
+            DraftPhotoList(
+                title = "Menu photos",
+                photoUris = attributes.menuPhotoUris
+            )
+        }
+
+        if (attributes.lastUpdatedEpochMillis != null) {
+            Text(
+                text = "Updated from local suggestions this session.",
+                color = panelTextColor.copy(alpha = 0.78f),
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+    }
+
+    if (showSuggestionSheet) {
+        CrowdAttributeSuggestionSheet(
+            cafe = cafe,
+            attributes = attributes,
+            onDismiss = { showSuggestionSheet = false }
+        )
+    }
+}
+
+@Composable
+private fun CrowdAttributeSection(
+    title: String,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    OutlinedCard(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, Color.Black),
+        colors = CardDefaults.outlinedCardColors(
+            containerColor = CoffeeLight,
+            contentColor = Color.Black
+        )
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, color = Color.Black)
+            content()
+        }
+    }
+}
+
+@Composable
+private fun CrowdAttributeRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.weight(1f),
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color.Black
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodyMedium,
+            fontWeight = FontWeight.SemiBold,
+            textAlign = TextAlign.End,
+            color = Color.Black
+        )
+    }
+}
+
+@Composable
+private fun ProtectedSecretAttributeRow(
+    title: String,
+    secret: ProtectedCrowdSecret,
+    isAvailable: Boolean?,
+    cafeLatLng: LatLng?,
+    clipboardLabel: String
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val fusedLocationClient = remember(context) { LocationServices.getFusedLocationProviderClient(context) }
+    val hasLocationPermission = ContextCompat.checkSelfPermission(
+        context,
+        Manifest.permission.ACCESS_FINE_LOCATION
+    ) == PackageManager.PERMISSION_GRANTED
+
+    var displayState by remember(secret, isAvailable, cafeLatLng) {
+        mutableStateOf(protectedSecretDisplayState(secret, isNearby = false, isAvailable = isAvailable))
+    }
+    var helperText by remember(secret, isAvailable, cafeLatLng) { mutableStateOf<String?>(null) }
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(title, style = MaterialTheme.typography.bodyMedium, color = Color.Black)
+                Text(
+                    text = displayTextForSecretState(displayState),
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = Color.Black
+                )
+            }
+
+            when (val state = displayState) {
+                is ProtectedSecretDisplayState.Revealed -> {
+                    OutlinedButton(
+                        onClick = {
+                            copySecretToClipboard(context, clipboardLabel, state.value)
+                            helperText = "Copied to clipboard."
+                        },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Black),
+                        border = BorderStroke(1.dp, Color.Black)
+                    ) {
+                        Text("Copy")
+                    }
+                }
+
+                ProtectedSecretDisplayState.Censored -> {
+                    OutlinedButton(
+                        onClick = {
+                            if (!hasLocationPermission) {
+                                helperText = "Location permission is needed to reveal this here."
+                                return@OutlinedButton
+                            }
+
+                            scope.launch {
+                                val userLatLng = runCatching {
+                                    getCurrentOrLastLocation(fusedLocationClient).toLatLng()
+                                }.getOrNull()
+                                val isNearby = isUserNearCafe(userLatLng, cafeLatLng)
+                                val updatedState = protectedSecretDisplayState(
+                                    secret = secret,
+                                    isNearby = isNearby,
+                                    isAvailable = isAvailable
+                                )
+                                displayState = updatedState
+                                helperText = when {
+                                    cafeLatLng == null -> "Cafe location is unavailable."
+                                    !isNearby -> "Visit this cafe to reveal."
+                                    updatedState == ProtectedSecretDisplayState.AskStaff -> "Ask staff while you are there."
+                                    updatedState == ProtectedSecretDisplayState.Unknown -> "No one has submitted this yet."
+                                    else -> null
+                                }
+                            }
+                        },
+                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Black),
+                        border = BorderStroke(1.dp, Color.Black)
+                    ) {
+                        Text("Reveal")
+                    }
+                }
+
+                else -> Unit
+            }
+        }
+
+        helperText?.let { text ->
+            Text(
+                text = text,
+                color = Color.Black.copy(alpha = 0.72f),
+                style = MaterialTheme.typography.bodySmall
+            )
+        }
+    }
+}
+
+@Composable
+private fun VibeTagSummary(vibeTags: Set<VibeTag>) {
+    if (vibeTags.isEmpty()) {
+        CrowdAttributeRow("Vibe / atmosphere", "Unknown")
+        return
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Vibe / atmosphere", color = Color.Black, style = MaterialTheme.typography.bodyMedium)
+        vibeTags.chunked(2).forEach { rowTags ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                rowTags.forEach { tag ->
+                    AssistChip(
+                        onClick = { },
+                        label = { Text(tag.label, color = Color.Black) },
+                        modifier = Modifier.weight(1f),
+                        colors = AssistChipDefaults.assistChipColors(
+                            containerColor = CoffeeLight,
+                            labelColor = Color.Black
+                        )
+                    )
+                }
+                if (rowTags.size == 1) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun DraftPhotoList(title: String, photoUris: List<String>) {
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(title, color = Color.Black, style = MaterialTheme.typography.bodyMedium)
+        if (photoUris.isEmpty()) {
+            Text("No visitor photos yet.", color = Color.Black.copy(alpha = 0.72f), style = MaterialTheme.typography.bodySmall)
+        } else {
+            photoUris.forEachIndexed { index, uri ->
+                OutlinedCard(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, Color.Black),
+                    colors = CardDefaults.outlinedCardColors(
+                        containerColor = CoffeeLight,
+                        contentColor = Color.Black
+                    )
+                ) {
+                    Text(
+                        text = "Draft ${index + 1}: $uri",
+                        modifier = Modifier.padding(10.dp),
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 2,
+                        color = Color.Black
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun CrowdAttributeSuggestionSheet(
+    cafe: Cafe,
+    attributes: CafeCrowdAttributes,
+    onDismiss: () -> Unit
+) {
+    var outletAvailability by remember(cafe.id, attributes) { mutableStateOf(attributes.outletAvailability) }
+    var wifiSpeed by remember(cafe.id, attributes) { mutableStateOf(attributes.wifiSpeed) }
+    var wifiPassword by remember(cafe.id, attributes) { mutableStateOf(attributes.wifiPassword.value.orEmpty()) }
+    var wifiPasswordExists by remember(cafe.id, attributes) { mutableStateOf(attributes.wifiPassword.knownToExist) }
+    var bathroomAvailability by remember(cafe.id, attributes) { mutableStateOf(attributes.bathroomAvailability) }
+    var bathroomCode by remember(cafe.id, attributes) { mutableStateOf(attributes.bathroomCode.value.orEmpty()) }
+    var bathroomCodeExists by remember(cafe.id, attributes) { mutableStateOf(attributes.bathroomCode.knownToExist) }
+    var seatingAvailability by remember(cafe.id, attributes) { mutableStateOf(attributes.seatingAvailability) }
+    var seatingSpace by remember(cafe.id, attributes) { mutableStateOf(attributes.seatingSpace) }
+    var seatingComfort by remember(cafe.id, attributes) { mutableStateOf(attributes.seatingComfort) }
+    var crowdLevel by remember(cafe.id, attributes) { mutableStateOf(attributes.crowdLevel) }
+    var noiseLevel by remember(cafe.id, attributes) { mutableStateOf(attributes.noiseLevel) }
+    var petFriendly by remember(cafe.id, attributes) { mutableStateOf(attributes.petFriendly) }
+    var cleanlinessRating by remember(cafe.id, attributes) { mutableStateOf(attributes.cleanlinessRating) }
+    var selectedVibeTags by remember(cafe.id, attributes) { mutableStateOf(attributes.vibeTags) }
+    var seatingPhotoUri by remember(cafe.id) { mutableStateOf("") }
+    var menuPhotoUri by remember(cafe.id) { mutableStateOf("") }
+
+    ModalBottomSheet(onDismissRequest = onDismiss) {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(max = 680.dp),
+            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 28.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            item {
+                Text(
+                    text = "Suggest changes",
+                    style = MaterialTheme.typography.headlineSmall,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = cafe.name,
+                    color = Color.Gray,
+                    style = MaterialTheme.typography.bodyMedium
+                )
+            }
+
+            item {
+                SuggestionDropdown("Outlets", outletAvailability, OutletAvailability.entries, { it.label }) {
+                    outletAvailability = it
+                }
+            }
+            item {
+                SuggestionDropdown("Wi-Fi speed", wifiSpeed, WifiSpeed.entries, { it.label }) {
+                    wifiSpeed = it
+                }
+            }
+            item {
+                OutlinedTextField(
+                    value = wifiPassword,
+                    onValueChange = { wifiPassword = it },
+                    label = { Text("Wi-Fi password") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+            }
+            item {
+                ToggleRow(
+                    label = "Wi-Fi password exists, but I do not know it",
+                    checked = wifiPasswordExists,
+                    onCheckedChange = { wifiPasswordExists = it }
+                )
+            }
+            item {
+                SuggestionDropdown("Bathroom", bathroomAvailability, BathroomAvailability.entries, { it.label }) {
+                    bathroomAvailability = it
+                }
+            }
+            item {
+                OutlinedTextField(
+                    value = bathroomCode,
+                    onValueChange = { bathroomCode = it },
+                    label = { Text("Bathroom code") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+            }
+            item {
+                ToggleRow(
+                    label = "Bathroom code exists, but I do not know it",
+                    checked = bathroomCodeExists,
+                    onCheckedChange = { bathroomCodeExists = it }
+                )
+            }
+            item {
+                SuggestionDropdown(
+                    "Seating availability",
+                    seatingAvailability,
+                    SeatingAvailability.entries,
+                    { it.label }
+                ) {
+                    seatingAvailability = it
+                }
+            }
+            item {
+                SuggestionDropdown("Seating space", seatingSpace, SeatingSpace.entries, { it.label }) {
+                    seatingSpace = it
+                }
+            }
+            item {
+                SuggestionDropdown("Seating comfort", seatingComfort, SeatingComfort.entries, { it.label }) {
+                    seatingComfort = it
+                }
+            }
+            item {
+                SuggestionDropdown("Crowd level", crowdLevel, CrowdLevel.entries, { it.label }) {
+                    crowdLevel = it
+                }
+            }
+            item {
+                SuggestionDropdown("Noise level", noiseLevel, NoiseLevel.entries, { it.label }) {
+                    noiseLevel = it
+                }
+            }
+            item {
+                SuggestionDropdown("Pet-friendly", petFriendly, PetFriendly.entries, { it.label }) {
+                    petFriendly = it
+                }
+            }
+            item {
+                SuggestionDropdown("Cleanliness", cleanlinessRating, CleanlinessRating.entries, { it.label }) {
+                    cleanlinessRating = it
+                }
+            }
+            item {
+                VibeTagSelector(
+                    selectedTags = selectedVibeTags,
+                    onSelectedTagsChanged = { selectedVibeTags = it }
+                )
+            }
+            item {
+                OutlinedTextField(
+                    value = seatingPhotoUri,
+                    onValueChange = { seatingPhotoUri = it },
+                    label = { Text("Seating photo URI") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+            }
+            item {
+                OutlinedTextField(
+                    value = menuPhotoUri,
+                    onValueChange = { menuPhotoUri = it },
+                    label = { Text("Menu photo URI") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+            }
+            item {
+                Button(
+                    onClick = {
+                        CrowdAttributeRepository.applySuggestion(
+                            cafeId = cafe.id,
+                            suggestion = CrowdAttributeSuggestion(
+                                outletAvailability = outletAvailability,
+                                wifiSpeed = wifiSpeed,
+                                wifiPassword = ProtectedCrowdSecret(
+                                    value = wifiPassword,
+                                    knownToExist = wifiPasswordExists
+                                ),
+                                bathroomAvailability = bathroomAvailability,
+                                bathroomCode = ProtectedCrowdSecret(
+                                    value = bathroomCode,
+                                    knownToExist = bathroomCodeExists
+                                ),
+                                seatingAvailability = seatingAvailability,
+                                seatingSpace = seatingSpace,
+                                seatingComfort = seatingComfort,
+                                crowdLevel = crowdLevel,
+                                noiseLevel = noiseLevel,
+                                vibeTags = selectedVibeTags,
+                                petFriendly = petFriendly,
+                                cleanlinessRating = cleanlinessRating,
+                                seatingPhotoUris = listOf(seatingPhotoUri),
+                                menuPhotoUris = listOf(menuPhotoUri)
+                            )
+                        )
+                        onDismiss()
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("Submit suggestion")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun <T> SuggestionDropdown(
+    label: String,
+    selected: T,
+    options: Iterable<T>,
+    optionLabel: (T) -> String,
+    onSelected: (T) -> Unit
+) {
+    var expanded by remember { mutableStateOf(false) }
+
+    Box(modifier = Modifier.fillMaxWidth()) {
+        OutlinedButton(
+            onClick = { expanded = true },
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Column(
+                modifier = Modifier.weight(1f),
+                horizontalAlignment = Alignment.Start
+            ) {
+                Text(label, style = MaterialTheme.typography.labelMedium, color = Color.Gray)
+                Text(optionLabel(selected), textAlign = TextAlign.Start)
+            }
+            Icon(Icons.Filled.ArrowDropDown, contentDescription = null)
+        }
+        DropdownMenu(
+            expanded = expanded,
+            onDismissRequest = { expanded = false }
+        ) {
+            options.forEach { option ->
+                DropdownMenuItem(
+                    text = { Text(optionLabel(option)) },
+                    onClick = {
+                        onSelected(option)
+                        expanded = false
+                    }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ToggleRow(
+    label: String,
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onCheckedChange(!checked) },
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Checkbox(checked = checked, onCheckedChange = onCheckedChange)
+        Spacer(modifier = Modifier.width(8.dp))
+        Text(label, style = MaterialTheme.typography.bodyMedium)
+    }
+}
+
+@Composable
+private fun VibeTagSelector(
+    selectedTags: Set<VibeTag>,
+    onSelectedTagsChanged: (Set<VibeTag>) -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Vibe / atmosphere", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+        VibeTag.entries.chunked(2).forEach { rowTags ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                rowTags.forEach { tag ->
+                    FilterChip(
+                        selected = tag in selectedTags,
+                        onClick = {
+                            onSelectedTagsChanged(
+                                if (tag in selectedTags) selectedTags - tag else selectedTags + tag
+                            )
+                        },
+                        label = { Text(tag.label) },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+                if (rowTags.size == 1) {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+            }
+        }
+    }
+}
+
+private fun WifiSpeed.toAvailabilityFlag(): Boolean? {
+    return when (this) {
+        WifiSpeed.FAST,
+        WifiSpeed.DECENT,
+        WifiSpeed.SLOW -> true
+        WifiSpeed.NONE -> false
+        WifiSpeed.UNKNOWN -> null
+    }
+}
+
+private fun BathroomAvailability.toAvailabilityFlag(): Boolean? {
+    return when (this) {
+        BathroomAvailability.AVAILABLE -> true
+        BathroomAvailability.NONE -> false
+        BathroomAvailability.UNKNOWN -> null
+    }
+}
+
+private fun displayTextForSecretState(state: ProtectedSecretDisplayState): String {
+    return when (state) {
+        ProtectedSecretDisplayState.Censored -> "Hidden until nearby"
+        is ProtectedSecretDisplayState.Revealed -> state.value
+        ProtectedSecretDisplayState.AskStaff -> "Ask staff"
+        ProtectedSecretDisplayState.Unavailable -> "Not available"
+        ProtectedSecretDisplayState.Unknown -> "Unknown"
+    }
+}
+
+private fun copySecretToClipboard(context: Context, label: String, value: String) {
+    val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
+    clipboard.setPrimaryClip(ClipData.newPlainText(label, value))
 }
 
 @Composable
@@ -3212,6 +3931,8 @@ fun PlaceCard(
     transitionAlpha: Float = 1f
 ) {
     var cardBounds by remember(cafe.id) { mutableStateOf<Rect?>(null) }
+    val cardTextColor = Color.White
+    val cardSecondaryTextColor = Color.White.copy(alpha = 0.78f)
     Card(
         modifier = modifier
             .fillMaxWidth()
@@ -3222,7 +3943,10 @@ fun PlaceCard(
                 cardBounds = coordinates.boundsInRoot()
             },
         shape = RoundedCornerShape(16.dp),
-        colors = CardDefaults.cardColors(containerColor = Color.White),
+        colors = CardDefaults.cardColors(
+            containerColor = CoffeeDark,
+            contentColor = cardTextColor
+        ),
         border = BorderStroke(2.dp, Color.Black),
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
@@ -3249,24 +3973,24 @@ fun PlaceCard(
             Column(modifier = Modifier.padding(12.dp)) {
                 val rating = cafe.rating
                 val reviewCount = cafe.userRatingCount ?: 0
-                Text(cafe.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Text(cafe.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = cardTextColor)
                 if (rating != null && reviewCount > 0) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         RatingStars(rating)
                         Spacer(Modifier.width(8.dp))
-                        Text(String.format(Locale.US, "%.1f (%d Reviews)", rating, reviewCount), color = Color.Gray, style = MaterialTheme.typography.bodySmall)
+                        Text(String.format(Locale.US, "%.1f (%d Reviews)", rating, reviewCount), color = cardSecondaryTextColor, style = MaterialTheme.typography.bodySmall)
                     }
                 } else {
-                    Text("No ratings yet", color = Color.Gray, style = MaterialTheme.typography.bodySmall)
+                    Text("No ratings yet", color = cardSecondaryTextColor, style = MaterialTheme.typography.bodySmall)
                 }
                 cafe.distanceMeters?.let { distanceMeters ->
                     Text(
                         text = formatDistanceAway(distanceMeters) ?: "",
-                        color = Color(0xFF4A231C),
+                        color = cardTextColor,
                         style = MaterialTheme.typography.bodySmall
                     )
                 }
-                Text(cafe.address, style = MaterialTheme.typography.bodySmall)
+                Text(cafe.address, style = MaterialTheme.typography.bodySmall, color = cardSecondaryTextColor)
             }
         }
     }
@@ -3287,19 +4011,25 @@ fun ExpandedCafeDetailOverlay(
     val context = LocalContext.current
     val reviews = ReviewRepository.reviewsFor(cafe.id)
     val isBookmarked = BookmarkRepository.isBookmarked(cafe.id)
+    val crowdAttributes = CrowdAttributeRepository.attributesFor(cafe.id)
     val pageCount = cafe.photoPageCount()
     val pagerState = rememberPagerState(pageCount = { pageCount })
     val detailRevealAlpha = transitionRevealAlpha(transitionProgress)
     val detailSurfaceAlpha = transitionDetailSurfaceAlpha(transitionProgress)
     val pagerAlpha = ((transitionProgress - 0.22f) / 0.18f).coerceIn(0f, 1f)
     val overlayAlpha = sCurve(((transitionProgress - 0.04f) / 0.34f).coerceIn(0f, 1f))
+    val detailTextColor = Color.White
+    val detailSecondaryTextColor = Color.White.copy(alpha = 0.78f)
 
     Card(
         modifier = modifier.graphicsLayer { alpha = overlayAlpha },
         shape = RoundedCornerShape(cornerRadius),
-        colors = CardDefaults.cardColors(containerColor = Color.White.copy(alpha = detailSurfaceAlpha)),
+        colors = CardDefaults.cardColors(
+            containerColor = CoffeeDark.copy(alpha = detailSurfaceAlpha),
+            contentColor = detailTextColor
+        ),
         elevation = CardDefaults.cardElevation(defaultElevation = 10.dp),
-        border = BorderStroke(2.dp, Color(0xFF4A231C).copy(alpha = 0.75f))
+        border = BorderStroke(2.dp, Color.Black)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
             AsyncImage(
@@ -3463,20 +4193,21 @@ fun ExpandedCafeDetailOverlay(
                                 Spacer(modifier = Modifier.width(8.dp))
                                 Text(
                                     text = String.format(Locale.US, "%.1f (%d reviews)", cafe.rating, cafe.userRatingCount ?: 0),
-                                    color = Color.Gray
+                                    color = detailSecondaryTextColor
                                 )
                             }
                         }
 
-                        Text(cafe.status, color = Color(0xFF4A231C), style = MaterialTheme.typography.bodyMedium)
+                        Text(cafe.status, color = detailTextColor, style = MaterialTheme.typography.bodyMedium)
                         cafe.distanceMeters?.let { distanceMeters ->
                             Text(
                                 "Distance: ${formatDistanceAway(distanceMeters)}",
-                                style = MaterialTheme.typography.bodyLarge
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = detailTextColor
                             )
                         }
-                        Text("Address: ${cafe.address}", style = MaterialTheme.typography.bodyLarge)
-                        Text("Phone: ${cafe.phone}", style = MaterialTheme.typography.bodyLarge)
+                        Text("Address: ${cafe.address}", style = MaterialTheme.typography.bodyLarge, color = detailTextColor)
+                        Text("Phone: ${cafe.phone}", style = MaterialTheme.typography.bodyLarge, color = detailTextColor)
                         HoursDropdown(cafe.hours)
                         Button(
                             onClick = { openDirectionsInGoogleMaps(context, cafe) },
@@ -3491,13 +4222,21 @@ fun ExpandedCafeDetailOverlay(
                 }
 
                 item {
+                    CafeCrowdAttributesPanel(
+                        cafe = cafe,
+                        attributes = crowdAttributes,
+                        modifier = Modifier.padding(horizontal = 20.dp)
+                    )
+                }
+
+                item {
                     Column(
                         modifier = Modifier.padding(horizontal = 20.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Text("Features", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        Text("Features", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = detailTextColor)
                         cafe.features.forEach { feature ->
-                            Text("- $feature", style = MaterialTheme.typography.bodyMedium)
+                            Text("- $feature", style = MaterialTheme.typography.bodyMedium, color = detailTextColor)
                         }
                     }
                 }
@@ -3507,9 +4246,9 @@ fun ExpandedCafeDetailOverlay(
                         modifier = Modifier.padding(horizontal = 20.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp)
                     ) {
-                        Text("Ambience", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                        Text("Ambience", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = detailTextColor)
                         cafe.ambience.forEach { vibe ->
-                            Text("- $vibe", style = MaterialTheme.typography.bodyMedium)
+                            Text("- $vibe", style = MaterialTheme.typography.bodyMedium, color = detailTextColor)
                         }
                     }
                 }
@@ -3521,8 +4260,11 @@ fun ExpandedCafeDetailOverlay(
                             .padding(horizontal = 20.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Text("Reviews", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f))
-                        TextButton(onClick = { navController.navigate(Screen.WriteReview.createRoute(cafe.id)) }) {
+                        Text("Reviews", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), color = detailTextColor)
+                        TextButton(
+                            onClick = { navController.navigate(Screen.WriteReview.createRoute(cafe.id)) },
+                            colors = ButtonDefaults.textButtonColors(contentColor = detailTextColor)
+                        ) {
                             Text("Write review")
                         }
                     }
@@ -3532,7 +4274,7 @@ fun ExpandedCafeDetailOverlay(
                     item {
                         Text(
                             text = "No reviews yet.",
-                            color = Color.Gray,
+                            color = detailSecondaryTextColor,
                             modifier = Modifier.padding(horizontal = 20.dp)
                         )
                     }
@@ -3541,9 +4283,14 @@ fun ExpandedCafeDetailOverlay(
                         OutlinedCard(
                             modifier = Modifier
                                 .fillMaxWidth()
-                                .padding(horizontal = 20.dp)
+                                .padding(horizontal = 20.dp),
+                            border = BorderStroke(1.dp, Color.Black),
+                            colors = CardDefaults.outlinedCardColors(
+                                containerColor = CoffeeDark,
+                                contentColor = detailTextColor
+                            )
                         ) {
-                            Text(review, modifier = Modifier.padding(12.dp))
+                            Text(review, modifier = Modifier.padding(12.dp), color = detailTextColor)
                         }
                     }
                 }
