@@ -108,6 +108,7 @@ internal sealed class ProtectedSecretDisplayState {
 
 internal data class CafeCrowdAttributes(
     val outletAvailability: OutletAvailability = OutletAvailability.UNKNOWN,
+    val wifiName: String? = null,
     val wifiSpeed: WifiSpeed = WifiSpeed.UNKNOWN,
     val wifiPassword: ProtectedCrowdSecret = ProtectedCrowdSecret(),
     val bathroomAvailability: BathroomAvailability = BathroomAvailability.UNKNOWN,
@@ -127,6 +128,7 @@ internal data class CafeCrowdAttributes(
 
 internal data class CrowdAttributeSuggestion(
     val outletAvailability: OutletAvailability? = null,
+    val wifiName: String? = null,
     val wifiSpeed: WifiSpeed? = null,
     val wifiPassword: ProtectedCrowdSecret? = null,
     val bathroomAvailability: BathroomAvailability? = null,
@@ -197,6 +199,7 @@ internal object CrowdAttributeRepository {
         val current = attributesFor(cafeId)
         attributesByCafeId[cafeId] = current.copy(
             outletAvailability = suggestion.outletAvailability ?: current.outletAvailability,
+            wifiName = suggestion.wifiName?.normalizedText() ?: current.wifiName,
             wifiSpeed = suggestion.wifiSpeed ?: current.wifiSpeed,
             wifiPassword = suggestion.wifiPassword?.normalized() ?: current.wifiPassword,
             bathroomAvailability = suggestion.bathroomAvailability ?: current.bathroomAvailability,
@@ -225,6 +228,10 @@ internal object CrowdAttributeRepository {
             value = cleanedValue,
             knownToExist = knownToExist || cleanedValue != null
         )
+    }
+
+    private fun String.normalizedText(): String? {
+        return trim().takeIf { it.isNotBlank() }
     }
 
     private fun mergeUriDrafts(current: List<String>, drafts: List<String>): List<String> {

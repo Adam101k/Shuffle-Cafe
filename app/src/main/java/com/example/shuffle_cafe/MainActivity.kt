@@ -64,20 +64,31 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalInspectionMode
+import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.lerp
 import androidx.compose.ui.zIndex
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
+import androidx.compose.ui.window.PopupProperties
 import androidx.core.content.ContextCompat
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
@@ -108,6 +119,7 @@ import com.google.android.libraries.places.api.model.CircularBounds
 import com.google.android.libraries.places.api.model.PhotoMetadata
 import com.google.android.libraries.places.api.model.Place
 import com.google.android.libraries.places.api.net.FetchPhotoRequest
+import com.google.android.libraries.places.api.net.FetchPlaceRequest
 import com.google.android.libraries.places.api.net.PlacesClient
 import com.google.maps.android.compose.CameraPositionState
 import com.google.maps.android.compose.GoogleMap
@@ -130,6 +142,7 @@ import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
+import java.util.Calendar
 import java.util.Locale
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -259,6 +272,7 @@ private const val CAFE_CACHE_ENTRY_PREFIX = "city_cache_"
 private const val BOOKMARK_CACHE_PREFS_NAME = "shuffle_cafe_bookmark_cache"
 private const val BOOKMARK_CACHE_ENTRY_KEY = "saved_bookmark_cafes"
 private const val UNKNOWN_CITY_CACHE_KEY = "nearby_unknown_city"
+private const val PHONE_UNAVAILABLE_TEXT = "Phone unavailable"
 private const val CAFE_CACHE_MAX_AGE_MILLIS = 7L * 24L * 60L * 60L * 1000L
 private const val MAP_VIEWPORT_QUERY_DEBOUNCE_MILLIS = 650L
 private const val MAP_VIEWPORT_MIN_QUERY_ZOOM = 6f
@@ -433,6 +447,11 @@ private val excludedCoffeeHouseTypes = setOf(
     "hotel",
     "supermarket",
     "grocery_store"
+)
+
+private val cafePhonePlaceFields = listOf(
+    Place.Field.INTERNATIONAL_PHONE_NUMBER,
+    Place.Field.NATIONAL_PHONE_NUMBER
 )
 
 private fun Cafe.primaryImageModel(): Any = heroImageBitmap ?: imageUrl ?: imageResId
@@ -900,6 +919,14 @@ object CafeRepository {
 
     fun updateCafePhoto(cafeId: String, photoIndex: Int, bitmap: Bitmap) {
         applyCafeUpdate(cafeId) { cafe -> cafe.withLoadedPhoto(photoIndex, bitmap) }
+    }
+
+    fun updateCafePhone(cafeId: String, phone: String) {
+        if (isPhoneUnavailable(phone)) return
+
+        applyCafeUpdate(cafeId) { cafe ->
+            if (cafe.phone == phone) cafe else cafe.copy(phone = phone)
+        }
     }
 
     fun setHomePreviewCafes() {
@@ -1400,6 +1427,7 @@ fun MainScreen(navController: NavHostController) {
     }
     val isDetailExpanded = expandedCafe != null
     val loadedExpandedPhotoCount = expandedCafe?.photoBitmaps?.count { it != null } ?: 0
+    MissingCafePhoneEffect(cafe = expandedCafe, placesClient = placesClient)
 
     LaunchedEffect(hasLocationPermission, placesClient, inspectionMode) {
         if (inspectionMode) {
@@ -1877,17 +1905,17 @@ private suspend fun searchCoffeeHousesNearLocation(
 ): List<Place> = coroutineScope {
     val placeFields = listOf(
         Place.Field.ID,
-        Place.Field.NAME,
-        Place.Field.ADDRESS,
+        Place.Field.DISPLAY_NAME,
+        Place.Field.FORMATTED_ADDRESS,
         Place.Field.RATING,
-        Place.Field.USER_RATINGS_TOTAL,
+        Place.Field.USER_RATING_COUNT,
         Place.Field.PHOTO_METADATAS,
-        Place.Field.LAT_LNG,
+        Place.Field.LOCATION,
         Place.Field.PRIMARY_TYPE,
         Place.Field.TYPES,
         Place.Field.OPENING_HOURS,
         Place.Field.CURRENT_OPENING_HOURS
-    )
+    ) + cafePhonePlaceFields
     val locationBias = CircularBounds.newInstance(
         LatLng(location.latitude, location.longitude),
         searchRadiusMeters
@@ -1948,7 +1976,7 @@ private suspend fun fetchCafePhotoBitmap(
 }
 
 private fun Place.isLikelyCoffeeHouse(): Boolean {
-    val normalizedName = name?.lowercase(Locale.US).orEmpty()
+    val normalizedName = displayName?.lowercase(Locale.US).orEmpty()
     val primaryTypeValue = primaryType?.lowercase(Locale.US)
     val typeValues = placeTypes.orEmpty().map { it.lowercase(Locale.US) }.toSet()
     val nameLooksCoffeeFocused = coffeeHouseNameKeywords.any { keyword -> normalizedName.contains(keyword) }
@@ -1966,6 +1994,36 @@ private fun formatDistanceAway(distanceMeters: Float?): String? {
     } else {
         String.format(Locale.US, "%.1f mi away", distanceMeters / 1609.344f)
     }
+}
+
+internal fun selectCafePhoneNumber(
+    internationalPhoneNumber: String?,
+    nationalPhoneNumber: String?
+): String {
+    return internationalPhoneNumber?.trim()?.takeIf { it.isNotBlank() }
+        ?: nationalPhoneNumber?.trim()?.takeIf { it.isNotBlank() }
+        ?: PHONE_UNAVAILABLE_TEXT
+}
+
+internal fun isPhoneUnavailable(phone: String): Boolean {
+    return phone.isBlank() || phone.equals(PHONE_UNAVAILABLE_TEXT, ignoreCase = true)
+}
+
+private suspend fun fetchCafePhoneNumber(
+    placesClient: PlacesClient,
+    placeId: String
+): String? {
+    if (placeId.isBlank()) return null
+
+    val request = FetchPlaceRequest
+        .builder(placeId, cafePhonePlaceFields)
+        .build()
+    val place = placesClient.fetchPlace(request).await().place
+
+    return selectCafePhoneNumber(
+        internationalPhoneNumber = place.internationalPhoneNumber,
+        nationalPhoneNumber = place.nationalPhoneNumber
+    ).takeUnless { isPhoneUnavailable(it) }
 }
 
 private fun Cafe.directionsDestination(): String? {
@@ -2160,11 +2218,15 @@ private fun Place.toHoursMap(): LinkedHashMap<String, String> {
 
 private fun Place.toCafe(distanceReference: LatLng?): Cafe? {
     val placeId = id ?: return null
-    val cafeName = name?.trim().takeIf { !it.isNullOrBlank() } ?: return null
-    val cafeAddress = address?.trim().takeIf { !it.isNullOrBlank() } ?: "Address unavailable"
+    val cafeName = displayName?.trim().takeIf { !it.isNullOrBlank() } ?: return null
+    val cafeAddress = formattedAddress?.trim().takeIf { !it.isNullOrBlank() } ?: "Address unavailable"
+    val cafePhone = selectCafePhoneNumber(
+        internationalPhoneNumber = internationalPhoneNumber,
+        nationalPhoneNumber = nationalPhoneNumber
+    )
     val ratingValue = rating?.toFloat()
-    val ratingCount = userRatingsTotal
-    val cafeLatLng = latLng
+    val ratingCount = userRatingCount
+    val cafeLatLng = location
     val distanceToCafe = computeCafeDistanceMeters(cafeLatLng, distanceReference)
     val statusText = if (ratingValue != null && ratingCount != null && ratingCount > 0) {
         String.format(Locale.US, "%.1f (%d reviews)", ratingValue, ratingCount)
@@ -2178,7 +2240,7 @@ private fun Place.toCafe(distanceReference: LatLng?): Cafe? {
         id = placeId,
         name = cafeName,
         address = cafeAddress,
-        phone = "Phone unavailable",
+        phone = cafePhone,
         status = statusText,
         hours = cafeHours,
         features = listOf("Coffee house"),
@@ -2275,6 +2337,7 @@ fun MapScreen(navController: NavHostController) {
     }
     val loadedSelectedPhotoCount = selectedCafe?.photoBitmaps?.count { it != null } ?: 0
     val cafesWithCoordinates = remember(renderedMapCafes) { renderedMapCafes.filter { it.latLng != null } }
+    MissingCafePhoneEffect(cafe = selectedCafe, placesClient = placesClient)
 
     LaunchedEffect(selectedCafe) {
         if (selectedCafe != null) {
@@ -2607,6 +2670,7 @@ fun BookmarkScreen(navController: NavHostController) {
         }
     }
     val loadedSelectedPhotoCount = selectedSavedCafe?.photoBitmaps?.count { it != null } ?: 0
+    MissingCafePhoneEffect(cafe = selectedSavedCafe, placesClient = placesClient)
 
     LaunchedEffect(selectedSavedCafe) {
         if (selectedSavedCafe != null) {
@@ -2875,13 +2939,13 @@ fun MapSearchBar(searchQuery: String, onQueryChanged: (String) -> Unit, onPlaceS
                     val request = com.google.android.libraries.places.api.net.FetchPlaceRequest
                         .builder(
                             prediction.placeId,
-                            listOf(Place.Field.LAT_LNG)
+                            listOf(Place.Field.LOCATION)
                         )
                         .build()
 
                     client.fetchPlace(request)
                         .addOnSuccessListener { response ->
-                            response.place.latLng?.let { latLng ->
+                            response.place.location?.let { latLng ->
                                 onPlaceSelected(latLng)
                                 recommended = emptyList()
                             }
@@ -2894,8 +2958,282 @@ fun MapSearchBar(searchQuery: String, onQueryChanged: (String) -> Unit, onPlaceS
 }
 
 @Composable
+private fun MissingCafePhoneEffect(
+    cafe: Cafe?,
+    placesClient: PlacesClient?
+) {
+    LaunchedEffect(cafe?.id, cafe?.phone, placesClient) {
+        val selectedCafe = cafe ?: return@LaunchedEffect
+        val client = placesClient ?: return@LaunchedEffect
+        if (!isPhoneUnavailable(selectedCafe.phone)) return@LaunchedEffect
+
+        val fetchedPhone = runCatching {
+            fetchCafePhoneNumber(client, selectedCafe.id)
+        }.getOrNull() ?: return@LaunchedEffect
+
+        CafeRepository.updateCafePhone(selectedCafe.id, fetchedPhone)
+    }
+}
+
+@Composable
+private fun DetailInfoBubble(
+    iconRes: Int,
+    iconName: String,
+    value: String,
+    modifier: Modifier = Modifier,
+    maxLines: Int = 2,
+    copyLabel: String? = null
+) {
+    val context = LocalContext.current
+    val canCopy = copyLabel != null && !isPhoneUnavailable(value)
+    val isWholeBubbleClickable = copyLabel != null
+    var tooltipMessage by remember(iconName, value) { mutableStateOf<String?>(null) }
+    var showCopyAction by remember(iconName, value) { mutableStateOf(false) }
+    val showTooltip = {
+        tooltipMessage = iconName
+        showCopyAction = canCopy
+    }
+
+    LaunchedEffect(tooltipMessage, showCopyAction) {
+        val messageToClear = tooltipMessage ?: return@LaunchedEffect
+        delay(if (showCopyAction) CROWD_TOOLTIP_DISPLAY_MILLIS * 2 else CROWD_TOOLTIP_DISPLAY_MILLIS)
+        if (tooltipMessage == messageToClear) {
+            tooltipMessage = null
+            showCopyAction = false
+        }
+    }
+
+    BoxWithConstraints(
+        modifier = modifier.fillMaxWidth(),
+        contentAlignment = Alignment.Center
+    ) {
+        val maxBubbleWidth = maxWidth * 0.92f
+        val maxTextWidth = if (maxBubbleWidth > 92.dp) maxBubbleWidth - 64.dp else maxBubbleWidth
+        val surfaceModifier = Modifier
+            .widthIn(max = maxBubbleWidth)
+            .then(
+                if (isWholeBubbleClickable) {
+                    Modifier.clickable { showTooltip() }
+                } else {
+                    Modifier
+                }
+            )
+
+        Surface(
+            modifier = surfaceModifier,
+            shape = RoundedCornerShape(24.dp),
+            color = DetailInfoBubbleColor,
+            contentColor = DetailInfoBubbleTextColor,
+            shadowElevation = 1.dp
+        ) {
+            Row(
+                modifier = Modifier
+                    .padding(horizontal = 12.dp, vertical = 8.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally)
+            ) {
+                Box {
+                    val iconModifier = Modifier
+                        .size(20.dp)
+                        .then(
+                            if (isWholeBubbleClickable) {
+                                Modifier
+                            } else {
+                                Modifier.clickable { showTooltip() }
+                            }
+                        )
+
+                    Icon(
+                        painter = painterResource(id = iconRes),
+                        contentDescription = iconName,
+                        modifier = iconModifier,
+                        tint = Color.Unspecified
+                    )
+                    DetailInfoTooltip(
+                        message = tooltipMessage,
+                        copyActionLabel = if (showCopyAction) "Copy number" else null,
+                        onCopyClick = if (showCopyAction) {
+                            {
+                                copyTextToClipboard(context, copyLabel ?: iconName, value)
+                                tooltipMessage = "$iconName copied to clipboard."
+                                showCopyAction = false
+                            }
+                        } else {
+                            null
+                        },
+                        onDismiss = {
+                            tooltipMessage = null
+                            showCopyAction = false
+                        }
+                    )
+                }
+                Text(
+                    text = value,
+                    modifier = Modifier.widthIn(max = maxTextWidth),
+                    style = MaterialTheme.typography.bodyLarge,
+                    fontWeight = FontWeight.SemiBold,
+                    color = DetailInfoBubbleTextColor,
+                    textAlign = TextAlign.Center,
+                    maxLines = maxLines,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun DetailInfoTooltip(
+    message: String?,
+    copyActionLabel: String?,
+    onCopyClick: (() -> Unit)?,
+    onDismiss: () -> Unit
+) {
+    val tooltipMessage = message ?: return
+    val density = LocalDensity.current
+    val positionProvider = remember(density) {
+        CrowdTooltipPositionProvider(
+            verticalGapPx = with(density) { 2.dp.roundToPx() },
+            screenPaddingPx = with(density) { 8.dp.roundToPx() }
+        )
+    }
+
+    Popup(
+        popupPositionProvider = positionProvider,
+        onDismissRequest = onDismiss,
+        properties = PopupProperties(focusable = false)
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.widthIn(max = 240.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(9.dp)
+                    .graphicsLayer { rotationZ = 45f }
+                    .background(CrowdTooltipColor, RoundedCornerShape(1.dp))
+            )
+            Surface(
+                modifier = Modifier.offset(y = (-4).dp),
+                shape = RoundedCornerShape(6.dp),
+                color = CrowdTooltipColor,
+                contentColor = DetailInfoBubbleTextColor,
+                shadowElevation = 6.dp
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        text = tooltipMessage,
+                        color = DetailInfoBubbleTextColor,
+                        style = MaterialTheme.typography.bodySmall,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (copyActionLabel != null && onCopyClick != null) {
+                        TextButton(
+                            onClick = onCopyClick,
+                            colors = ButtonDefaults.textButtonColors(contentColor = DetailInfoBubbleTextColor)
+                        ) {
+                            Icon(
+                                painter = painterResource(id = R.drawable.copy),
+                                contentDescription = copyActionLabel,
+                                modifier = Modifier.size(18.dp),
+                                tint = Color.Unspecified
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(copyActionLabel)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CompactDetailInfoBubble(
+    iconRes: Int,
+    iconName: String,
+    value: String,
+    modifier: Modifier = Modifier,
+    copyLabel: String? = null
+) {
+    val context = LocalContext.current
+    val canCopy = copyLabel != null && !isPhoneUnavailable(value)
+    var tooltipMessage by remember(iconName, value) { mutableStateOf<String?>(null) }
+    var showCopyAction by remember(iconName, value) { mutableStateOf(false) }
+
+    LaunchedEffect(tooltipMessage, showCopyAction) {
+        val messageToClear = tooltipMessage ?: return@LaunchedEffect
+        delay(if (showCopyAction) CROWD_TOOLTIP_DISPLAY_MILLIS * 2 else CROWD_TOOLTIP_DISPLAY_MILLIS)
+        if (tooltipMessage == messageToClear) {
+            tooltipMessage = null
+            showCopyAction = false
+        }
+    }
+
+    Box(modifier = modifier) {
+        Surface(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(42.dp)
+                .clickable {
+                    tooltipMessage = "$iconName: $value"
+                    showCopyAction = canCopy
+                },
+            shape = RoundedCornerShape(24.dp),
+            color = DetailInfoBubbleColor,
+            contentColor = DetailInfoBubbleTextColor,
+            shadowElevation = 1.dp
+        ) {
+            Row(
+                modifier = Modifier.padding(horizontal = 10.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(7.dp)
+            ) {
+                Icon(
+                    painter = painterResource(id = iconRes),
+                    contentDescription = iconName,
+                    modifier = Modifier.size(18.dp),
+                    tint = Color.Unspecified
+                )
+                Text(
+                    text = value,
+                    modifier = Modifier.weight(1f),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = DetailInfoBubbleTextColor,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+        DetailInfoTooltip(
+            message = tooltipMessage,
+            copyActionLabel = if (showCopyAction) "Copy number" else null,
+            onCopyClick = if (showCopyAction) {
+                {
+                    copyTextToClipboard(context, copyLabel ?: iconName, value)
+                    tooltipMessage = "$iconName copied to clipboard."
+                    showCopyAction = false
+                }
+            } else {
+                null
+            },
+            onDismiss = {
+                tooltipMessage = null
+                showCopyAction = false
+            }
+        )
+    }
+}
+
+@Composable
 fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
     val context = LocalContext.current
+    val placesClient = remember(context) { if (Places.isInitialized()) Places.createClient(context) else null }
     val detailTextColor = Color.White
     val detailSecondaryTextColor = Color.White.copy(alpha = 0.78f)
 
@@ -2907,10 +3245,11 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
     val reviews = ReviewRepository.reviewsFor(cafeId)
 
     val isBookmarked = BookmarkRepository.isBookmarked(cafeId)
+    MissingCafePhoneEffect(cafe = cafe, placesClient = placesClient)
 
     Scaffold(
         bottomBar = { BottomNavBar(navController) },
-        containerColor = CoffeeDark,
+        containerColor = SelectedCafeSurfaceColor,
         contentColor = detailTextColor
     ) { innerPadding ->
         if (cafe == null) {
@@ -2960,19 +3299,37 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
             }
 
             item {
-                Text("Address: ${cafe.address}", color = detailTextColor)
-                Text("Phone: ${cafe.phone}", color = detailTextColor)
-                Text(cafe.status, color = detailTextColor)
-                HoursDropdown(cafe.hours)
-                Spacer(Modifier.height(12.dp))
-                Button(
-                    onClick = { openDirectionsInGoogleMaps(context, cafe) },
-                    enabled = cafe.directionsDestination() != null,
-                    modifier = Modifier.fillMaxWidth()
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Icon(Icons.Filled.Directions, contentDescription = null)
-                    Spacer(Modifier.width(8.dp))
-                    Text("Directions")
+                    DetailInfoBubble(
+                        iconRes = R.drawable.address,
+                        iconName = "Address",
+                        value = cafe.address,
+                        maxLines = 3
+                    )
+                    DetailInfoBubble(
+                        iconRes = R.drawable.phone,
+                        iconName = "Phone",
+                        value = cafe.phone,
+                        maxLines = 2,
+                        copyLabel = "${cafe.name} phone number"
+                    )
+                    Text(cafe.status, color = detailTextColor)
+                    HoursDropdown(cafe.hours)
+                }
+                Spacer(Modifier.height(12.dp))
+                Row {
+                    Button(
+                        onClick = { openDirectionsInGoogleMaps(context, cafe) },
+                        enabled = cafe.directionsDestination() != null
+                    ) {
+                        Icon(Icons.Filled.Directions, contentDescription = null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("Directions")
+                    }
                 }
             }
 
@@ -2989,7 +3346,7 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
                     shape = RoundedCornerShape(4.dp),
                     border = BorderStroke(1.dp, Color.Black),
                     colors = CardDefaults.outlinedCardColors(
-                        containerColor = CoffeeDark,
+                        containerColor = SelectedCafeSurfaceColor,
                         contentColor = detailTextColor
                     )
                 ) {
@@ -3002,12 +3359,6 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
                     }
                 }
             }
-
-            item { Text("Features:", fontWeight = FontWeight.SemiBold, color = detailTextColor) }
-            items(cafe.features) { Text("• $it") }
-
-            item { Text("Ambience:", fontWeight = FontWeight.SemiBold, color = detailTextColor) }
-            items(cafe.ambience) { Text("• $it") }
 
             item {
                 Row(
@@ -3032,7 +3383,7 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
                         modifier = Modifier.fillMaxWidth(),
                         border = BorderStroke(1.dp, Color.Black),
                         colors = CardDefaults.outlinedCardColors(
-                            containerColor = CoffeeDark,
+                            containerColor = SelectedCafeSurfaceColor,
                             contentColor = detailTextColor
                         )
                     ) {
@@ -3046,71 +3397,125 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
 
 @Composable
 fun HoursDropdown(hours: LinkedHashMap<String, String>) {
-    val dropdownTextColor = Color.White
     val displayHours = remember(hours) {
         if (hours.isEmpty()) linkedMapOf("Hours" to "Hours unavailable") else hours
     }
 
-    val days = displayHours.keys.toList()
-    var expanded by remember { mutableStateOf(false) }
-    var selectedDay by remember(displayHours) {
-        mutableStateOf(days.firstOrNull().orEmpty())
+    val todayName = currentWeekdayName()
+    val orderedHours = remember(displayHours, todayName) {
+        todayFirstHoursEntries(displayHours, todayName)
     }
+    val summaryEntry = orderedHours.firstOrNull()
+    val summaryText = summaryEntry?.let { formatHoursLabel(it.first, it.second) } ?: "Hours unavailable"
+    var expanded by remember { mutableStateOf(false) }
+    val isExpandable = orderedHours.size > 1
 
-    Box(modifier = Modifier.fillMaxWidth()) {
-        OutlinedCard(
+    BoxWithConstraints(
+        modifier = Modifier.fillMaxWidth(),
+        contentAlignment = Alignment.Center
+    ) {
+        val maxBubbleWidth = maxWidth * 0.92f
+        val maxTextWidth = if (maxBubbleWidth > 92.dp) maxBubbleWidth - 86.dp else maxBubbleWidth
+
+        Surface(
             modifier = Modifier
-                .fillMaxWidth()
-                .clickable(enabled = days.isNotEmpty()) { expanded = true },
-            shape = RoundedCornerShape(4.dp),
-            border = BorderStroke(1.dp, Color.Black),
-            colors = CardDefaults.outlinedCardColors(
-                containerColor = CoffeeDark,
-                contentColor = dropdownTextColor
-            )
+                .widthIn(max = maxBubbleWidth)
+                .clickable(enabled = isExpandable) { expanded = !expanded },
+            shape = RoundedCornerShape(24.dp),
+            color = DetailInfoBubbleColor,
+            contentColor = DetailInfoBubbleTextColor,
+            shadowElevation = 1.dp
         ) {
-            Row(
-                modifier = Modifier.padding(12.dp),
-                verticalAlignment = Alignment.CenterVertically
+            Column(
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 8.dp),
+                horizontalAlignment = Alignment.CenterHorizontally
             ) {
-                val summaryText = if (selectedDay == "Hours") {
-                    displayHours[selectedDay].orEmpty()
-                } else {
-                    "$selectedDay: ${displayHours[selectedDay].orEmpty()}"
-                }
-
-                Text(
-                    text = summaryText,
-                    modifier = Modifier.weight(1f),
-                    color = dropdownTextColor
-                )
-
-                Icon(Icons.Filled.ArrowDropDown, contentDescription = null, tint = dropdownTextColor)
-            }
-        }
-
-        DropdownMenu(
-            expanded = expanded,
-            onDismissRequest = { expanded = false }
-        ) {
-            days.forEach { day ->
-                val label = if (day == "Hours") {
-                    displayHours[day].orEmpty()
-                } else {
-                    "$day: ${displayHours[day].orEmpty()}"
-                }
-
-                DropdownMenuItem(
-                    text = { Text(label) },
-                    onClick = {
-                        selectedDay = day
-                        expanded = false
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally)
+                ) {
+                    Icon(
+                        painter = painterResource(id = R.drawable.calender),
+                        contentDescription = "Hours",
+                        modifier = Modifier.size(20.dp),
+                        tint = Color.Unspecified
+                    )
+                    Text(
+                        text = summaryText,
+                        modifier = Modifier.widthIn(max = maxTextWidth),
+                        style = MaterialTheme.typography.bodyLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        color = DetailInfoBubbleTextColor,
+                        textAlign = TextAlign.Center,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (isExpandable) {
+                        Icon(
+                            imageVector = Icons.Filled.ArrowDropDown,
+                            contentDescription = if (expanded) "Collapse hours" else "Expand hours",
+                            modifier = Modifier.graphicsLayer {
+                                rotationZ = if (expanded) 180f else 0f
+                            },
+                            tint = DetailInfoBubbleTextColor
+                        )
                     }
-                )
+                }
+
+                if (expanded && orderedHours.size > 1) {
+                    HorizontalDivider(
+                        modifier = Modifier.padding(top = 8.dp, bottom = 6.dp),
+                        color = DetailInfoBubbleTextColor.copy(alpha = 0.16f)
+                    )
+                    orderedHours.drop(1).forEach { (day, hoursText) ->
+                        Text(
+                            text = formatHoursLabel(day, hoursText),
+                            modifier = Modifier
+                                .widthIn(max = maxTextWidth)
+                                .padding(vertical = 3.dp),
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = DetailInfoBubbleTextColor,
+                            textAlign = TextAlign.Center
+                        )
+                    }
+                }
             }
         }
     }
 }
+
+private fun currentWeekdayName(): String {
+    return Calendar.getInstance(Locale.US)
+        .getDisplayName(Calendar.DAY_OF_WEEK, Calendar.LONG, Locale.US)
+        .orEmpty()
+}
+
+private fun todayFirstHoursEntries(
+    hours: LinkedHashMap<String, String>,
+    todayName: String
+): List<Pair<String, String>> {
+    val entries = hours.entries.map { it.key to it.value }
+    val todayIndex = entries.indexOfFirst { (day, _) -> day.equals(todayName, ignoreCase = true) }
+    return if (todayIndex > 0) {
+        entries.drop(todayIndex) + entries.take(todayIndex)
+    } else {
+        entries
+    }
+}
+
+private fun formatHoursLabel(day: String, hoursText: String): String {
+    return if (day.equals("Hours", ignoreCase = true)) hoursText else "$day: $hoursText"
+}
+
+private val SelectedCafeSurfaceColor = Color(0xFF694B2E)
+private val CrowdAttributeBubbleColor = Color(0xFFC5A07D)
+private val CrowdTooltipColor = Color(0xFFF6E9D8)
+private val DetailInfoBubbleColor = Color(0xFFC5A07D)
+private val SuggestChangesBubbleColor = Color(0xFFBDEBFF)
+private val DetailInfoBubbleTextColor = Color(0xFF4B3621)
+private val CrowdActionBubbleSize = 42.dp
+private const val CROWD_TOOLTIP_DISPLAY_MILLIS = 2400L
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -3119,67 +3524,99 @@ private fun CafeCrowdAttributesPanel(
     attributes: CafeCrowdAttributes,
     modifier: Modifier = Modifier
 ) {
-    var showSuggestionSheet by remember { mutableStateOf(false) }
     val panelTextColor = LocalContentColor.current
+    var showSuggestionSheet by remember { mutableStateOf(false) }
 
     Column(
         modifier = modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Text(
-                text = "Cafe details from visitors",
-                style = MaterialTheme.typography.titleMedium,
-                fontWeight = FontWeight.SemiBold,
-                modifier = Modifier.weight(1f),
-                color = panelTextColor
-            )
-            TextButton(
-                onClick = { showSuggestionSheet = true },
-                colors = ButtonDefaults.textButtonColors(contentColor = panelTextColor)
-            ) {
-                Text("Suggest changes")
+        CrowdAttributeBubbleSection(
+            densePacking = true,
+            maxItemWidthFraction = 0.62f,
+            topEndAction = {
+                SuggestChangesIconBubble(onClick = { showSuggestionSheet = true })
             }
-        }
-
-        CrowdAttributeSection(title = "Work setup") {
-            CrowdAttributeRow("Outlets", attributes.outletAvailability.label)
-            CrowdAttributeRow("Wi-Fi speed", attributes.wifiSpeed.label)
-            ProtectedSecretAttributeRow(
-                title = "Wi-Fi password",
+        ) {
+            CrowdAttributeBubble(
+                iconRes = R.drawable.outlets,
+                iconName = "Outlets",
+                value = attributes.outletAvailability.label
+            )
+            CrowdAttributeBubbleWithProtectedKey(
+                iconRes = R.drawable.wifi,
+                iconName = "WiFi",
+                value = attributes.wifiName.displayCrowdValue(),
+                keyIconRes = R.drawable.key,
+                keyIconName = "WiFi key",
                 secret = attributes.wifiPassword,
                 isAvailable = attributes.wifiSpeed.toAvailabilityFlag(),
                 cafeLatLng = cafe.latLng,
-                clipboardLabel = "${cafe.name} Wi-Fi password"
+                secretLabel = "WiFi password",
+                clipboardLabel = "${cafe.name} WiFi key",
+                isCopyable = true
             )
-            CrowdAttributeRow("Seating availability", attributes.seatingAvailability.label)
-            CrowdAttributeRow("Seating space", attributes.seatingSpace.label)
-            CrowdAttributeRow("Seating comfort", attributes.seatingComfort.label)
-        }
-
-        CrowdAttributeSection(title = "On-site details") {
-            CrowdAttributeRow("Bathroom", attributes.bathroomAvailability.label)
-            ProtectedSecretAttributeRow(
-                title = "Bathroom code",
+            CrowdAttributeBubble(
+                iconRes = R.drawable.wifi_speed,
+                iconName = "WiFi Speed",
+                value = attributes.wifiSpeed.label
+            )
+            CrowdAttributeBubble(
+                iconRes = R.drawable.seating_availability,
+                iconName = "Seating Availability",
+                value = attributes.seatingAvailability.label
+            )
+            CrowdAttributeBubble(
+                iconRes = R.drawable.seating_space,
+                iconName = "Seating space",
+                value = attributes.seatingSpace.label
+            )
+            CrowdAttributeBubble(
+                iconRes = R.drawable.seating_comfort,
+                iconName = "Seating Comfort",
+                value = attributes.seatingComfort.label
+            )
+            CrowdAttributeBubbleWithProtectedKey(
+                iconRes = R.drawable.bathroom,
+                iconName = "Bathroom",
+                value = attributes.bathroomAvailability.label,
+                keyIconRes = R.drawable.key,
+                keyIconName = "Bathroom key",
                 secret = attributes.bathroomCode,
                 isAvailable = attributes.bathroomAvailability.toAvailabilityFlag(),
                 cafeLatLng = cafe.latLng,
-                clipboardLabel = "${cafe.name} bathroom code"
+                secretLabel = "Bathroom code",
+                clipboardLabel = "${cafe.name} bathroom key",
+                isCopyable = false
             )
-            CrowdAttributeRow("Pet-friendly", attributes.petFriendly.label)
-            CrowdAttributeRow("Cleanliness", attributes.cleanlinessRating.label)
+            CrowdAttributeBubble(
+                iconRes = R.drawable.pet_friendly,
+                iconName = "Pet friendly",
+                value = attributes.petFriendly.label
+            )
+            CrowdAttributeBubble(
+                iconRes = R.drawable.cleanliness,
+                iconName = "Cleanliness",
+                value = attributes.cleanlinessRating.label
+            )
+            CrowdAttributeBubble(
+                iconRes = R.drawable.crowd_level,
+                iconName = "Crowd Level",
+                value = attributes.crowdLevel.label
+            )
+            CrowdAttributeBubble(
+                iconRes = R.drawable.noise_level,
+                iconName = "Noise Level",
+                value = attributes.noiseLevel.label
+            )
+            CrowdAttributeBubble(
+                iconRes = R.drawable.vibe_and_atmosphere,
+                iconName = "Vibe and Atmosphere",
+                value = attributes.vibeTags.displayVibeValue()
+            )
         }
 
-        CrowdAttributeSection(title = "Today") {
-            CrowdAttributeRow("Crowd level", attributes.crowdLevel.label)
-            CrowdAttributeRow("Noise level", attributes.noiseLevel.label)
-            VibeTagSummary(attributes.vibeTags)
-        }
-
-        CrowdAttributeSection(title = "Photos from visitors") {
+        CrowdAttributePlainSection(title = "Photos from visitors") {
             DraftPhotoList(
                 title = "Seating photos",
                 photoUris = attributes.seatingPhotoUris
@@ -3200,67 +3637,541 @@ private fun CafeCrowdAttributesPanel(
     }
 
     if (showSuggestionSheet) {
-        CrowdAttributeSuggestionSheet(
-            cafe = cafe,
-            attributes = attributes,
-            onDismiss = { showSuggestionSheet = false }
-        )
-    }
-}
-
-@Composable
-private fun CrowdAttributeSection(
-    title: String,
-    content: @Composable ColumnScope.() -> Unit
-) {
-    OutlinedCard(
-        modifier = Modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(8.dp),
-        border = BorderStroke(1.dp, Color.Black),
-        colors = CardDefaults.outlinedCardColors(
-            containerColor = CoffeeLight,
-            contentColor = Color.Black
-        )
-    ) {
-        Column(
-            modifier = Modifier.padding(14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
-        ) {
-            Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, color = Color.Black)
-            content()
+        ModalBottomSheet(onDismissRequest = { showSuggestionSheet = false }) {
+            CrowdAttributeSuggestionForm(
+                cafe = cafe,
+                attributes = attributes,
+                onSubmit = { showSuggestionSheet = false },
+                modifier = Modifier.heightIn(max = 680.dp)
+            )
         }
     }
 }
 
 @Composable
-private fun CrowdAttributeRow(label: String, value: String) {
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.CenterVertically
+private fun SuggestChangesIconBubble(onClick: () -> Unit) {
+    Surface(
+        modifier = Modifier
+            .size(CrowdActionBubbleSize)
+            .clickable { onClick() },
+        shape = CircleShape,
+        color = SuggestChangesBubbleColor,
+        contentColor = Color.Black,
+        shadowElevation = 2.dp
     ) {
-        Text(
-            text = label,
-            modifier = Modifier.weight(1f),
-            style = MaterialTheme.typography.bodyMedium,
-            color = Color.Black
+        Box(contentAlignment = Alignment.Center) {
+            Icon(
+                painter = painterResource(id = R.drawable.edit),
+                contentDescription = "Suggest changes",
+                modifier = Modifier.size(21.dp),
+                tint = Color.Unspecified
+            )
+        }
+    }
+}
+
+@Composable
+private fun CrowdAttributeBubbleSection(
+    densePacking: Boolean = false,
+    maxItemWidthFraction: Float = 1f,
+    topEndAction: (@Composable () -> Unit)? = null,
+    content: @Composable () -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        if (topEndAction == null) {
+            WrappingBubbleRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalSpacing = 8.dp,
+                verticalSpacing = 8.dp,
+                densePacking = densePacking,
+                maxItemWidthFraction = maxItemWidthFraction
+            ) {
+                content()
+            }
+        } else {
+            WrappingBubbleRowWithTopEndAction(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalSpacing = 8.dp,
+                verticalSpacing = 8.dp,
+                densePacking = densePacking,
+                maxItemWidthFraction = maxItemWidthFraction,
+                topEndAction = topEndAction
+            ) {
+                content()
+            }
+        }
+    }
+}
+
+@Composable
+private fun CrowdAttributeTooltip(
+    message: String?,
+    onDismiss: () -> Unit
+) {
+    val tooltipMessage = message ?: return
+    val density = LocalDensity.current
+    val positionProvider = remember(density) {
+        CrowdTooltipPositionProvider(
+            verticalGapPx = with(density) { 2.dp.roundToPx() },
+            screenPaddingPx = with(density) { 8.dp.roundToPx() }
         )
-        Text(
-            text = value,
-            style = MaterialTheme.typography.bodyMedium,
-            fontWeight = FontWeight.SemiBold,
-            textAlign = TextAlign.End,
-            color = Color.Black
+    }
+
+    Popup(
+        popupPositionProvider = positionProvider,
+        onDismissRequest = onDismiss,
+        properties = PopupProperties(focusable = false)
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            modifier = Modifier.widthIn(max = 220.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(9.dp)
+                    .graphicsLayer { rotationZ = 45f }
+                    .background(CrowdTooltipColor, RoundedCornerShape(1.dp))
+            )
+            Surface(
+                modifier = Modifier.offset(y = (-4).dp),
+                shape = RoundedCornerShape(6.dp),
+                color = CrowdTooltipColor,
+                contentColor = Color.Black,
+                shadowElevation = 6.dp
+            ) {
+                Text(
+                    text = tooltipMessage,
+                    modifier = Modifier.padding(horizontal = 10.dp, vertical = 7.dp),
+                    color = Color.Black.copy(alpha = 0.86f),
+                    style = MaterialTheme.typography.bodySmall,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+private class CrowdTooltipPositionProvider(
+    private val verticalGapPx: Int,
+    private val screenPaddingPx: Int
+) : PopupPositionProvider {
+    override fun calculatePosition(
+        anchorBounds: IntRect,
+        windowSize: IntSize,
+        layoutDirection: LayoutDirection,
+        popupContentSize: IntSize
+    ): IntOffset {
+        val anchorCenterX = anchorBounds.left + (anchorBounds.width / 2)
+        val preferredX = anchorCenterX - (popupContentSize.width / 2)
+        val minX = screenPaddingPx
+        val maxX = (windowSize.width - popupContentSize.width - screenPaddingPx).coerceAtLeast(minX)
+        val x = preferredX.coerceIn(minX, maxX)
+
+        val preferredY = anchorBounds.bottom + verticalGapPx
+        val minY = screenPaddingPx
+        val maxY = (windowSize.height - popupContentSize.height - screenPaddingPx).coerceAtLeast(minY)
+        val y = preferredY.coerceIn(minY, maxY)
+
+        return IntOffset(x, y)
+    }
+}
+
+@Composable
+private fun WrappingBubbleRow(
+    modifier: Modifier = Modifier,
+    horizontalSpacing: Dp = 8.dp,
+    verticalSpacing: Dp = 8.dp,
+    densePacking: Boolean = false,
+    maxItemWidthFraction: Float = 1f,
+    content: @Composable () -> Unit
+) {
+    val density = LocalDensity.current
+    val horizontalSpacingPx = with(density) { horizontalSpacing.roundToPx() }
+    val verticalSpacingPx = with(density) { verticalSpacing.roundToPx() }
+
+    Layout(
+        content = content,
+        modifier = modifier
+    ) { measurables, constraints ->
+        val rowMaxWidth = if (constraints.hasBoundedWidth) constraints.maxWidth else constraints.minWidth
+        val childMaxWidth = (rowMaxWidth * maxItemWidthFraction.coerceIn(0.1f, 1f))
+            .roundToInt()
+            .coerceAtLeast(0)
+        val childConstraints = constraints.copy(minWidth = 0, minHeight = 0, maxWidth = childMaxWidth)
+        val placeables = measurables.map { measurable -> measurable.measure(childConstraints) }
+        val positions = MutableList(placeables.size) { 0 to 0 }
+
+        var x = 0
+        var y = 0
+        var rowHeight = 0
+        var contentWidth = 0
+
+        if (densePacking) {
+            val rowItems = mutableListOf<MutableList<Int>>()
+            val rowWidths = mutableListOf<Int>()
+            val rowHeights = mutableListOf<Int>()
+            val orderedIndices = placeables.indices
+                .sortedWith(compareByDescending<Int> { placeables[it].width }.thenBy { it })
+
+            orderedIndices.forEach { index ->
+                val placeable = placeables[index]
+                var bestRowIndex = -1
+                var bestRemainingWidth = Int.MAX_VALUE
+
+                rowWidths.forEachIndexed { rowIndex, rowWidth ->
+                    val candidateWidth = rowWidth + horizontalSpacingPx + placeable.width
+                    if (candidateWidth <= rowMaxWidth) {
+                        val remainingWidth = rowMaxWidth - candidateWidth
+                        if (remainingWidth < bestRemainingWidth) {
+                            bestRemainingWidth = remainingWidth
+                            bestRowIndex = rowIndex
+                        }
+                    }
+                }
+
+                if (bestRowIndex == -1) {
+                    rowItems.add(mutableListOf(index))
+                    rowWidths.add(placeable.width)
+                    rowHeights.add(placeable.height)
+                } else {
+                    rowItems[bestRowIndex].add(index)
+                    rowWidths[bestRowIndex] = rowWidths[bestRowIndex] + horizontalSpacingPx + placeable.width
+                    rowHeights[bestRowIndex] = maxOf(rowHeights[bestRowIndex], placeable.height)
+                }
+            }
+
+            rowItems.forEachIndexed { rowIndex, indices ->
+                x = 0
+                indices.sort()
+                indices.forEach { index ->
+                    val placeable = placeables[index]
+                    val childX = if (x == 0) 0 else x + horizontalSpacingPx
+                    positions[index] = childX to y
+                    x = childX + placeable.width
+                }
+                contentWidth = maxOf(contentWidth, x)
+                y += rowHeights[rowIndex] + verticalSpacingPx
+            }
+            if (rowItems.isNotEmpty()) {
+                y -= verticalSpacingPx
+            }
+        } else {
+            placeables.forEachIndexed { index, placeable ->
+                val spacingBefore = if (x == 0) 0 else horizontalSpacingPx
+                if (x > 0 && x + spacingBefore + placeable.width > rowMaxWidth) {
+                    contentWidth = maxOf(contentWidth, x)
+                    y += rowHeight + verticalSpacingPx
+                    x = 0
+                    rowHeight = 0
+                }
+
+                val childX = if (x == 0) 0 else x + horizontalSpacingPx
+                positions[index] = childX to y
+                x = childX + placeable.width
+                rowHeight = maxOf(rowHeight, placeable.height)
+            }
+
+            contentWidth = maxOf(contentWidth, x)
+            y = if (placeables.isEmpty()) 0 else y + rowHeight
+        }
+
+        val contentHeight = y
+        val layoutWidth = if (constraints.hasBoundedWidth) constraints.maxWidth else contentWidth
+
+        layout(
+            width = layoutWidth.coerceIn(constraints.minWidth, constraints.maxWidth),
+            height = contentHeight.coerceIn(constraints.minHeight, constraints.maxHeight)
+        ) {
+            placeables.forEachIndexed { index, placeable ->
+                val (childX, childY) = positions[index]
+                placeable.placeRelative(childX, childY)
+            }
+        }
+    }
+}
+
+@Composable
+private fun WrappingBubbleRowWithTopEndAction(
+    modifier: Modifier = Modifier,
+    horizontalSpacing: Dp = 8.dp,
+    verticalSpacing: Dp = 8.dp,
+    densePacking: Boolean = false,
+    maxItemWidthFraction: Float = 1f,
+    topEndAction: @Composable () -> Unit,
+    content: @Composable () -> Unit
+) {
+    val density = LocalDensity.current
+    val horizontalSpacingPx = with(density) { horizontalSpacing.roundToPx() }
+    val verticalSpacingPx = with(density) { verticalSpacing.roundToPx() }
+
+    Layout(
+        content = {
+            topEndAction()
+            content()
+        },
+        modifier = modifier
+    ) { measurables, constraints ->
+        val rowMaxWidth = if (constraints.hasBoundedWidth) constraints.maxWidth else constraints.minWidth
+        val actionConstraints = constraints.copy(minWidth = 0, minHeight = 0, maxWidth = rowMaxWidth)
+        val actionPlaceable = measurables.firstOrNull()?.measure(actionConstraints)
+        val bubbleMeasurables = measurables.drop(1)
+        val childMaxWidth = (rowMaxWidth * maxItemWidthFraction.coerceIn(0.1f, 1f))
+            .roundToInt()
+            .coerceAtLeast(0)
+        val childConstraints = constraints.copy(minWidth = 0, minHeight = 0, maxWidth = childMaxWidth)
+        val bubblePlaceables = bubbleMeasurables.map { measurable -> measurable.measure(childConstraints) }
+        val bubblePositions = MutableList(bubblePlaceables.size) { 0 to 0 }
+
+        val topRowReservedWidth = actionPlaceable?.let { it.width + horizontalSpacingPx } ?: 0
+        val rowMaxWidths = mutableListOf((rowMaxWidth - topRowReservedWidth).coerceAtLeast(0))
+        val rowItems = mutableListOf(mutableListOf<Int>())
+        val rowWidths = mutableListOf(0)
+        val rowHeights = mutableListOf(actionPlaceable?.height ?: 0)
+        val orderedIndices = if (densePacking) {
+            bubblePlaceables.indices
+                .sortedWith(compareByDescending<Int> { bubblePlaceables[it].width }.thenBy { it })
+        } else {
+            bubblePlaceables.indices.toList()
+        }
+
+        fun addBubbleToRow(rowIndex: Int, bubbleIndex: Int) {
+            val placeable = bubblePlaceables[bubbleIndex]
+            rowItems[rowIndex].add(bubbleIndex)
+            rowWidths[rowIndex] = if (rowWidths[rowIndex] == 0) {
+                placeable.width
+            } else {
+                rowWidths[rowIndex] + horizontalSpacingPx + placeable.width
+            }
+            rowHeights[rowIndex] = maxOf(rowHeights[rowIndex], placeable.height)
+        }
+
+        orderedIndices.forEach { index ->
+            val placeable = bubblePlaceables[index]
+            var bestRowIndex = -1
+            var bestRemainingWidth = Int.MAX_VALUE
+
+            rowWidths.forEachIndexed { rowIndex, rowWidth ->
+                val candidateWidth = if (rowWidth == 0) {
+                    placeable.width
+                } else {
+                    rowWidth + horizontalSpacingPx + placeable.width
+                }
+                if (candidateWidth <= rowMaxWidths[rowIndex]) {
+                    val remainingWidth = rowMaxWidths[rowIndex] - candidateWidth
+                    if (!densePacking) {
+                        bestRowIndex = rowIndex
+                        return@forEachIndexed
+                    }
+                    if (remainingWidth < bestRemainingWidth) {
+                        bestRemainingWidth = remainingWidth
+                        bestRowIndex = rowIndex
+                    }
+                }
+            }
+
+            if (bestRowIndex == -1) {
+                rowItems.add(mutableListOf())
+                rowWidths.add(0)
+                rowHeights.add(0)
+                rowMaxWidths.add(rowMaxWidth)
+                bestRowIndex = rowItems.lastIndex
+            }
+
+            addBubbleToRow(bestRowIndex, index)
+        }
+
+        var contentWidth = actionPlaceable?.width ?: 0
+        var y = 0
+        rowItems.forEachIndexed { rowIndex, indices ->
+            var x = 0
+            indices.sort()
+            indices.forEach { index ->
+                val placeable = bubblePlaceables[index]
+                val childX = if (x == 0) 0 else x + horizontalSpacingPx
+                bubblePositions[index] = childX to y
+                x = childX + placeable.width
+            }
+            contentWidth = maxOf(contentWidth, x)
+            y += rowHeights[rowIndex] + verticalSpacingPx
+        }
+        if (rowItems.isNotEmpty()) {
+            y -= verticalSpacingPx
+        }
+
+        val layoutWidth = if (constraints.hasBoundedWidth) constraints.maxWidth else contentWidth
+        val contentHeight = maxOf(y, actionPlaceable?.height ?: 0)
+
+        layout(
+            width = layoutWidth.coerceIn(constraints.minWidth, constraints.maxWidth),
+            height = contentHeight.coerceIn(constraints.minHeight, constraints.maxHeight)
+        ) {
+            bubblePlaceables.forEachIndexed { index, placeable ->
+                val (childX, childY) = bubblePositions[index]
+                placeable.placeRelative(childX, childY)
+            }
+            actionPlaceable?.placeRelative(layoutWidth - actionPlaceable.width, 0)
+        }
+    }
+}
+
+@Composable
+private fun CrowdAttributePlainSection(
+    title: String,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(title, style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold, color = LocalContentColor.current)
+        content()
+    }
+}
+
+@Composable
+private fun CrowdAttributeBubble(
+    iconRes: Int,
+    iconName: String,
+    value: String,
+    modifier: Modifier = Modifier
+) {
+    val displayValue = value.displayCrowdBubbleValue()
+    var tooltipMessage by remember(iconName, value) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(tooltipMessage) {
+        val messageToClear = tooltipMessage ?: return@LaunchedEffect
+        delay(CROWD_TOOLTIP_DISPLAY_MILLIS)
+        if (tooltipMessage == messageToClear) {
+            tooltipMessage = null
+        }
+    }
+
+    Box(modifier = modifier) {
+        val surfaceModifier = if (displayValue == null) {
+            Modifier.size(CrowdActionBubbleSize)
+        } else {
+            Modifier
+                .height(CrowdActionBubbleSize)
+                .widthIn(min = CrowdActionBubbleSize)
+        }
+        Surface(
+            modifier = surfaceModifier
+                .clickable { tooltipMessage = crowdAttributeTooltipText(iconName, value) },
+            shape = CircleShape,
+            color = CrowdAttributeBubbleColor,
+            contentColor = Color.Black
+        ) {
+            if (displayValue == null) {
+                Box(contentAlignment = Alignment.Center) {
+                    CrowdBubbleIcon(iconRes = iconRes, contentDescription = iconName)
+                }
+            } else {
+                Row(
+                    modifier = Modifier
+                        .height(CrowdActionBubbleSize)
+                        .padding(horizontal = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    CrowdBubbleIcon(iconRes = iconRes, contentDescription = iconName)
+                    Text(
+                        text = displayValue,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.Black,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+        CrowdAttributeTooltip(
+            message = tooltipMessage,
+            onDismiss = { tooltipMessage = null }
         )
     }
 }
 
 @Composable
-private fun ProtectedSecretAttributeRow(
-    title: String,
+private fun CrowdBubbleIcon(
+    iconRes: Int,
+    contentDescription: String,
+    modifier: Modifier = Modifier
+) {
+    val resources = LocalContext.current.resources
+    val hasDrawableResource = remember(resources, iconRes) {
+        runCatching {
+            resources.getResourceTypeName(iconRes)
+        }.getOrNull() in setOf("drawable", "mipmap")
+    }
+
+    if (hasDrawableResource) {
+        Icon(
+            painter = painterResource(id = iconRes),
+            contentDescription = contentDescription,
+            modifier = modifier.size(20.dp),
+            tint = Color.Black
+        )
+    } else {
+        Icon(
+            imageVector = Icons.Filled.Info,
+            contentDescription = contentDescription,
+            modifier = modifier.size(20.dp),
+            tint = Color.Black
+        )
+    }
+}
+
+@Composable
+private fun CrowdAttributeBubbleWithProtectedKey(
+    iconRes: Int,
+    iconName: String,
+    value: String,
+    keyIconRes: Int,
+    keyIconName: String,
     secret: ProtectedCrowdSecret,
     isAvailable: Boolean?,
     cafeLatLng: LatLng?,
-    clipboardLabel: String
+    secretLabel: String,
+    clipboardLabel: String,
+    isCopyable: Boolean
+) {
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        CrowdAttributeBubble(
+            iconRes = iconRes,
+            iconName = iconName,
+            value = value
+        )
+        ProtectedSecretKeyBubble(
+            keyIconRes = keyIconRes,
+            keyIconName = keyIconName,
+            secret = secret,
+            isAvailable = isAvailable,
+            cafeLatLng = cafeLatLng,
+            secretLabel = secretLabel,
+            clipboardLabel = clipboardLabel,
+            isCopyable = isCopyable
+        )
+    }
+}
+
+@Composable
+private fun ProtectedSecretKeyBubble(
+    keyIconRes: Int,
+    keyIconName: String,
+    secret: ProtectedCrowdSecret,
+    isAvailable: Boolean?,
+    cafeLatLng: LatLng?,
+    secretLabel: String,
+    clipboardLabel: String,
+    isCopyable: Boolean
 ) {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -3273,122 +4184,122 @@ private fun ProtectedSecretAttributeRow(
     var displayState by remember(secret, isAvailable, cafeLatLng) {
         mutableStateOf(protectedSecretDisplayState(secret, isNearby = false, isAvailable = isAvailable))
     }
-    var helperText by remember(secret, isAvailable, cafeLatLng) { mutableStateOf<String?>(null) }
+    var tooltipMessage by remember(secret, isAvailable, cafeLatLng) { mutableStateOf<String?>(null) }
 
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Row(
-            modifier = Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(title, style = MaterialTheme.typography.bodyMedium, color = Color.Black)
-                Text(
-                    text = displayTextForSecretState(displayState),
-                    style = MaterialTheme.typography.bodyMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = Color.Black
-                )
-            }
+    LaunchedEffect(tooltipMessage) {
+        val messageToClear = tooltipMessage ?: return@LaunchedEffect
+        delay(CROWD_TOOLTIP_DISPLAY_MILLIS)
+        if (tooltipMessage == messageToClear) {
+            tooltipMessage = null
+        }
+    }
 
-            when (val state = displayState) {
-                is ProtectedSecretDisplayState.Revealed -> {
-                    OutlinedButton(
-                        onClick = {
+    Box {
+        Surface(
+            modifier = Modifier.size(CrowdActionBubbleSize),
+            onClick = {
+                when (val state = displayState) {
+                    is ProtectedSecretDisplayState.Revealed -> {
+                        if (isCopyable) {
                             copySecretToClipboard(context, clipboardLabel, state.value)
-                            helperText = "Copied to clipboard."
-                        },
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Black),
-                        border = BorderStroke(1.dp, Color.Black)
-                    ) {
-                        Text("Copy")
+                            tooltipMessage = "$secretLabel copied to clipboard."
+                        } else {
+                            tooltipMessage = protectedSecretRevealedMessage(secretLabel, state.value, isCopyable = false)
+                        }
                     }
-                }
 
-                ProtectedSecretDisplayState.Censored -> {
-                    OutlinedButton(
-                        onClick = {
-                            if (!hasLocationPermission) {
-                                helperText = "Location permission is needed to reveal this here."
-                                return@OutlinedButton
-                            }
+                    ProtectedSecretDisplayState.Censored -> {
+                        if (!hasLocationPermission) {
+                            tooltipMessage = "Location permission is needed to reveal this here."
+                            return@Surface
+                        }
 
-                            scope.launch {
-                                val userLatLng = runCatching {
-                                    getCurrentOrLastLocation(fusedLocationClient).toLatLng()
-                                }.getOrNull()
-                                val isNearby = isUserNearCafe(userLatLng, cafeLatLng)
-                                val updatedState = protectedSecretDisplayState(
-                                    secret = secret,
-                                    isNearby = isNearby,
-                                    isAvailable = isAvailable
-                                )
-                                displayState = updatedState
-                                helperText = when {
-                                    cafeLatLng == null -> "Cafe location is unavailable."
-                                    !isNearby -> "Visit this cafe to reveal."
-                                    updatedState == ProtectedSecretDisplayState.AskStaff -> "Ask staff while you are there."
-                                    updatedState == ProtectedSecretDisplayState.Unknown -> "No one has submitted this yet."
-                                    else -> null
+                        scope.launch {
+                            val userLatLng = runCatching {
+                                getCurrentOrLastLocation(fusedLocationClient).toLatLng()
+                            }.getOrNull()
+                            val isNearby = isUserNearCafe(userLatLng, cafeLatLng)
+                            val updatedState = protectedSecretDisplayState(
+                                secret = secret,
+                                isNearby = isNearby,
+                                isAvailable = isAvailable
+                            )
+                            displayState = updatedState
+                            tooltipMessage = when {
+                                cafeLatLng == null -> "Cafe location is unavailable."
+                                !isNearby -> "Visit this cafe to reveal."
+                                updatedState == ProtectedSecretDisplayState.AskStaff -> "Ask staff while you are there."
+                                updatedState == ProtectedSecretDisplayState.Unknown -> "No one has submitted this yet."
+                                updatedState is ProtectedSecretDisplayState.Revealed -> {
+                                    protectedSecretRevealedMessage(secretLabel, updatedState.value, isCopyable)
                                 }
+                                else -> displayTextForSecretState(updatedState)
                             }
-                        },
-                        colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.Black),
-                        border = BorderStroke(1.dp, Color.Black)
-                    ) {
-                        Text("Reveal")
+                        }
                     }
-                }
 
-                else -> Unit
+                    ProtectedSecretDisplayState.AskStaff -> tooltipMessage = "Ask staff while you are there."
+                    ProtectedSecretDisplayState.Unavailable -> tooltipMessage = "Not available."
+                    ProtectedSecretDisplayState.Unknown -> tooltipMessage = "No one has submitted this yet."
+                }
+            },
+            shape = CircleShape,
+            color = CrowdAttributeBubbleColor,
+            contentColor = Color.Black
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                CrowdBubbleIcon(iconRes = keyIconRes, contentDescription = keyIconName)
             }
         }
-
-        helperText?.let { text ->
-            Text(
-                text = text,
-                color = Color.Black.copy(alpha = 0.72f),
-                style = MaterialTheme.typography.bodySmall
-            )
-        }
+        CrowdAttributeTooltip(
+            message = tooltipMessage,
+            onDismiss = { tooltipMessage = null }
+        )
     }
 }
 
-@Composable
-private fun VibeTagSummary(vibeTags: Set<VibeTag>) {
-    if (vibeTags.isEmpty()) {
-        CrowdAttributeRow("Vibe / atmosphere", "Unknown")
-        return
-    }
+private fun crowdAttributeTooltipText(iconName: String, value: String): String {
+    return value.displayCrowdBubbleValue()?.let { "$iconName: $it" } ?: iconName
+}
 
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Vibe / atmosphere", color = Color.Black, style = MaterialTheme.typography.bodyMedium)
-        vibeTags.chunked(2).forEach { rowTags ->
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                rowTags.forEach { tag ->
-                    AssistChip(
-                        onClick = { },
-                        label = { Text(tag.label, color = Color.Black) },
-                        modifier = Modifier.weight(1f),
-                        colors = AssistChipDefaults.assistChipColors(
-                            containerColor = CoffeeLight,
-                            labelColor = Color.Black
-                        )
-                    )
-                }
-                if (rowTags.size == 1) {
-                    Spacer(modifier = Modifier.weight(1f))
-                }
-            }
-        }
+private fun protectedSecretRevealedMessage(
+    secretLabel: String,
+    value: String,
+    isCopyable: Boolean
+): String {
+    return if (isCopyable) {
+        "$secretLabel: $value\nTap again to copy."
+    } else {
+        "$secretLabel: $value"
+    }
+}
+
+private fun String?.displayCrowdValue(): String {
+    return this?.trim()?.takeIf { it.isNotBlank() } ?: "Unknown"
+}
+
+private fun String.displayCrowdBubbleValue(): String? {
+    return trim()
+        .takeIf { it.isNotBlank() }
+        ?.takeUnless { it.equals("Unknown", ignoreCase = true) }
+}
+
+private fun Set<VibeTag>.displayVibeValue(): String {
+    return if (isEmpty()) {
+        "Unknown"
+    } else {
+        joinToString(separator = ", ") { it.label }
     }
 }
 
 @Composable
 private fun DraftPhotoList(title: String, photoUris: List<String>) {
+    val textColor = LocalContentColor.current
+
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text(title, color = Color.Black, style = MaterialTheme.typography.bodyMedium)
+        Text(title, color = textColor, style = MaterialTheme.typography.bodyMedium)
         if (photoUris.isEmpty()) {
-            Text("No visitor photos yet.", color = Color.Black.copy(alpha = 0.72f), style = MaterialTheme.typography.bodySmall)
+            Text("No visitor photos yet.", color = textColor.copy(alpha = 0.72f), style = MaterialTheme.typography.bodySmall)
         } else {
             photoUris.forEachIndexed { index, uri ->
                 OutlinedCard(
@@ -3413,14 +4324,16 @@ private fun DraftPhotoList(title: String, photoUris: List<String>) {
     }
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun CrowdAttributeSuggestionSheet(
+private fun CrowdAttributeSuggestionForm(
     cafe: Cafe,
     attributes: CafeCrowdAttributes,
-    onDismiss: () -> Unit
+    onSubmit: () -> Unit,
+    modifier: Modifier = Modifier,
+    contentPadding: PaddingValues = PaddingValues(start = 20.dp, end = 20.dp, bottom = 28.dp)
 ) {
     var outletAvailability by remember(cafe.id, attributes) { mutableStateOf(attributes.outletAvailability) }
+    var wifiName by remember(cafe.id, attributes) { mutableStateOf(attributes.wifiName.orEmpty()) }
     var wifiSpeed by remember(cafe.id, attributes) { mutableStateOf(attributes.wifiSpeed) }
     var wifiPassword by remember(cafe.id, attributes) { mutableStateOf(attributes.wifiPassword.value.orEmpty()) }
     var wifiPasswordExists by remember(cafe.id, attributes) { mutableStateOf(attributes.wifiPassword.knownToExist) }
@@ -3438,23 +4351,15 @@ private fun CrowdAttributeSuggestionSheet(
     var seatingPhotoUri by remember(cafe.id) { mutableStateOf("") }
     var menuPhotoUri by remember(cafe.id) { mutableStateOf("") }
 
-    ModalBottomSheet(onDismissRequest = onDismiss) {
-        LazyColumn(
-            modifier = Modifier
-                .fillMaxWidth()
-                .heightIn(max = 680.dp),
-            contentPadding = PaddingValues(start = 20.dp, end = 20.dp, bottom = 28.dp),
-            verticalArrangement = Arrangement.spacedBy(14.dp)
-        ) {
+    LazyColumn(
+        modifier = modifier.fillMaxWidth(),
+        contentPadding = contentPadding,
+        verticalArrangement = Arrangement.spacedBy(14.dp)
+    ) {
             item {
                 Text(
-                    text = "Suggest changes",
-                    style = MaterialTheme.typography.headlineSmall,
-                    fontWeight = FontWeight.Bold
-                )
-                Text(
                     text = cafe.name,
-                    color = Color.Gray,
+                    color = Color.Black.copy(alpha = 0.72f),
                     style = MaterialTheme.typography.bodyMedium
                 )
             }
@@ -3465,6 +4370,15 @@ private fun CrowdAttributeSuggestionSheet(
                 }
             }
             item {
+                OutlinedTextField(
+                    value = wifiName,
+                    onValueChange = { wifiName = it },
+                    label = { Text("WiFi") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true
+                )
+            }
+            item {
                 SuggestionDropdown("Wi-Fi speed", wifiSpeed, WifiSpeed.entries, { it.label }) {
                     wifiSpeed = it
                 }
@@ -3473,14 +4387,14 @@ private fun CrowdAttributeSuggestionSheet(
                 OutlinedTextField(
                     value = wifiPassword,
                     onValueChange = { wifiPassword = it },
-                    label = { Text("Wi-Fi password") },
+                    label = { Text("WiFi key") },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true
                 )
             }
             item {
                 ToggleRow(
-                    label = "Wi-Fi password exists, but I do not know it",
+                    label = "WiFi key exists, but I do not know it",
                     checked = wifiPasswordExists,
                     onCheckedChange = { wifiPasswordExists = it }
                 )
@@ -3494,14 +4408,14 @@ private fun CrowdAttributeSuggestionSheet(
                 OutlinedTextField(
                     value = bathroomCode,
                     onValueChange = { bathroomCode = it },
-                    label = { Text("Bathroom code") },
+                    label = { Text("Bathroom key") },
                     modifier = Modifier.fillMaxWidth(),
                     singleLine = true
                 )
             }
             item {
                 ToggleRow(
-                    label = "Bathroom code exists, but I do not know it",
+                    label = "Bathroom key exists, but I do not know it",
                     checked = bathroomCodeExists,
                     onCheckedChange = { bathroomCodeExists = it }
                 )
@@ -3577,6 +4491,7 @@ private fun CrowdAttributeSuggestionSheet(
                             cafeId = cafe.id,
                             suggestion = CrowdAttributeSuggestion(
                                 outletAvailability = outletAvailability,
+                                wifiName = wifiName,
                                 wifiSpeed = wifiSpeed,
                                 wifiPassword = ProtectedCrowdSecret(
                                     value = wifiPassword,
@@ -3599,14 +4514,13 @@ private fun CrowdAttributeSuggestionSheet(
                                 menuPhotoUris = listOf(menuPhotoUri)
                             )
                         )
-                        onDismiss()
+                        onSubmit()
                     },
                     modifier = Modifier.fillMaxWidth()
                 ) {
                     Text("Submit suggestion")
                 }
             }
-        }
     }
 }
 
@@ -3726,9 +4640,13 @@ private fun displayTextForSecretState(state: ProtectedSecretDisplayState): Strin
     }
 }
 
-private fun copySecretToClipboard(context: Context, label: String, value: String) {
+private fun copyTextToClipboard(context: Context, label: String, value: String) {
     val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager ?: return
     clipboard.setPrimaryClip(ClipData.newPlainText(label, value))
+}
+
+private fun copySecretToClipboard(context: Context, label: String, value: String) {
+    copyTextToClipboard(context, label, value)
 }
 
 @Composable
@@ -3944,7 +4862,7 @@ fun PlaceCard(
             },
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(
-            containerColor = CoffeeDark,
+            containerColor = SelectedCafeSurfaceColor,
             contentColor = cardTextColor
         ),
         border = BorderStroke(2.dp, Color.Black),
@@ -4025,7 +4943,7 @@ fun ExpandedCafeDetailOverlay(
         modifier = modifier.graphicsLayer { alpha = overlayAlpha },
         shape = RoundedCornerShape(cornerRadius),
         colors = CardDefaults.cardColors(
-            containerColor = CoffeeDark.copy(alpha = detailSurfaceAlpha),
+            containerColor = SelectedCafeSurfaceColor.copy(alpha = detailSurfaceAlpha),
             contentColor = detailTextColor
         ),
         elevation = CardDefaults.cardElevation(defaultElevation = 10.dp),
@@ -4199,24 +5117,48 @@ fun ExpandedCafeDetailOverlay(
                         }
 
                         Text(cafe.status, color = detailTextColor, style = MaterialTheme.typography.bodyMedium)
-                        cafe.distanceMeters?.let { distanceMeters ->
-                            Text(
-                                "Distance: ${formatDistanceAway(distanceMeters)}",
-                                style = MaterialTheme.typography.bodyLarge,
-                                color = detailTextColor
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            cafe.distanceMeters
+                                ?.let { distanceMeters -> formatDistanceAway(distanceMeters) }
+                                ?.let { distanceText ->
+                                    CompactDetailInfoBubble(
+                                        iconRes = R.drawable.distance,
+                                        iconName = "Distance",
+                                        value = distanceText,
+                                        modifier = Modifier.weight(1f)
+                                    )
+                                }
+                            CompactDetailInfoBubble(
+                                iconRes = R.drawable.address,
+                                iconName = "Address",
+                                value = cafe.address,
+                                modifier = Modifier.weight(1f)
+                            )
+                            CompactDetailInfoBubble(
+                                iconRes = R.drawable.phone,
+                                iconName = "Phone",
+                                value = cafe.phone,
+                                modifier = Modifier.weight(1f),
+                                copyLabel = "${cafe.name} phone number"
                             )
                         }
-                        Text("Address: ${cafe.address}", style = MaterialTheme.typography.bodyLarge, color = detailTextColor)
-                        Text("Phone: ${cafe.phone}", style = MaterialTheme.typography.bodyLarge, color = detailTextColor)
                         HoursDropdown(cafe.hours)
-                        Button(
-                            onClick = { openDirectionsInGoogleMaps(context, cafe) },
-                            enabled = cafe.directionsDestination() != null,
-                            modifier = Modifier.fillMaxWidth()
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.Center
                         ) {
-                            Icon(Icons.Filled.Directions, contentDescription = null)
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Directions")
+                            Button(
+                                onClick = { openDirectionsInGoogleMaps(context, cafe) },
+                                enabled = cafe.directionsDestination() != null
+                            ) {
+                                Icon(Icons.Filled.Directions, contentDescription = null)
+                                Spacer(modifier = Modifier.width(8.dp))
+                                Text("Directions")
+                            }
                         }
                     }
                 }
@@ -4227,30 +5169,6 @@ fun ExpandedCafeDetailOverlay(
                         attributes = crowdAttributes,
                         modifier = Modifier.padding(horizontal = 20.dp)
                     )
-                }
-
-                item {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 20.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text("Features", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = detailTextColor)
-                        cafe.features.forEach { feature ->
-                            Text("- $feature", style = MaterialTheme.typography.bodyMedium, color = detailTextColor)
-                        }
-                    }
-                }
-
-                item {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 20.dp),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
-                    ) {
-                        Text("Ambience", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = detailTextColor)
-                        cafe.ambience.forEach { vibe ->
-                            Text("- $vibe", style = MaterialTheme.typography.bodyMedium, color = detailTextColor)
-                        }
-                    }
                 }
 
                 item {
@@ -4286,7 +5204,7 @@ fun ExpandedCafeDetailOverlay(
                                 .padding(horizontal = 20.dp),
                             border = BorderStroke(1.dp, Color.Black),
                             colors = CardDefaults.outlinedCardColors(
-                                containerColor = CoffeeDark,
+                                containerColor = SelectedCafeSurfaceColor,
                                 contentColor = detailTextColor
                             )
                         ) {

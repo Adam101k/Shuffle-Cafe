@@ -68,6 +68,7 @@ class CrowdAttributeRepositoryTest {
             cafeId = "alpha",
             suggestion = CrowdAttributeSuggestion(
                 outletAvailability = OutletAvailability.PLENTY,
+                wifiName = " Alpha Beans Guest ",
                 wifiPassword = ProtectedCrowdSecret(value = "alpha-pass"),
                 vibeTags = setOf(VibeTag.STUDY_HEAVY),
                 seatingPhotoUris = listOf(" content://alpha-seat ")
@@ -87,6 +88,7 @@ class CrowdAttributeRepositoryTest {
         val bravo = CrowdAttributeRepository.attributesFor("bravo")
 
         assertEquals(OutletAvailability.PLENTY, alpha.outletAvailability)
+        assertEquals("Alpha Beans Guest", alpha.wifiName)
         assertEquals(ProtectedCrowdSecret(value = "alpha-pass", knownToExist = true), alpha.wifiPassword)
         assertEquals(setOf(VibeTag.STUDY_HEAVY), alpha.vibeTags)
         assertEquals(listOf("content://alpha-seat"), alpha.seatingPhotoUris)
@@ -94,6 +96,7 @@ class CrowdAttributeRepositoryTest {
         assertEquals(100L, alpha.lastUpdatedEpochMillis)
 
         assertEquals(OutletAvailability.UNKNOWN, bravo.outletAvailability)
+        assertEquals(null, bravo.wifiName)
         assertEquals(NoiseLevel.QUIET, bravo.noiseLevel)
         assertEquals(listOf("content://bravo-menu"), bravo.menuPhotoUris)
         assertEquals(200L, bravo.lastUpdatedEpochMillis)

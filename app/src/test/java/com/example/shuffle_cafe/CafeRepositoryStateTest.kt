@@ -160,6 +160,36 @@ class CafeRepositoryStateTest {
     }
 
     @Test
+    fun cafePhoneSelectionPrefersInternationalNumber() {
+        val phone = selectCafePhoneNumber(
+            internationalPhoneNumber = "+1 555-0100",
+            nationalPhoneNumber = "(555) 0100"
+        )
+
+        assertEquals("+1 555-0100", phone)
+    }
+
+    @Test
+    fun cafePhoneSelectionFallsBackToNationalNumber() {
+        val phone = selectCafePhoneNumber(
+            internationalPhoneNumber = " ",
+            nationalPhoneNumber = "(555) 0100"
+        )
+
+        assertEquals("(555) 0100", phone)
+    }
+
+    @Test
+    fun cafePhoneSelectionUsesUnavailableTextWhenMissing() {
+        val phone = selectCafePhoneNumber(
+            internationalPhoneNumber = null,
+            nationalPhoneNumber = ""
+        )
+
+        assertEquals("Phone unavailable", phone)
+    }
+
+    @Test
     fun resetForTestClearsMapSessionCache() {
         CafeRepository.cacheMapViewportForTest(
             viewportKey = "viewport_a",
