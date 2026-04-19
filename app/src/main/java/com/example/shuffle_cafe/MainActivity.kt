@@ -38,9 +38,12 @@ import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -2660,6 +2663,7 @@ fun BookmarkScreen(navController: NavHostController) {
     val savedCafes = BookmarkRepository.cafes()
     var showAllSaved by rememberSaveable { mutableStateOf(false) }
     var selectedSavedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedStudySession by remember { mutableStateOf<StudySession?>(null) }
     var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
     val detailProgress = remember { Animatable(0f) }
     val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
@@ -2742,10 +2746,25 @@ fun BookmarkScreen(navController: NavHostController) {
                         onToggleShowAllSaved = { showAllSaved = !showAllSaved },
                         onSavedCafeSelected = { cafe ->
                             selectedSavedCafeId = cafe.id
+                        },
+                        onStudySessionSelected = { session ->
+                            selectedStudySession = session
                         }
                     )
                 }
             }
+        }
+
+        selectedStudySession?.let { session ->
+            StudySessionDetailOverlay(
+                session = session,
+                onDismiss = { selectedStudySession = null },
+                onOpenCafeDetails = {
+                    selectedSavedCafeId = session.cafeId
+                },
+                backHandlerEnabled = selectedSavedCafeId == null,
+                modifier = Modifier.matchParentSize()
+            )
         }
 
         if (overlayCafe != null && detailProgress.value > 0f) {
@@ -2763,6 +2782,7 @@ fun BookmarkScreen(navController: NavHostController) {
             Box(
                 modifier = Modifier
                     .matchParentSize()
+                    .zIndex(20f)
                     .background(Color.Black.copy(alpha = scrimAlpha))
                     .clickable(
                         interactionSource = interactionSource,
@@ -2790,6 +2810,7 @@ fun BookmarkScreen(navController: NavHostController) {
                 transitionProgress = detailProgress.value,
                 modifier = Modifier
                     .align(Alignment.TopCenter)
+                    .zIndex(21f)
                     .statusBarsPadding()
                     .navigationBarsPadding()
                     .padding(
@@ -2804,7 +2825,7 @@ fun BookmarkScreen(navController: NavHostController) {
                         scaleX = overlayScale
                         scaleY = overlayScale
                     }
-            )
+                )
         }
     }
 }
@@ -3246,28 +3267,34 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
 
     val isBookmarked = BookmarkRepository.isBookmarked(cafeId)
     MissingCafePhoneEffect(cafe = cafe, placesClient = placesClient)
+    var studyComposerCafe by remember { mutableStateOf<Cafe?>(null) }
 
-    Scaffold(
-        bottomBar = { BottomNavBar(navController) },
-        containerColor = SelectedCafeSurfaceColor,
-        contentColor = detailTextColor
-    ) { innerPadding ->
-        if (cafe == null) {
-            Box(
-                modifier = Modifier.padding(innerPadding).fillMaxSize(),
-                contentAlignment = Alignment.Center
-            ) { Text("Cafe not found", color = detailTextColor) }
-            return@Scaffold
-        }
-        val crowdAttributes = CrowdAttributeRepository.attributesFor(cafe.id)
+    BackHandler(enabled = studyComposerCafe != null) {
+        studyComposerCafe = null
+    }
 
-        LazyColumn(
-            modifier = Modifier
-                .padding(innerPadding)
-                .fillMaxSize()
-                .padding(horizontal = 16.dp),
-            verticalArrangement = Arrangement.spacedBy(12.dp)
-        ) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Scaffold(
+            bottomBar = { BottomNavBar(navController) },
+            containerColor = SelectedCafeSurfaceColor,
+            contentColor = detailTextColor
+        ) { innerPadding ->
+            if (cafe == null) {
+                Box(
+                    modifier = Modifier.padding(innerPadding).fillMaxSize(),
+                    contentAlignment = Alignment.Center
+                ) { Text("Cafe not found", color = detailTextColor) }
+                return@Scaffold
+            }
+            val crowdAttributes = CrowdAttributeRepository.attributesFor(cafe.id)
+
+            LazyColumn(
+                modifier = Modifier
+                    .padding(innerPadding)
+                    .fillMaxSize()
+                    .padding(horizontal = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
             item {
                 Spacer(Modifier.height(8.dp))
 
@@ -3321,16 +3348,11 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
                     HoursDropdown(cafe.hours)
                 }
                 Spacer(Modifier.height(12.dp))
-                Row {
-                    Button(
-                        onClick = { openDirectionsInGoogleMaps(context, cafe) },
-                        enabled = cafe.directionsDestination() != null
-                    ) {
-                        Icon(Icons.Filled.Directions, contentDescription = null)
-                        Spacer(Modifier.width(8.dp))
-                        Text("Directions")
-                    }
-                }
+                StudySessionActionRow(
+                    cafe = cafe,
+                    onCreateStudySession = { studyComposerCafe = cafe },
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
 
             item {
@@ -3391,6 +3413,15 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
                     }
                 }
             }
+        }
+        }
+
+        studyComposerCafe?.let { selectedCafe ->
+            StudySessionComposerOverlay(
+                cafe = selectedCafe,
+                onDismiss = { studyComposerCafe = null },
+                modifier = Modifier.matchParentSize()
+            )
         }
     }
 }
@@ -3514,6 +3545,12 @@ private val CrowdTooltipColor = Color(0xFFF6E9D8)
 private val DetailInfoBubbleColor = Color(0xFFC5A07D)
 private val SuggestChangesBubbleColor = Color(0xFFBDEBFF)
 private val DetailInfoBubbleTextColor = Color(0xFF4B3621)
+private val StudySessionPopupSurfaceColor = SelectedCafeSurfaceColor
+private val StudySessionPopupTextColor = Color.White
+private val StudySessionPopupSecondaryTextColor = Color.White.copy(alpha = 0.78f)
+private val StudySessionPopupFieldColor = DetailInfoBubbleColor
+private val StudySessionPopupFieldTextColor = Color.Black
+private val StudySessionCafeButtonColor = Color(0xFFB44436)
 private val CrowdActionBubbleSize = 42.dp
 private const val CROWD_TOOLTIP_DISPLAY_MILLIS = 2400L
 
@@ -4707,13 +4744,15 @@ fun WriteReviewScreen(navController: NavHostController, cafeId: String) {
 }
 
 @Composable
-fun PlaceSaved(
+private fun PlaceSaved(
     savedCafes: List<Cafe>,
     showAllSaved: Boolean,
     onToggleShowAllSaved: () -> Unit,
-    onSavedCafeSelected: (Cafe) -> Unit
+    onSavedCafeSelected: (Cafe) -> Unit,
+    onStudySessionSelected: (StudySession) -> Unit
 ) {
     val outlineColor = Color(0xFFE6E6E6)
+    val studySessions = StudySessionRepository.sessions()
     Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(22.dp)) {
         Column {
             SavedSectionHeading("Saved")
@@ -4800,10 +4839,21 @@ fun PlaceSaved(
         Column {
             SavedSectionHeading("Study Plan")
             Spacer(Modifier.height(10.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                SavedTile(Modifier.weight(1f))
-                SavedTile(Modifier.weight(1f))
-                SavedTile(Modifier.weight(1f), true)
+            if (studySessions.isEmpty()) {
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                    SavedTile(Modifier.weight(1f))
+                    SavedTile(Modifier.weight(1f))
+                    SavedTile(Modifier.weight(1f), true)
+                }
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    studySessions.forEach { session ->
+                        StudySessionSavedCard(
+                            session = session,
+                            onOpen = { onStudySessionSelected(session) }
+                        )
+                    }
+                }
             }
         }
     }
@@ -4813,6 +4863,379 @@ fun PlaceSaved(
 fun SavedTile(modifier: Modifier = Modifier, plus: Boolean = false) {
     val outlineColor = Color(0xFFE6E6E6)
     OutlinedCard(modifier.aspectRatio(1f), shape = RoundedCornerShape(4.dp), border = BorderStroke(1.dp, outlineColor)) { Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { if (plus) Text("+", style = MaterialTheme.typography.headlineLarge) } }
+}
+
+@Composable
+private fun StudySessionSavedCard(
+    session: StudySession,
+    onOpen: () -> Unit
+) {
+    val firstPhotoUri = session.photoUris.firstOrNull()
+
+    OutlinedCard(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onOpen() },
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, Color(0xFFE6E6E6)),
+        colors = CardDefaults.outlinedCardColors(
+            containerColor = Color.White,
+            contentColor = Color.Black
+        )
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            OutlinedCard(
+                modifier = Modifier.size(64.dp),
+                shape = RoundedCornerShape(8.dp),
+                border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.24f)),
+                colors = CardDefaults.outlinedCardColors(
+                    containerColor = StudySessionPopupFieldColor,
+                    contentColor = StudySessionPopupFieldTextColor
+                )
+            ) {
+                if (firstPhotoUri != null) {
+                    AsyncImage(
+                        model = firstPhotoUri,
+                        contentDescription = session.title,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
+                    )
+                } else {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            painter = painterResource(id = R.drawable.study),
+                            contentDescription = null,
+                            modifier = Modifier.size(34.dp),
+                            tint = Color.Unspecified
+                        )
+                    }
+                }
+            }
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = session.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = session.cafeName,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.Gray,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "${session.className} - ${session.dateText} at ${session.timeText}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.Black.copy(alpha = 0.74f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = session.summary,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.Black.copy(alpha = 0.64f),
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StudySessionDetailOverlay(
+    session: StudySession,
+    onDismiss: () -> Unit,
+    onOpenCafeDetails: () -> Unit,
+    backHandlerEnabled: Boolean = true,
+    modifier: Modifier = Modifier
+) {
+    val scope = rememberCoroutineScope()
+    val interactionSource = remember { MutableInteractionSource() }
+    var isVisible by remember { mutableStateOf(false) }
+    var isClosing by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        isVisible = true
+    }
+
+    fun closeDetails() {
+        if (isClosing) return
+        isClosing = true
+        isVisible = false
+        scope.launch {
+            delay(140)
+            onDismiss()
+        }
+    }
+
+    BackHandler(enabled = backHandlerEnabled) {
+        closeDetails()
+    }
+
+    val overlayAlpha by animateFloatAsState(
+        targetValue = if (isVisible) 1f else 0f,
+        animationSpec = tween(durationMillis = 140, easing = FastOutSlowInEasing),
+        label = "studySessionDetailAlpha"
+    )
+    val overlayScale by animateFloatAsState(
+        targetValue = if (isVisible) 1f else 0.92f,
+        animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing),
+        label = "studySessionDetailScale"
+    )
+
+    Box(modifier = modifier.zIndex(10f)) {
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .background(Color.Black.copy(alpha = 0.24f * overlayAlpha))
+                .clickable(
+                    interactionSource = interactionSource,
+                    indication = null
+                ) {
+                    closeDetails()
+                }
+        )
+
+        Card(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .padding(20.dp)
+                .fillMaxWidth()
+                .widthIn(max = 420.dp)
+                .heightIn(max = 620.dp)
+                .graphicsLayer {
+                    alpha = overlayAlpha
+                    scaleX = overlayScale
+                    scaleY = overlayScale
+                },
+            shape = RoundedCornerShape(20.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = StudySessionPopupSurfaceColor,
+                contentColor = StudySessionPopupTextColor
+            ),
+            elevation = CardDefaults.cardElevation(defaultElevation = 12.dp),
+            border = BorderStroke(2.dp, Color.Black)
+        ) {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        modifier = Modifier.size(44.dp),
+                        shape = CircleShape,
+                        color = Color(0xFFD5F1FF)
+                    ) {
+                        Icon(
+                            painter = painterResource(id = R.drawable.study),
+                            contentDescription = null,
+                            modifier = Modifier.padding(8.dp),
+                            tint = Color.Unspecified
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = session.title,
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = StudySessionPopupTextColor,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Text(
+                            text = session.cafeName,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = StudySessionPopupSecondaryTextColor,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    IconButton(onClick = { closeDetails() }) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = "Close study session",
+                            tint = StudySessionPopupTextColor
+                        )
+                    }
+                }
+
+                StudySessionSubmittedPhotos(photoUris = session.photoUris)
+
+                StudySessionReadonlyField(label = "Class", value = session.className)
+                StudySessionReadonlyField(
+                    label = "When",
+                    value = "${session.dateText} at ${session.timeText}"
+                )
+                StudySessionCafeDetailsButton(
+                    cafeName = session.cafeName,
+                    onClick = onOpenCafeDetails
+                )
+                StudySessionReadonlyField(label = "Summary", value = session.summary)
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    Button(
+                        onClick = { closeDetails() },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = StudySessionPopupFieldColor,
+                            contentColor = StudySessionPopupFieldTextColor
+                        )
+                    ) {
+                        Text("Done")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StudySessionReadonlyField(
+    label: String,
+    value: String
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelMedium,
+            color = StudySessionPopupSecondaryTextColor
+        )
+        OutlinedCard(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(8.dp),
+            border = BorderStroke(1.dp, Color.Black),
+            colors = CardDefaults.outlinedCardColors(
+                containerColor = StudySessionPopupFieldColor,
+                contentColor = StudySessionPopupFieldTextColor
+            )
+        ) {
+            Text(
+                text = value,
+                modifier = Modifier.padding(12.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                color = StudySessionPopupFieldTextColor
+            )
+        }
+    }
+}
+
+@Composable
+private fun StudySessionCafeDetailsButton(
+    cafeName: String,
+    onClick: () -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(
+            text = "Cafe",
+            style = MaterialTheme.typography.labelMedium,
+            color = StudySessionPopupSecondaryTextColor
+        )
+        Button(
+            onClick = onClick,
+            modifier = Modifier.fillMaxWidth(),
+            colors = ButtonDefaults.buttonColors(
+                containerColor = StudySessionCafeButtonColor,
+                contentColor = Color.White
+            ),
+            shape = RoundedCornerShape(8.dp),
+            border = BorderStroke(1.dp, Color.Black)
+        ) {
+            Icon(
+                painter = painterResource(id = R.drawable.address),
+                contentDescription = null,
+                modifier = Modifier.size(20.dp),
+                tint = Color.Unspecified
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = cafeName,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+@Composable
+private fun StudySessionSubmittedPhotos(photoUris: List<String>) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(
+            text = "Submitted photos",
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            color = StudySessionPopupTextColor
+        )
+
+        if (photoUris.isEmpty()) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(140.dp),
+                shape = RoundedCornerShape(8.dp),
+                color = StudySessionPopupFieldColor
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        painter = painterResource(id = R.drawable.study),
+                        contentDescription = null,
+                        modifier = Modifier.size(46.dp),
+                        tint = Color.Unspecified
+                    )
+                }
+            }
+        } else {
+            AsyncImage(
+                model = photoUris.first(),
+                contentDescription = "Submitted study photo",
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(180.dp),
+                contentScale = ContentScale.Crop
+            )
+
+            if (photoUris.size > 1) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    photoUris.forEach { uri ->
+                        OutlinedCard(
+                            modifier = Modifier.size(76.dp),
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.18f))
+                        ) {
+                            AsyncImage(
+                                model = uri,
+                                contentDescription = "Submitted study photo",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Crop
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 @Composable
@@ -4926,7 +5349,6 @@ fun ExpandedCafeDetailOverlay(
     transitionProgress: Float,
     modifier: Modifier = Modifier
 ) {
-    val context = LocalContext.current
     val reviews = ReviewRepository.reviewsFor(cafe.id)
     val isBookmarked = BookmarkRepository.isBookmarked(cafe.id)
     val crowdAttributes = CrowdAttributeRepository.attributesFor(cafe.id)
@@ -4938,6 +5360,11 @@ fun ExpandedCafeDetailOverlay(
     val overlayAlpha = sCurve(((transitionProgress - 0.04f) / 0.34f).coerceIn(0f, 1f))
     val detailTextColor = Color.White
     val detailSecondaryTextColor = Color.White.copy(alpha = 0.78f)
+    var showStudyComposer by remember(cafe.id) { mutableStateOf(false) }
+
+    BackHandler(enabled = showStudyComposer) {
+        showStudyComposer = false
+    }
 
     Card(
         modifier = modifier.graphicsLayer { alpha = overlayAlpha },
@@ -5147,19 +5574,11 @@ fun ExpandedCafeDetailOverlay(
                             )
                         }
                         HoursDropdown(cafe.hours)
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.Center
-                        ) {
-                            Button(
-                                onClick = { openDirectionsInGoogleMaps(context, cafe) },
-                                enabled = cafe.directionsDestination() != null
-                            ) {
-                                Icon(Icons.Filled.Directions, contentDescription = null)
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text("Directions")
-                            }
-                        }
+                        StudySessionActionRow(
+                            cafe = cafe,
+                            onCreateStudySession = { showStudyComposer = true },
+                            modifier = Modifier.fillMaxWidth()
+                        )
                     }
                 }
 
@@ -5214,6 +5633,394 @@ fun ExpandedCafeDetailOverlay(
                 }
             }
 
+            if (showStudyComposer) {
+                StudySessionComposerOverlay(
+                    cafe = cafe,
+                    onDismiss = { showStudyComposer = false },
+                    modifier = Modifier.matchParentSize()
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StudySessionActionRow(
+    cafe: Cafe,
+    onCreateStudySession: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+
+    Box(
+        modifier = modifier.heightIn(min = CrowdActionBubbleSize),
+        contentAlignment = Alignment.Center
+    ) {
+        Button(
+            onClick = { openDirectionsInGoogleMaps(context, cafe) },
+            enabled = cafe.directionsDestination() != null,
+            modifier = Modifier.align(Alignment.Center)
+        ) {
+            Icon(Icons.Filled.Directions, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Directions")
+        }
+
+        StudyBubbleButton(
+            onClick = onCreateStudySession,
+            modifier = Modifier.align(Alignment.CenterEnd)
+        )
+    }
+}
+
+@Composable
+private fun StudyBubbleButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier
+            .size(CrowdActionBubbleSize)
+            .clickable { onClick() },
+        shape = CircleShape,
+        color = Color(0xFFD5F1FF),
+        contentColor = Color.Black,
+        shadowElevation = 2.dp
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Icon(
+                painter = painterResource(id = R.drawable.study),
+                contentDescription = "Create study session",
+                modifier = Modifier.size(21.dp),
+                tint = Color.Unspecified
+            )
+        }
+    }
+}
+
+@Composable
+private fun studySessionTextFieldColors() = OutlinedTextFieldDefaults.colors(
+    focusedTextColor = StudySessionPopupFieldTextColor,
+    unfocusedTextColor = StudySessionPopupFieldTextColor,
+    focusedContainerColor = StudySessionPopupFieldColor,
+    unfocusedContainerColor = StudySessionPopupFieldColor,
+    focusedLabelColor = StudySessionPopupFieldTextColor,
+    unfocusedLabelColor = StudySessionPopupFieldTextColor.copy(alpha = 0.72f),
+    focusedBorderColor = Color.Black,
+    unfocusedBorderColor = Color.Black.copy(alpha = 0.72f),
+    cursorColor = StudySessionPopupFieldTextColor
+)
+
+@Composable
+private fun StudySessionComposerOverlay(
+    cafe: Cafe,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val scope = rememberCoroutineScope()
+    val interactionSource = remember { MutableInteractionSource() }
+    var isVisible by remember { mutableStateOf(false) }
+    var isClosing by remember { mutableStateOf(false) }
+    var title by remember(cafe.id) { mutableStateOf("") }
+    var className by remember(cafe.id) { mutableStateOf("") }
+    var dateText by remember(cafe.id) { mutableStateOf("") }
+    var timeText by remember(cafe.id) { mutableStateOf("") }
+    var summary by remember(cafe.id) { mutableStateOf("") }
+    val selectedPhotoUris = remember(cafe.id) { mutableStateListOf<String>() }
+    val photoPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetMultipleContents()
+    ) { uris ->
+        uris
+            .map(Uri::toString)
+            .forEach { uriText ->
+                if (selectedPhotoUris.size < 5 && uriText !in selectedPhotoUris) {
+                    selectedPhotoUris.add(uriText)
+                }
+            }
+    }
+
+    LaunchedEffect(Unit) {
+        isVisible = true
+    }
+
+    fun closeComposer() {
+        if (isClosing) return
+        isClosing = true
+        isVisible = false
+        scope.launch {
+            delay(140)
+            onDismiss()
+        }
+    }
+
+    BackHandler(enabled = true) {
+        closeComposer()
+    }
+
+    val overlayAlpha by animateFloatAsState(
+        targetValue = if (isVisible) 1f else 0f,
+        animationSpec = tween(durationMillis = 140, easing = FastOutSlowInEasing),
+        label = "studyComposerAlpha"
+    )
+    val overlayScale by animateFloatAsState(
+        targetValue = if (isVisible) 1f else 0.92f,
+        animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing),
+        label = "studyComposerScale"
+    )
+    val draft = StudySessionDraft(
+        title = title,
+        className = className,
+        dateText = dateText,
+        timeText = timeText,
+        summary = summary,
+        photoUris = selectedPhotoUris.toList()
+    )
+    val canCreate = StudySessionRepository.canCreate(draft)
+    val textFieldColors = studySessionTextFieldColors()
+
+    Box(modifier = modifier.zIndex(10f)) {
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .background(Color.Black.copy(alpha = 0.24f * overlayAlpha))
+                .clickable(
+                    interactionSource = interactionSource,
+                    indication = null
+                ) {
+                    closeComposer()
+                }
+        )
+
+        Card(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .padding(20.dp)
+                .fillMaxWidth()
+                .widthIn(max = 420.dp)
+                .heightIn(max = 620.dp)
+                .graphicsLayer {
+                    alpha = overlayAlpha
+                    scaleX = overlayScale
+                    scaleY = overlayScale
+                },
+            shape = RoundedCornerShape(20.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = StudySessionPopupSurfaceColor,
+                contentColor = StudySessionPopupTextColor
+            ),
+            elevation = CardDefaults.cardElevation(defaultElevation = 12.dp),
+            border = BorderStroke(2.dp, Color.Black)
+        ) {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        modifier = Modifier.size(44.dp),
+                        shape = CircleShape,
+                        color = Color(0xFFD5F1FF)
+                    ) {
+                        Icon(
+                            painter = painterResource(id = R.drawable.study),
+                            contentDescription = null,
+                            modifier = Modifier.padding(8.dp),
+                            tint = Color.Unspecified
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Create study session",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = StudySessionPopupTextColor
+                        )
+                        Text(
+                            text = cafe.name,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = StudySessionPopupSecondaryTextColor,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    IconButton(onClick = { closeComposer() }) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = "Close study session form",
+                            tint = StudySessionPopupTextColor
+                        )
+                    }
+                }
+
+                OutlinedTextField(
+                    value = title,
+                    onValueChange = { title = it },
+                    label = { Text("Title") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    colors = textFieldColors
+                )
+                OutlinedTextField(
+                    value = className,
+                    onValueChange = { className = it },
+                    label = { Text("Class") },
+                    modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    colors = textFieldColors
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OutlinedTextField(
+                        value = dateText,
+                        onValueChange = { dateText = it },
+                        label = { Text("Date") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                        colors = textFieldColors
+                    )
+                    OutlinedTextField(
+                        value = timeText,
+                        onValueChange = { timeText = it },
+                        label = { Text("Time") },
+                        modifier = Modifier.weight(1f),
+                        singleLine = true,
+                        colors = textFieldColors
+                    )
+                }
+                OutlinedTextField(
+                    value = summary,
+                    onValueChange = { summary = it },
+                    label = { Text("Summary") },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 96.dp),
+                    maxLines = 5,
+                    colors = textFieldColors
+                )
+
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Work photos",
+                            style = MaterialTheme.typography.titleSmall,
+                            modifier = Modifier.weight(1f),
+                            color = StudySessionPopupTextColor
+                        )
+                        OutlinedButton(
+                            onClick = { photoPicker.launch("image/*") },
+                            enabled = selectedPhotoUris.size < 5,
+                            colors = ButtonDefaults.outlinedButtonColors(
+                                containerColor = StudySessionPopupFieldColor,
+                                contentColor = StudySessionPopupFieldTextColor,
+                                disabledContainerColor = StudySessionPopupFieldColor.copy(alpha = 0.42f),
+                                disabledContentColor = StudySessionPopupFieldTextColor.copy(alpha = 0.5f)
+                            ),
+                            border = BorderStroke(1.dp, Color.Black)
+                        ) {
+                            Icon(Icons.Filled.AddPhotoAlternate, contentDescription = null)
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text(if (selectedPhotoUris.isEmpty()) "Add" else "Add more")
+                        }
+                    }
+                    if (selectedPhotoUris.isEmpty()) {
+                        Text(
+                            text = "Add up to 5 photos of notes, slides, or problems you want to work on.",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = StudySessionPopupSecondaryTextColor
+                        )
+                    } else {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .horizontalScroll(rememberScrollState()),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            selectedPhotoUris.forEach { uri ->
+                                StudySessionPhotoPreview(
+                                    uri = uri,
+                                    onRemove = { selectedPhotoUris.remove(uri) }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(
+                        onClick = { closeComposer() },
+                        colors = ButtonDefaults.textButtonColors(contentColor = StudySessionPopupTextColor)
+                    ) {
+                        Text("Cancel")
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = {
+                            StudySessionRepository.add(cafe, draft)?.let {
+                                closeComposer()
+                            }
+                        },
+                        enabled = canCreate,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = StudySessionPopupFieldColor,
+                            contentColor = StudySessionPopupFieldTextColor,
+                            disabledContainerColor = StudySessionPopupFieldColor.copy(alpha = 0.42f),
+                            disabledContentColor = StudySessionPopupFieldTextColor.copy(alpha = 0.5f)
+                        )
+                    ) {
+                        Text("Create")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun StudySessionPhotoPreview(
+    uri: String,
+    onRemove: () -> Unit
+) {
+    Box(modifier = Modifier.size(76.dp)) {
+        OutlinedCard(
+            modifier = Modifier.fillMaxSize(),
+            shape = RoundedCornerShape(8.dp),
+            border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.18f))
+        ) {
+            AsyncImage(
+                model = uri,
+                contentDescription = "Selected study photo",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        }
+        Surface(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(3.dp)
+                .size(24.dp)
+                .clickable { onRemove() },
+            shape = CircleShape,
+            color = Color.Black.copy(alpha = 0.62f),
+            contentColor = Color.White
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    Icons.Filled.Close,
+                    contentDescription = "Remove study photo",
+                    modifier = Modifier.size(14.dp)
+                )
+            }
         }
     }
 }
