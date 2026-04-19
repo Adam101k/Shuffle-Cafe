@@ -37,6 +37,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -58,6 +59,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.scale
@@ -65,7 +67,9 @@ import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.boundsInRoot
@@ -89,6 +93,8 @@ import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.lerp
 import androidx.compose.ui.zIndex
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
@@ -1993,9 +1999,15 @@ private fun formatDistanceAway(distanceMeters: Float?): String? {
     if (distanceMeters == null) return null
 
     return if (distanceMeters < 1609.344f) {
-        "${distanceMeters.toInt()} m away"
+        "${distanceMeters.toInt()} m"
     } else {
-        String.format(Locale.US, "%.1f mi away", distanceMeters / 1609.344f)
+        val milesTenths = ((distanceMeters / 1609.344f) * 10).roundToInt()
+        val milesText = if (milesTenths % 10 == 0) {
+            (milesTenths / 10).toString()
+        } else {
+            String.format(Locale.US, "%.1f", milesTenths / 10f)
+        }
+        "$milesText mi"
     }
 }
 
@@ -3179,7 +3191,13 @@ private fun CompactDetailInfoBubble(
     iconName: String,
     value: String,
     modifier: Modifier = Modifier,
-    copyLabel: String? = null
+    copyLabel: String? = null,
+    height: Dp = 42.dp,
+    iconSize: Dp = 18.dp,
+    horizontalPadding: Dp = 10.dp,
+    horizontalSpacing: Dp = 7.dp,
+    useCompactText: Boolean = true,
+    fillBubbleWidth: Boolean = true
 ) {
     val context = LocalContext.current
     val canCopy = copyLabel != null && !isPhoneUnavailable(value)
@@ -3196,10 +3214,12 @@ private fun CompactDetailInfoBubble(
     }
 
     Box(modifier = modifier) {
+        val bubbleModifier = Modifier
+            .height(height)
+            .then(if (fillBubbleWidth) Modifier.fillMaxWidth() else Modifier)
+
         Surface(
-            modifier = Modifier
-                .fillMaxWidth()
-                .height(42.dp)
+            modifier = bubbleModifier
                 .clickable {
                     tooltipMessage = "$iconName: $value"
                     showCopyAction = canCopy
@@ -3210,20 +3230,20 @@ private fun CompactDetailInfoBubble(
             shadowElevation = 1.dp
         ) {
             Row(
-                modifier = Modifier.padding(horizontal = 10.dp),
+                modifier = Modifier.padding(horizontal = horizontalPadding),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(7.dp)
+                horizontalArrangement = Arrangement.spacedBy(horizontalSpacing)
             ) {
                 Icon(
                     painter = painterResource(id = iconRes),
                     contentDescription = iconName,
-                    modifier = Modifier.size(18.dp),
+                    modifier = Modifier.size(iconSize),
                     tint = Color.Unspecified
                 )
                 Text(
                     text = value,
-                    modifier = Modifier.weight(1f),
-                    style = MaterialTheme.typography.bodySmall,
+                    modifier = if (fillBubbleWidth) Modifier.weight(1f) else Modifier,
+                    style = if (useCompactText) MaterialTheme.typography.labelSmall else MaterialTheme.typography.bodySmall,
                     fontWeight = FontWeight.SemiBold,
                     color = DetailInfoBubbleTextColor,
                     maxLines = 1,
@@ -3247,6 +3267,58 @@ private fun CompactDetailInfoBubble(
                 tooltipMessage = null
                 showCopyAction = false
             }
+        )
+    }
+}
+
+@Composable
+private fun CardInfoBubble(
+    iconRes: Int,
+    iconName: String,
+    value: String,
+    modifier: Modifier = Modifier,
+    copyLabel: String? = null,
+    fillBubbleWidth: Boolean = true
+) {
+    CompactDetailInfoBubble(
+        iconRes = iconRes,
+        iconName = iconName,
+        value = value,
+        modifier = modifier,
+        copyLabel = copyLabel,
+        height = 36.dp,
+        iconSize = 15.dp,
+        horizontalPadding = 8.dp,
+        horizontalSpacing = 5.dp,
+        useCompactText = true,
+        fillBubbleWidth = fillBubbleWidth
+    )
+}
+
+@Composable
+private fun CardTodayHoursBubble(
+    hours: LinkedHashMap<String, String>,
+    modifier: Modifier = Modifier
+) {
+    val todayName = currentWeekdayName()
+    val summaryText = remember(hours, todayName) {
+        val displayHours = if (hours.isEmpty()) linkedMapOf("Hours" to "Hours unavailable") else hours
+        todayFirstHoursEntries(displayHours, todayName)
+            .firstOrNull()
+            ?.let { formatHoursLabel(it.first, it.second) }
+            ?: "Hours unavailable"
+    }
+
+    BoxWithConstraints(
+        modifier = modifier.fillMaxWidth(),
+        contentAlignment = Alignment.Center
+    ) {
+        CardInfoBubble(
+            iconRes = R.drawable.calender,
+            iconName = "Today's hours",
+            value = summaryText,
+            modifier = Modifier.widthIn(max = maxWidth * 0.92f),
+            fillBubbleWidth = false
         )
     }
 }
@@ -3474,7 +3546,7 @@ fun HoursDropdown(hours: LinkedHashMap<String, String>) {
                     Text(
                         text = summaryText,
                         modifier = Modifier.widthIn(max = maxTextWidth),
-                        style = MaterialTheme.typography.bodyLarge,
+                        style = MaterialTheme.typography.labelSmall,
                         fontWeight = FontWeight.SemiBold,
                         color = DetailInfoBubbleTextColor,
                         textAlign = TextAlign.Center,
@@ -3504,7 +3576,7 @@ fun HoursDropdown(hours: LinkedHashMap<String, String>) {
                             modifier = Modifier
                                 .widthIn(max = maxTextWidth)
                                 .padding(vertical = 3.dp),
-                            style = MaterialTheme.typography.bodyMedium,
+                            style = MaterialTheme.typography.labelSmall,
                             fontWeight = FontWeight.SemiBold,
                             color = DetailInfoBubbleTextColor,
                             textAlign = TextAlign.Center
@@ -3554,6 +3626,12 @@ private val StudySessionCafeButtonColor = Color(0xFFB44436)
 private val CrowdActionBubbleSize = 42.dp
 private const val CROWD_TOOLTIP_DISPLAY_MILLIS = 2400L
 
+private data class VisitorPhotoViewerState(
+    val title: String,
+    val photoUris: List<String>,
+    val initialIndex: Int
+)
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 private fun CafeCrowdAttributesPanel(
@@ -3563,6 +3641,7 @@ private fun CafeCrowdAttributesPanel(
 ) {
     val panelTextColor = LocalContentColor.current
     var showSuggestionSheet by remember { mutableStateOf(false) }
+    var visitorPhotoViewerState by remember(cafe.id) { mutableStateOf<VisitorPhotoViewerState?>(null) }
 
     Column(
         modifier = modifier.fillMaxWidth(),
@@ -3601,12 +3680,14 @@ private fun CafeCrowdAttributesPanel(
             CrowdAttributeBubble(
                 iconRes = R.drawable.seating_availability,
                 iconName = "Seating Availability",
-                value = attributes.seatingAvailability.label
+                value = attributes.seatingAvailability.label,
+                iconSize = 26.dp
             )
             CrowdAttributeBubble(
                 iconRes = R.drawable.seating_space,
                 iconName = "Seating space",
-                value = attributes.seatingSpace.label
+                value = attributes.seatingSpace.label,
+                iconSize = 26.dp
             )
             CrowdAttributeBubble(
                 iconRes = R.drawable.seating_comfort,
@@ -3653,14 +3734,34 @@ private fun CafeCrowdAttributesPanel(
             )
         }
 
-        CrowdAttributePlainSection(title = "Photos from visitors") {
-            DraftPhotoList(
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalAlignment = Alignment.Top
+        ) {
+            VisitorPhotoCarousel(
                 title = "Seating photos",
-                photoUris = attributes.seatingPhotoUris
+                photoUris = attributes.seatingPhotoUris,
+                modifier = Modifier.weight(1f),
+                onPhotoClick = { index ->
+                    visitorPhotoViewerState = VisitorPhotoViewerState(
+                        title = "Seating photos",
+                        photoUris = attributes.seatingPhotoUris,
+                        initialIndex = index
+                    )
+                }
             )
-            DraftPhotoList(
-                title = "Menu photos",
-                photoUris = attributes.menuPhotoUris
+            VisitorPhotoCarousel(
+                title = "Menu Photos",
+                photoUris = attributes.menuPhotoUris,
+                modifier = Modifier.weight(1f),
+                onPhotoClick = { index ->
+                    visitorPhotoViewerState = VisitorPhotoViewerState(
+                        title = "Menu Photos",
+                        photoUris = attributes.menuPhotoUris,
+                        initialIndex = index
+                    )
+                }
             )
         }
 
@@ -3683,6 +3784,17 @@ private fun CafeCrowdAttributesPanel(
             )
         }
     }
+
+    visitorPhotoViewerState
+        ?.takeIf { it.photoUris.isNotEmpty() }
+        ?.let { viewerState ->
+            VisitorPhotoFullScreenViewer(
+                title = viewerState.title,
+                photoUris = viewerState.photoUris,
+                initialPage = viewerState.initialIndex,
+                onDismiss = { visitorPhotoViewerState = null }
+            )
+        }
 }
 
 @Composable
@@ -4074,7 +4186,8 @@ private fun CrowdAttributeBubble(
     iconRes: Int,
     iconName: String,
     value: String,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    iconSize: Dp = 20.dp
 ) {
     val displayValue = value.displayCrowdBubbleValue()
     var tooltipMessage by remember(iconName, value) { mutableStateOf<String?>(null) }
@@ -4104,7 +4217,7 @@ private fun CrowdAttributeBubble(
         ) {
             if (displayValue == null) {
                 Box(contentAlignment = Alignment.Center) {
-                    CrowdBubbleIcon(iconRes = iconRes, contentDescription = iconName)
+                    CrowdBubbleIcon(iconRes = iconRes, contentDescription = iconName, size = iconSize)
                 }
             } else {
                 Row(
@@ -4114,7 +4227,7 @@ private fun CrowdAttributeBubble(
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    CrowdBubbleIcon(iconRes = iconRes, contentDescription = iconName)
+                    CrowdBubbleIcon(iconRes = iconRes, contentDescription = iconName, size = iconSize)
                     Text(
                         text = displayValue,
                         style = MaterialTheme.typography.bodyMedium,
@@ -4137,7 +4250,8 @@ private fun CrowdAttributeBubble(
 private fun CrowdBubbleIcon(
     iconRes: Int,
     contentDescription: String,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    size: Dp = 20.dp
 ) {
     val resources = LocalContext.current.resources
     val hasDrawableResource = remember(resources, iconRes) {
@@ -4150,14 +4264,14 @@ private fun CrowdBubbleIcon(
         Icon(
             painter = painterResource(id = iconRes),
             contentDescription = contentDescription,
-            modifier = modifier.size(20.dp),
+            modifier = modifier.size(size),
             tint = Color.Black
         )
     } else {
         Icon(
             imageVector = Icons.Filled.Info,
             contentDescription = contentDescription,
-            modifier = modifier.size(20.dp),
+            modifier = modifier.size(size),
             tint = Color.Black
         )
     }
@@ -4178,14 +4292,14 @@ private fun CrowdAttributeBubbleWithProtectedKey(
     isCopyable: Boolean
 ) {
     Row(
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(6.dp)
+        verticalAlignment = Alignment.CenterVertically
     ) {
         CrowdAttributeBubble(
             iconRes = iconRes,
             iconName = iconName,
             value = value
         )
+        ProtectedKeyConnectorLine()
         ProtectedSecretKeyBubble(
             keyIconRes = keyIconRes,
             keyIconName = keyIconName,
@@ -4197,6 +4311,16 @@ private fun CrowdAttributeBubbleWithProtectedKey(
             isCopyable = isCopyable
         )
     }
+}
+
+@Composable
+private fun ProtectedKeyConnectorLine() {
+    Box(
+        modifier = Modifier
+            .width(20.dp)
+            .height(3.6.dp)
+            .background(CrowdAttributeBubbleColor, RoundedCornerShape(2.dp))
+    )
 }
 
 @Composable
@@ -4329,32 +4453,382 @@ private fun Set<VibeTag>.displayVibeValue(): String {
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun DraftPhotoList(title: String, photoUris: List<String>) {
+private fun VisitorPhotoCarousel(
+    title: String,
+    photoUris: List<String>,
+    modifier: Modifier = Modifier,
+    onPhotoClick: (Int) -> Unit
+) {
     val textColor = LocalContentColor.current
 
-    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text(title, color = textColor, style = MaterialTheme.typography.bodyMedium)
+    Column(
+        modifier = modifier,
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(6.dp)
+    ) {
+        Text(
+            text = title,
+            color = CrowdAttributeBubbleColor,
+            style = MaterialTheme.typography.bodySmall,
+            fontWeight = FontWeight.SemiBold,
+            textAlign = TextAlign.Center,
+            modifier = Modifier.fillMaxWidth()
+        )
         if (photoUris.isEmpty()) {
-            Text("No visitor photos yet.", color = textColor.copy(alpha = 0.72f), style = MaterialTheme.typography.bodySmall)
+            Text(
+                text = "No visitor photos yet.",
+                color = textColor.copy(alpha = 0.72f),
+                style = MaterialTheme.typography.bodySmall,
+                textAlign = TextAlign.Center
+            )
         } else {
-            photoUris.forEachIndexed { index, uri ->
-                OutlinedCard(
+            val pagerState = rememberPagerState(pageCount = { photoUris.size })
+
+            OutlinedCard(
+                modifier = Modifier
+                    .fillMaxWidth(0.9f)
+                    .widthIn(max = 142.dp)
+                    .aspectRatio(3f / 4f),
+                shape = RoundedCornerShape(8.dp),
+                border = BorderStroke(1.dp, Color.Black),
+                colors = CardDefaults.outlinedCardColors(
+                    containerColor = CoffeeLight,
+                    contentColor = Color.Black
+                )
+            ) {
+                HorizontalPager(
+                    state = pagerState,
+                    modifier = Modifier.fillMaxSize()
+                ) { page ->
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .clickable { onPhotoClick(page) }
+                            .padding(8.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        AsyncImage(
+                            model = photoUris[page],
+                            contentDescription = "$title ${page + 1}",
+                            modifier = Modifier.fillMaxSize(),
+                            contentScale = ContentScale.Fit
+                        )
+                    }
+                }
+            }
+
+            if (photoUris.size > 1) {
+                Row(
                     modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(8.dp),
-                    border = BorderStroke(1.dp, Color.Black),
-                    colors = CardDefaults.outlinedCardColors(
-                        containerColor = CoffeeLight,
-                        contentColor = Color.Black
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    VisitorPhotoPageIndicator(
+                        currentPage = pagerState.currentPage,
+                        pageCount = photoUris.size,
+                        activeColor = textColor,
+                        inactiveColor = textColor.copy(alpha = 0.38f)
                     )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "${pagerState.currentPage + 1} / ${photoUris.size}",
+                        color = textColor.copy(alpha = 0.78f),
+                        style = MaterialTheme.typography.labelSmall
+                    )
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun VisitorPhotoFullScreenViewer(
+    title: String,
+    photoUris: List<String>,
+    initialPage: Int,
+    onDismiss: () -> Unit
+) {
+    if (photoUris.isEmpty()) return
+
+    val startPage = initialPage.coerceIn(0, photoUris.lastIndex)
+    val pagerState = rememberPagerState(
+        initialPage = startPage,
+        pageCount = { photoUris.size }
+    )
+    var zoomScale by remember { mutableStateOf(1f) }
+    var zoomOffset by remember { mutableStateOf(Offset.Zero) }
+
+    LaunchedEffect(pagerState.currentPage) {
+        zoomScale = 1f
+        zoomOffset = Offset.Zero
+    }
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        BackHandler(enabled = true) {
+            onDismiss()
+        }
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(Color.Black.copy(alpha = 0.94f))
+        ) {
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(horizontal = 12.dp, vertical = 84.dp),
+                userScrollEnabled = zoomScale <= 1.01f
+            ) { page ->
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .pointerInput(page) {
+                            awaitEachGesture {
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    val pressedCount = event.changes.count { it.pressed }
+                                    if (pressedCount == 0) break
+
+                                    val isMultiTouch = pressedCount > 1
+                                    if (isMultiTouch || zoomScale > 1f) {
+                                        val pressedChanges = event.changes.filter { it.pressed }
+                                        val currentCentroid = pressedChanges
+                                            .map { it.position }
+                                            .averageOffset()
+                                        val previousCentroid = pressedChanges
+                                            .map { it.previousPosition }
+                                            .averageOffset()
+                                        val zoomChange = if (isMultiTouch) {
+                                            pressedChanges.pointerZoomChange(currentCentroid, previousCentroid)
+                                        } else {
+                                            1f
+                                        }
+                                        val panChange = currentCentroid - previousCentroid
+                                        val updatedScale = (zoomScale * zoomChange).coerceIn(1f, 5f)
+
+                                        zoomScale = updatedScale
+                                        zoomOffset = if (updatedScale > 1f) {
+                                            zoomOffset + panChange
+                                        } else {
+                                            Offset.Zero
+                                        }
+
+                                        event.changes.forEach { change ->
+                                            if (change.positionChanged()) {
+                                                change.consume()
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    AsyncImage(
+                        model = photoUris[page],
+                        contentDescription = "$title ${page + 1}",
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer {
+                                scaleX = zoomScale
+                                scaleY = zoomScale
+                                translationX = zoomOffset.x
+                                translationY = zoomOffset.y
+                            },
+                        contentScale = ContentScale.Fit
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .fillMaxWidth()
+                    .background(
+                        Brush.verticalGradient(
+                            listOf(Color.Black.copy(alpha = 0.68f), Color.Transparent)
+                        )
+                    )
+                    .padding(horizontal = 12.dp, vertical = 16.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(
+                    onClick = onDismiss,
+                    modifier = Modifier.background(Color.White.copy(alpha = 0.16f), CircleShape)
+                ) {
+                    Icon(Icons.Filled.Close, contentDescription = "Close photo viewer", tint = Color.White)
+                }
+                Column(
+                    modifier = Modifier
+                        .weight(1f)
+                        .padding(horizontal = 12.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally
                 ) {
                     Text(
-                        text = "Draft ${index + 1}: $uri",
-                        modifier = Modifier.padding(10.dp),
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 2,
-                        color = Color.Black
+                        text = title,
+                        color = Color.White,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
                     )
+                    if (photoUris.size > 1) {
+                        Text(
+                            text = "${pagerState.currentPage + 1} / ${photoUris.size}",
+                            color = Color.White.copy(alpha = 0.78f),
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+                Spacer(modifier = Modifier.size(48.dp))
+            }
+
+            if (photoUris.size > 1) {
+                VisitorPhotoPageIndicator(
+                    currentPage = pagerState.currentPage,
+                    pageCount = photoUris.size,
+                    activeColor = Color.White,
+                    inactiveColor = Color.White.copy(alpha = 0.38f),
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 28.dp)
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun VisitorPhotoPageIndicator(
+    currentPage: Int,
+    pageCount: Int,
+    activeColor: Color,
+    inactiveColor: Color,
+    modifier: Modifier = Modifier
+) {
+    if (pageCount <= 1) return
+
+    Row(
+        modifier = modifier,
+        horizontalArrangement = Arrangement.spacedBy(6.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        repeat(pageCount) { page ->
+            Box(
+                modifier = Modifier
+                    .size(if (page == currentPage) 8.dp else 6.dp)
+                    .background(
+                        color = if (page == currentPage) activeColor else inactiveColor,
+                        shape = CircleShape
+                    )
+            )
+        }
+    }
+}
+
+private fun List<Offset>.averageOffset(): Offset {
+    if (isEmpty()) return Offset.Zero
+
+    var x = 0f
+    var y = 0f
+    forEach { offset ->
+        x += offset.x
+        y += offset.y
+    }
+
+    return Offset(x / size, y / size)
+}
+
+private fun List<PointerInputChange>.pointerZoomChange(
+    currentCentroid: Offset,
+    previousCentroid: Offset
+): Float {
+    if (size < 2) return 1f
+
+    var currentDistance = 0f
+    var previousDistance = 0f
+    forEach { change ->
+        currentDistance += (change.position - currentCentroid).getDistance()
+        previousDistance += (change.previousPosition - previousCentroid).getDistance()
+    }
+
+    return if (previousDistance > 0f) currentDistance / previousDistance else 1f
+}
+
+private fun addPickedPhotoUris(
+    target: SnapshotStateList<String>,
+    uris: List<Uri>
+) {
+    uris
+        .map(Uri::toString)
+        .forEach { uriText ->
+            if (uriText !in target) {
+                target.add(uriText)
+            }
+        }
+}
+
+@Composable
+private fun SuggestionPhotoPickerField(
+    title: String,
+    selectedPhotoUris: SnapshotStateList<String>,
+    onPickPhotos: () -> Unit
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text(title, style = MaterialTheme.typography.labelLarge, color = Color.Black)
+        OutlinedButton(
+            onClick = onPickPhotos,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Icon(Icons.Filled.AddPhotoAlternate, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(if (selectedPhotoUris.isEmpty()) "Select photos" else "Add more photos")
+        }
+        if (selectedPhotoUris.isEmpty()) {
+            Text(
+                text = "No photos selected yet.",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.Black.copy(alpha = 0.64f)
+            )
+        } else {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                selectedPhotoUris.forEachIndexed { index, uri ->
+                    OutlinedCard(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(120.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.38f))
+                    ) {
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            AsyncImage(
+                                model = uri,
+                                contentDescription = "$title selection ${index + 1}",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Crop
+                            )
+                            IconButton(
+                                onClick = { selectedPhotoUris.removeAt(index) },
+                                modifier = Modifier
+                                    .align(Alignment.TopEnd)
+                                    .padding(6.dp)
+                                    .background(Color.Black.copy(alpha = 0.45f), CircleShape)
+                            ) {
+                                Icon(
+                                    Icons.Filled.Close,
+                                    contentDescription = "Remove photo",
+                                    tint = Color.White
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -4385,8 +4859,18 @@ private fun CrowdAttributeSuggestionForm(
     var petFriendly by remember(cafe.id, attributes) { mutableStateOf(attributes.petFriendly) }
     var cleanlinessRating by remember(cafe.id, attributes) { mutableStateOf(attributes.cleanlinessRating) }
     var selectedVibeTags by remember(cafe.id, attributes) { mutableStateOf(attributes.vibeTags) }
-    var seatingPhotoUri by remember(cafe.id) { mutableStateOf("") }
-    var menuPhotoUri by remember(cafe.id) { mutableStateOf("") }
+    val selectedSeatingPhotoUris = remember(cafe.id) { mutableStateListOf<String>() }
+    val selectedMenuPhotoUris = remember(cafe.id) { mutableStateListOf<String>() }
+    val seatingPhotoPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetMultipleContents()
+    ) { uris ->
+        addPickedPhotoUris(selectedSeatingPhotoUris, uris)
+    }
+    val menuPhotoPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetMultipleContents()
+    ) { uris ->
+        addPickedPhotoUris(selectedMenuPhotoUris, uris)
+    }
 
     LazyColumn(
         modifier = modifier.fillMaxWidth(),
@@ -4504,21 +4988,17 @@ private fun CrowdAttributeSuggestionForm(
                 )
             }
             item {
-                OutlinedTextField(
-                    value = seatingPhotoUri,
-                    onValueChange = { seatingPhotoUri = it },
-                    label = { Text("Seating photo URI") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true
+                SuggestionPhotoPickerField(
+                    title = "Seating photos",
+                    selectedPhotoUris = selectedSeatingPhotoUris,
+                    onPickPhotos = { seatingPhotoPicker.launch("image/*") }
                 )
             }
             item {
-                OutlinedTextField(
-                    value = menuPhotoUri,
-                    onValueChange = { menuPhotoUri = it },
-                    label = { Text("Menu photo URI") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true
+                SuggestionPhotoPickerField(
+                    title = "Menu photos",
+                    selectedPhotoUris = selectedMenuPhotoUris,
+                    onPickPhotos = { menuPhotoPicker.launch("image/*") }
                 )
             }
             item {
@@ -4547,8 +5027,8 @@ private fun CrowdAttributeSuggestionForm(
                                 vibeTags = selectedVibeTags,
                                 petFriendly = petFriendly,
                                 cleanlinessRating = cleanlinessRating,
-                                seatingPhotoUris = listOf(seatingPhotoUri),
-                                menuPhotoUris = listOf(menuPhotoUri)
+                                seatingPhotoUris = selectedSeatingPhotoUris.toList(),
+                                menuPhotoUris = selectedMenuPhotoUris.toList()
                             )
                         )
                         onSubmit()
@@ -5297,24 +5777,36 @@ fun PlaceCard(
             }) {
                 AsyncImage(
                     model = cafe.primaryImageModel(),
-                    contentDescription = null,
+                    contentDescription = cafe.name,
                     modifier = Modifier.fillMaxSize(),
                     contentScale = ContentScale.Crop
                 )
                 val isBookmarked = BookmarkRepository.isBookmarked(cafe.id)
-                IconButton(onClick = { BookmarkRepository.toggle(cafe.id) }, modifier = Modifier.align(Alignment.TopStart).padding(10.dp).background(Color.Black.copy(alpha = 0.35f), CircleShape)) {
+                IconButton(onClick = { BookmarkRepository.toggle(cafe.id) }, modifier = Modifier.align(Alignment.TopEnd).padding(10.dp).background(Color.Black.copy(alpha = 0.35f), CircleShape)) {
                     Icon(imageVector = if (isBookmarked) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder, contentDescription = if (isBookmarked) "Remove bookmark" else "Add bookmark", tint = Color.White)
                 }
-                Box(modifier = Modifier.fillMaxWidth().height(72.dp).align(Alignment.BottomCenter).background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(0.5f)))))
-                Row(modifier = Modifier.align(Alignment.BottomCenter).padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
-                    Icon(Icons.Filled.Search, contentDescription = null, tint = Color.White); Spacer(Modifier.width(8.dp)); Text("More like this", color = Color.White, modifier = Modifier.weight(1f))
-                    Surface(modifier = Modifier.padding(0.dp), shape = CircleShape, color = Color.White.copy(alpha = 0.25f)) { IconButton(onClick = { }) { Icon(Icons.Filled.Share, contentDescription = null, tint = Color.White) } }
+                Box(modifier = Modifier.fillMaxWidth().height(100.dp).align(Alignment.BottomCenter).background(Brush.verticalGradient(listOf(Color.Transparent, Color.Black.copy(alpha = 0.5f)))))
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomStart)
+                        .padding(horizontal = 20.dp, vertical = 18.dp)
+                ) {
+                    Text(
+                        text = cafe.name,
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
                 }
             }
-            Column(modifier = Modifier.padding(12.dp)) {
+            Column(
+                modifier = Modifier.padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
                 val rating = cafe.rating
                 val reviewCount = cafe.userRatingCount ?: 0
-                Text(cafe.name, style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, color = cardTextColor)
                 if (rating != null && reviewCount > 0) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         RatingStars(rating)
@@ -5324,14 +5816,36 @@ fun PlaceCard(
                 } else {
                     Text("No ratings yet", color = cardSecondaryTextColor, style = MaterialTheme.typography.bodySmall)
                 }
-                cafe.distanceMeters?.let { distanceMeters ->
-                    Text(
-                        text = formatDistanceAway(distanceMeters) ?: "",
-                        color = cardTextColor,
-                        style = MaterialTheme.typography.bodySmall
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    CompactDetailInfoBubble(
+                        iconRes = R.drawable.distance,
+                        iconName = "Distance",
+                        value = formatDistanceAway(cafe.distanceMeters) ?: "Distance unavailable",
+                        modifier = Modifier.weight(1f)
+                    )
+                    CompactDetailInfoBubble(
+                        iconRes = R.drawable.address,
+                        iconName = "Address",
+                        value = cafe.address,
+                        modifier = Modifier.weight(1f)
+                    )
+                    CompactDetailInfoBubble(
+                        iconRes = R.drawable.phone,
+                        iconName = "Phone",
+                        value = cafe.phone,
+                        modifier = Modifier.weight(1f),
+                        copyLabel = "${cafe.name} phone number"
                     )
                 }
-                Text(cafe.address, style = MaterialTheme.typography.bodySmall, color = cardSecondaryTextColor)
+                CardTodayHoursBubble(
+                    hours = cafe.hours,
+                    modifier = Modifier.fillMaxWidth()
+                )
             }
         }
     }
@@ -5532,18 +6046,21 @@ fun ExpandedCafeDetailOverlay(
                         modifier = Modifier.padding(horizontal = 20.dp),
                         verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        if (cafe.rating != null && (cafe.userRatingCount ?: 0) > 0) {
+                        val rating = cafe.rating
+                        val reviewCount = cafe.userRatingCount ?: 0
+                        if (rating != null && reviewCount > 0) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
-                                RatingStars(cafe.rating)
-                                Spacer(modifier = Modifier.width(8.dp))
+                                RatingStars(rating)
+                                Spacer(Modifier.width(8.dp))
                                 Text(
-                                    text = String.format(Locale.US, "%.1f (%d reviews)", cafe.rating, cafe.userRatingCount ?: 0),
-                                    color = detailSecondaryTextColor
+                                    text = String.format(Locale.US, "%.1f (%d Reviews)", rating, reviewCount),
+                                    color = detailSecondaryTextColor,
+                                    style = MaterialTheme.typography.bodySmall
                                 )
                             }
+                        } else {
+                            Text("No ratings yet", color = detailSecondaryTextColor, style = MaterialTheme.typography.bodySmall)
                         }
-
-                        Text(cafe.status, color = detailTextColor, style = MaterialTheme.typography.bodyMedium)
                         Row(
                             modifier = Modifier.fillMaxWidth(),
                             horizontalArrangement = Arrangement.spacedBy(8.dp),
