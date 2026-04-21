@@ -4617,7 +4617,13 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically
                 ) {
-                    Spacer(Modifier.width(40.dp)) // keeps title centered-ish
+                    IconButton(onClick = { navController.popBackStack() }) {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowBack,
+                            contentDescription = "Back",
+                            tint = detailTextColor
+                        )
+                    }
 
                     Text(
                         cafe.name,
@@ -9050,520 +9056,959 @@ data class Profile(
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun ProfileScreen(navController: NavHostController) {
-
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
-    val placesClient = remember(context) { if (Places.isInitialized()) Places.createClient(context) else null }
-    val backgroundColor = CoffeeLight
-    val cardColor = CoffeeSurfaceLight
-    val primaryTextColor = CafeDark
-    val secondaryTextColor = CoffeeDark.copy(alpha = 0.78f)
-    val allRecentCafes = RecentRepository.cafes()
-    val recentCafes = allRecentCafes.take(3)
 
     var profile by remember { mutableStateOf<Profile?>(null) }
     var bioText by remember { mutableStateOf("") }
     var avatarUri by remember { mutableStateOf<Uri?>(null) }
-
     var isLoading by remember { mutableStateOf(true) }
-    var selectedRecentCafeId by rememberSaveable { mutableStateOf<String?>(null) }
-    var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
-    val detailProgress = remember { Animatable(0f) }
-    val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
-    val interactionSource = remember { MutableInteractionSource() }
-    val selectedRecentCafe = remember(allRecentCafes, selectedRecentCafeId) {
-        selectedRecentCafeId?.let { cafeId ->
-            allRecentCafes.firstOrNull { cafe -> cafe.id == cafeId } ?: CafeRepository.getCafe(cafeId)
-        }
-    }
-    CafeDetailDataEffect(cafe = selectedRecentCafe, placesClient = placesClient)
+    var isEditingBio by remember { mutableStateOf(false) }
+    var noise by remember { mutableIntStateOf(3) }
+    var outlet by remember { mutableIntStateOf(3) }
+    var seating by remember { mutableIntStateOf(3) }
+    var wifi by remember { mutableIntStateOf(3) }
 
-    LaunchedEffect(selectedRecentCafe) {
-        if (selectedRecentCafe != null) {
-            overlayCafe = selectedRecentCafe
-        }
-    }
+    // "saved" | "sessions" | "reviews" | null
+    var activeStat by remember { mutableStateOf<String?>(null) }
 
-    LaunchedEffect(selectedRecentCafeId) {
-        if (selectedRecentCafeId != null) {
-            detailProgress.animateTo(
-                targetValue = 1f,
-                animationSpec = tween(durationMillis = 320, easing = FastOutSlowInEasing)
-            )
-        } else if (overlayCafe != null || detailProgress.value > 0f) {
-            detailProgress.animateTo(
-                targetValue = 0f,
-                animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing)
-            )
-            overlayCafe = null
-        }
-    }
+    val savedCafes = BookmarkRepository.cafes()
+    val studySessions = StudySessionRepository.sessions()
+    val savedCount = savedCafes.size
+    val studySessionCount = studySessions.size
+    val reviewCount = savedCafes.sumOf { ReviewRepository.reviewsFor(it.id).size }
 
-    BackHandler(enabled = selectedRecentCafeId != null) {
-        selectedRecentCafeId = null
-    }
+    val heroBg = Color(0xFF4A231C)
+    val caramel = Color(0xFFC5A07D)
+    val cream = Color(0xFFF6E9D8)
+    val lightBrown = Color(0xFFEAD7CE)
+    val darkBrown = Color(0xFF694B2E)
 
-    // Pick image + upload to DB
     val pickImage = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetContent()
     ) { uri ->
-
         if (uri != null) {
             avatarUri = uri
-
             scope.launch {
-
-                val user = supabase.auth.currentUserOrNull()
-                if (user == null) return@launch
-
+                val user = supabase.auth.currentUserOrNull() ?: return@launch
                 try {
-                    val inputStream = context.contentResolver.openInputStream(uri)
-                    val bytes = inputStream?.readBytes() ?: return@launch
-
+                    val bytes = context.contentResolver.openInputStream(uri)?.readBytes()
+                        ?: return@launch
                     val fileName = "${user.id}.png"
-
-                    // Upload to storage
-                    supabase.storage
-                        .from("avatars")
-                        .upload(
-                            path = fileName,
-                            data = bytes
-                        ) {
-                            upsert = true
-                        }
-
-                    println("Upload success!")
-
-                    val publicUrl = supabase.storage
-                        .from("avatars")
-                        .publicUrl(fileName)
-
-                    // Save URL in profiles table
+                    supabase.storage.from("avatars")
+                        .upload(path = fileName, data = bytes) { upsert = true }
+                    val publicUrl = supabase.storage.from("avatars").publicUrl(fileName)
                     supabase.from("profiles")
                         .update(mapOf("avatar_url" to publicUrl)) {
-                            filter {
-                                eq("id", user.id)
-                            }
+                            filter { eq("id", user.id) }
                         }
-
-                    // update profile?? might not be needed
                     profile = profile?.copy(avatar_url = publicUrl)
-
                 } catch (e: Exception) {
-                    println("Upload failed: ${e.message}")
                     e.printStackTrace()
                 }
             }
         }
     }
 
-    // Fetch the profile
     LaunchedEffect(Unit) {
         val user = supabase.auth.currentUserOrNull()
-
         if (user != null) {
             try {
-                val result = supabase
-                    .from("profiles")
-                    .select {
-                        filter {
-                            eq("id", user.id)
-                        }
-                    }
+                val result = supabase.from("profiles")
+                    .select { filter { eq("id", user.id) } }
                     .decodeSingle<Profile>()
-
                 profile = result
                 bioText = result.bio ?: ""
-
+            } catch (e: Exception) {
+                e.printStackTrace()
+            }
+            try {
+                val prefs = supabase.from("user_preferences")
+                    .select { filter { eq("user_id", user.id) } }
+                    .decodeSingleOrNull<UserPreferences>()
+                prefs?.let {
+                    noise = it.noise_level
+                    outlet = it.outlet_importance
+                    seating = it.seating_importance
+                    wifi = it.wifi_importance
+                }
             } catch (e: Exception) {
                 e.printStackTrace()
             }
         }
-
-        isLoading = false;
+        isLoading = false
     }
 
     if (isLoading) {
-
         Box(
-            modifier = Modifier
-                .fillMaxSize()
-                .background(backgroundColor),
+            modifier = Modifier.fillMaxSize().background(heroBg),
             contentAlignment = Alignment.Center
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                CircularProgressIndicator(color = CafeDark)
-                Spacer(modifier = Modifier.height(12.dp))
-                Text("Loading profile...", color = primaryTextColor)
+                CircularProgressIndicator(color = caramel)
+                Spacer(Modifier.height(12.dp))
+                Text("Loading profile...", color = cream)
             }
         }
-
+        return
     }
 
-    else {
-        Box(modifier = Modifier.fillMaxSize()) {
-            Scaffold(
-                bottomBar = {
-                    BottomNavBar(
-                        navController = navController,
-                        enabled = detailProgress.value < 0.01f,
-                        dimFraction = detailProgress.value
-                    )
-                },
-                containerColor = backgroundColor
-            ) { innerPadding ->
-
-            LazyColumn(
-                modifier = Modifier
-                    .padding(innerPadding)
-                    .fillMaxSize()
-                    .padding(horizontal = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp),
-                contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp)
-            ) {
-
-                // Notifications
-                item {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.End
-                    ) {
-                        IconButton(onClick = { }) {
-                            Icon(
-                                Icons.Filled.Notifications,
-                                contentDescription = "Notifications",
-                                tint = primaryTextColor
-                            )
-                        }
-                    }
-                }
-
-                // Avatar + Name
-                item {
+    Scaffold(
+        bottomBar = { BottomNavBar(navController) },
+        containerColor = cream
+    ) { innerPadding ->
+        LazyColumn(
+            modifier = Modifier
+                .padding(innerPadding)
+                .fillMaxSize(),
+            contentPadding = PaddingValues(bottom = 28.dp)
+        ) {
+            item {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(heroBg)
+                        .padding(horizontal = 20.dp, vertical = 24.dp),
+                    contentAlignment = Alignment.Center
+                ) {
                     Column(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalAlignment = Alignment.CenterHorizontally
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(7.dp)
                     ) {
-
-                        Surface(
-                            shape = CircleShape,
-                            modifier = Modifier.size(72.dp),
-                            color = cardColor,
-                            onClick = { pickImage.launch("image/*") }
-                        ) {
-
-                            when {
-                                avatarUri != null -> {
-                                    AsyncImage(
-                                        model = avatarUri,
-                                        contentDescription = "Profile picture",
-                                        modifier = Modifier.fillMaxSize()
-                                    )
-                                }
-
-                                profile?.avatar_url != null -> {
-                                    AsyncImage(
-                                        model = "${profile?.avatar_url}?t=${System.currentTimeMillis()}",
-                                        contentDescription = "Profile picture",
-                                        modifier = Modifier.fillMaxSize()
-                                    )
-                                }
-
-                                else -> {
-                                    Box(contentAlignment = Alignment.Center) {
-                                        Icon(
-                                            Icons.Filled.Person,
-                                            contentDescription = "Profile picture",
-                                            modifier = Modifier.size(32.dp),
-                                            tint = primaryTextColor
-                                        )
-                                    }
-                                }
-                            }
-                        }
-
-                        Spacer(Modifier.height(8.dp))
-
-                        Text(
-                            text = profile?.let {
-                                val first = it.first_name.takeIf { it.isNotBlank() } ?: ""
-                                val last = it.last_name.takeIf { it.isNotBlank() } ?: ""
-                                if (first.isNotEmpty() || last.isNotEmpty()) "$first $last" else "User"
-                            } ?: "User",
-                            style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.SemiBold,
-                            color = primaryTextColor
-                        )
-                    }
-                }
-
-                // Quick Actions
-                item {
-                    Row(
-                        modifier = Modifier.fillMaxWidth(),
-                        horizontalArrangement = Arrangement.SpaceEvenly
-                    ) {
-                        ProfileAction(Icons.Filled.Star, "Review")
-                        ProfileAction(Icons.Filled.CameraAlt, "Photos")
-                        ProfileAction(Icons.Filled.Group, "Groups")
-                    }
-                }
-
-                // Experience Title
-                item {
-                    Text(
-                        text = "Experience",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold,
-                        color = primaryTextColor
-                    )
-                }
-
-                // Bio/ experience
-                item {
-                    OutlinedCard(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(80.dp),
-                        shape = RoundedCornerShape(8.dp),
-                        colors = CardDefaults.outlinedCardColors(containerColor = cardColor),
-                        border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.18f))
-                    ) {
-
-                        TextField(
-                            value = bioText,
-                            onValueChange = { bioText = it },
+                        // Ring avatar
+                        Box(
                             modifier = Modifier
-                                .fillMaxSize()
-                                .padding(horizontal = 8.dp),
-                            placeholder = { Text("Tell us about yourself...", color = secondaryTextColor) },
-                            colors = TextFieldDefaults.colors(
-                                focusedContainerColor = Color.Transparent,
-                                unfocusedContainerColor = Color.Transparent,
-                                disabledContainerColor = Color.Transparent,
-                                focusedIndicatorColor = Color.Transparent,
-                                unfocusedIndicatorColor = Color.Transparent,
-                                disabledIndicatorColor = Color.Transparent,
-                                cursorColor = primaryTextColor,
-                                focusedTextColor = primaryTextColor,
-                                unfocusedTextColor = primaryTextColor,
-                                focusedPlaceholderColor = secondaryTextColor,
-                                unfocusedPlaceholderColor = secondaryTextColor
-                            )
-                        )
-                    }
-                }
-
-                // Save Bio
-                item {
-                    Button(
-                        onClick = {
-                            scope.launch {
-                                val user = supabase.auth.currentUserOrNull()
-                                if (user != null) {
-                                    supabase.from("profiles")
-                                        .update(mapOf("bio" to bioText)) {
-                                            filter {
-                                                eq("id", user.id)
-                                            }
+                                .size(84.dp)
+                                .clickable { pickImage.launch("image/*") },
+                            contentAlignment = Alignment.Center
+                        ) {
+                            // Outer ring
+                            Surface(
+                                modifier = Modifier.fillMaxSize(),
+                                shape = CircleShape,
+                                color = Color.Transparent,
+                                border = BorderStroke(2.dp, caramel)
+                            ) {}
+                            // Inner avatar
+                            Surface(
+                                modifier = Modifier.size(74.dp),
+                                shape = CircleShape,
+                                color = caramel
+                            ) {
+                                when {
+                                    avatarUri != null ->
+                                        AsyncImage(
+                                            model = avatarUri,
+                                            contentDescription = "Profile picture",
+                                            modifier = Modifier.fillMaxSize(),
+                                            contentScale = ContentScale.Crop
+                                        )
+                                    profile?.avatar_url != null ->
+                                        AsyncImage(
+                                            model = "${profile?.avatar_url}?t=${System.currentTimeMillis()}",
+                                            contentDescription = "Profile picture",
+                                            modifier = Modifier.fillMaxSize(),
+                                            contentScale = ContentScale.Crop
+                                        )
+                                    else ->
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Text(
+                                                text = profile?.let {
+                                                    "${it.first_name.firstOrNull() ?: ""}${it.last_name.firstOrNull() ?: ""}"
+                                                        .uppercase().ifBlank { "?" }
+                                                } ?: "?",
+                                                style = MaterialTheme.typography.headlineMedium,
+                                                fontWeight = FontWeight.SemiBold,
+                                                color = heroBg
+                                            )
                                         }
                                 }
                             }
-                        },
-                        modifier = Modifier.fillMaxWidth(),
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = CoffeeDark,
-                            contentColor = Color.White
+                        }
+
+                        Text(
+                            text = profile?.let {
+                                "${it.first_name.trim()} ${it.last_name.trim()}".trim().ifBlank { "User" }
+                            } ?: "User",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = cream
                         )
-                    ) {
-                        Text("Save")
+
+                        Surface(
+                            shape = CircleShape,
+                            color = caramel.copy(alpha = 0.15f),
+                            border = BorderStroke(1.dp, caramel.copy(alpha = 0.38f))
+                        ) {
+
+                        }
                     }
                 }
+            }
 
-                // Recently viewed
+            item {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 14.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.CenterHorizontally)
+                ) {
+                    ProfileStatPill(
+                        count = savedCount,
+                        label = "SAVED",
+                        isActive = activeStat == "saved",
+                        onClick = { activeStat = if (activeStat == "saved") null else "saved" },
+                        modifier = Modifier.weight(1f)
+                    )
+                    ProfileStatPill(
+                        count = studySessionCount,
+                        label = "SESSIONS",
+                        isActive = activeStat == "sessions",
+                        onClick = { activeStat = if (activeStat == "sessions") null else "sessions" },
+                        modifier = Modifier.weight(1f)
+                    )
+                    ProfileStatPill(
+                        count = reviewCount,
+                        label = "REVIEWS",
+                        isActive = activeStat == "reviews",
+                        onClick = { activeStat = if (activeStat == "reviews") null else "reviews" },
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+
+            if (activeStat != null) {
                 item {
+                    ProfileStatPanel(
+                        activeStat = activeStat!!,
+                        savedCafes = savedCafes,
+                        studySessions = studySessions,
+                        navController = navController,
+                        onClose = { activeStat = null },
+                        modifier = Modifier
+                            .padding(horizontal = 16.dp)
+                            .padding(bottom = 6.dp)
+                    )
+                }
+            }
+
+            // About section
+            item {
+                ProfileSectionCard(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
+                ) {
                     Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
                         verticalAlignment = Alignment.CenterVertically
                     ) {
                         Text(
-                            text = "Recently View",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = primaryTextColor
+                            "ABOUT",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = caramel,
+                            letterSpacing = 0.09.sp
                         )
-
-                        Spacer(Modifier.width(4.dp))
-
-                        Icon(
-                            imageVector = Icons.Filled.ChevronRight,
-                            contentDescription = "View more",
-                            modifier = Modifier.clickable { },
-                            tint = primaryTextColor
-                        )
-                    }
-                }
-
-                if (recentCafes.isEmpty()) {
-                    item {
-                        Text("No recently viewed cafes yet.", color = secondaryTextColor)
-                    }
-                } else {
-                    items(recentCafes, key = { it.id }) { cafe ->
-                        RecentCafeRow(
-                            cafe = cafe,
-                            onClick = {
-                                RecentRepository.add(cafe.id)
-                                selectedRecentCafeId = cafe.id
+                        if (isEditingBio) {
+                            TextButton(
+                                onClick = {
+                                    isEditingBio = false
+                                    scope.launch {
+                                        val user = supabase.auth.currentUserOrNull()
+                                            ?: return@launch
+                                        runCatching {
+                                            supabase.from("profiles")
+                                                .update(mapOf("bio" to bioText)) {
+                                                    filter { eq("id", user.id) }
+                                                }
+                                        }
+                                    }
+                                },
+                                contentPadding = PaddingValues(horizontal = 10.dp, vertical = 3.dp),
+                                colors = ButtonDefaults.textButtonColors(contentColor = caramel)
+                            ) {
+                                Text("Save", style = MaterialTheme.typography.labelSmall)
                             }
-                        )
+                        } else {
+                            ProfileEditChip(onClick = { isEditingBio = true })
+                        }
                     }
-                }
-
-                item {
-
-                    Spacer(modifier = Modifier.height(32.dp))
-
-                    OutlinedButton(
-                        onClick = {
-                            scope.launch {
-                                supabase.auth.signOut()
-                                navController.navigate(Screen.LoginScreen.route) {
-                                    popUpTo(0) { inclusive = true }
-                                }
-                            }
-                        },
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(50.dp),
-                        shape = RoundedCornerShape(12.dp),
-                        border = BorderStroke(1.dp, Color.Red),
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            containerColor = Color.Transparent
+                    Spacer(Modifier.height(8.dp))
+                    if (isEditingBio) {
+                        OutlinedTextField(
+                            value = bioText,
+                            onValueChange = { bioText = it },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(min = 72.dp),
+                            placeholder = {
+                                Text(
+                                    "Tell us about yourself...",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = darkBrown.copy(alpha = 0.4f)
+                                )
+                            },
+                            maxLines = 4,
+                            colors = OutlinedTextFieldDefaults.colors(
+                                focusedTextColor = darkBrown,
+                                unfocusedTextColor = darkBrown,
+                                focusedContainerColor = lightBrown,
+                                unfocusedContainerColor = lightBrown,
+                                focusedBorderColor = caramel,
+                                unfocusedBorderColor = caramel.copy(alpha = 0.4f),
+                                cursorColor = darkBrown
+                            ),
+                            shape = RoundedCornerShape(10.dp)
                         )
-                    ) {
-                        Icon(
-                            imageVector = Icons.Filled.Person, // or Icons.Filled.ExitToApp
-                            contentDescription = "Logout",
-                            tint = Color.Red
-                        )
-                        Spacer(modifier = Modifier.width(8.dp))
-                        Text(
-                            text = "Logout",
-                            color = Color.Red,
-                            style = MaterialTheme.typography.bodyMedium,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                }
-            }
-            }
-
-            if (overlayCafe != null && detailProgress.value > 0f) {
-                val scrimAlpha by animateFloatAsState(
-                    targetValue = 0.2f * detailProgress.value,
-                    animationSpec = tween(durationMillis = 120, easing = FastOutSlowInEasing),
-                    label = "profileDetailScrimAlpha"
-                )
-                val overlayScale by animateFloatAsState(
-                    targetValue = 0.94f + (0.06f * detailProgress.value),
-                    animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
-                    label = "profileDetailOverlayScale"
-                )
-
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .zIndex(20f)
-                        .background(Color.Black.copy(alpha = scrimAlpha))
-                        .clickable(
-                            interactionSource = interactionSource,
-                            indication = null
+                    } else {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(10.dp),
+                            color = lightBrown
                         ) {
-                            selectedRecentCafeId = null
+                            Text(
+                                text = bioText.ifBlank { "Tap edit to add a bio..." },
+                                modifier = Modifier.padding(
+                                    horizontal = 12.dp,
+                                    vertical = 10.dp
+                                ),
+                                style = MaterialTheme.typography.bodySmall,
+                                color = if (bioText.isBlank()) darkBrown.copy(alpha = 0.4f)
+                                else darkBrown,
+                                lineHeight = 20.sp
+                            )
                         }
-                )
+                    }
+                    Spacer(Modifier.height(8.dp))
 
-                ExpandedCafeDetailOverlay(
-                    navController = navController,
-                    cafe = overlayCafe!!,
-                    onClose = { selectedRecentCafeId = null },
-                    cornerRadius = lerp(
-                        detailOverlayLayoutSpec.collapsedCornerRadius,
-                        detailOverlayLayoutSpec.expandedCornerRadius,
-                        detailProgress.value
-                    ),
-                    heroHeight = lerp(
-                        detailOverlayLayoutSpec.collapsedHeroHeight,
-                        detailOverlayLayoutSpec.expandedHeroHeight,
-                        detailProgress.value
-                    ),
-                    sharedHeroModel = overlayCafe!!.primaryImageModel(),
-                    transitionProgress = detailProgress.value,
-                    modifier = Modifier
-                        .align(Alignment.TopCenter)
-                        .zIndex(21f)
-                        .statusBarsPadding()
-                        .navigationBarsPadding()
-                        .padding(
-                            start = detailOverlayLayoutSpec.horizontalInset,
-                            end = detailOverlayLayoutSpec.horizontalInset,
-                            top = detailOverlayLayoutSpec.topInset,
-                            bottom = detailOverlayLayoutSpec.bottomInset
+                }
+            }
+
+            // Preferences
+            item {
+                ProfileSectionCard(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "PREFERENCES",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = caramel,
+                            letterSpacing = 0.09.sp
                         )
-                        .fillMaxWidth()
-                        .graphicsLayer {
-                            alpha = detailProgress.value
-                            scaleX = overlayScale
-                            scaleY = overlayScale
+                        ProfileEditChip(
+                            onClick = { navController.navigate(Screen.Preferences.route) }
+                        )
+                    }
+                    Spacer(Modifier.height(10.dp))
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(16.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(7.dp)
+                        ) {
+                            CompactPrefBar(label = "WiFi", value = wifi)
+                            CompactPrefBar(label = "Seating", value = seating)
                         }
-                )
+                        Column(
+                            modifier = Modifier.weight(1f),
+                            verticalArrangement = Arrangement.spacedBy(7.dp)
+                        ) {
+                            CompactPrefBar(label = "Noise", value = noise)
+                            CompactPrefBar(label = "Outlets", value = outlet)
+                        }
+                    }
+                }
+            }
+
+            // Recently viewed
+            item {
+                val recentCafes = RecentRepository.previewCafes(limit = 3)
+                ProfileSectionCard(
+                    modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            "RECENTLY VIEWED",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = caramel,
+                            letterSpacing = 0.09.sp
+                        )
+                        Text(
+                            "See all",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = caramel,
+                            modifier = Modifier.clickable {
+                                navController.navigate(Screen.MainScreen.route)
+                            }
+                        )
+                    }
+                    Spacer(Modifier.height(8.dp))
+                    if (recentCafes.isEmpty()) {
+                        Text(
+                            "No recently viewed cafes yet.",
+                            color = darkBrown.copy(alpha = 0.45f),
+                            style = MaterialTheme.typography.bodySmall,
+                            modifier = Modifier.padding(vertical = 4.dp)
+                        )
+                    } else {
+                        recentCafes.forEachIndexed { index, cafe ->
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .clickable {
+                                        navController.navigate(
+                                            Screen.CafeDetails.createRoute(cafe.id)
+                                        )
+                                    }
+                                    .padding(vertical = 9.dp),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                Surface(
+                                    modifier = Modifier.size(42.dp),
+                                    shape = RoundedCornerShape(8.dp),
+                                    color = lightBrown
+                                ) {
+                                    AsyncImage(
+                                        model = cafe.heroImageBitmap ?: cafe.imageUrl
+                                        ?: cafe.imageResId,
+                                        contentDescription = cafe.name,
+                                        modifier = Modifier.fillMaxSize(),
+                                        contentScale = ContentScale.Crop
+                                    )
+                                }
+                                Spacer(Modifier.width(10.dp))
+                                Column(modifier = Modifier.weight(1f)) {
+                                    Text(
+                                        cafe.name,
+                                        fontWeight = FontWeight.SemiBold,
+                                        color = darkBrown,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                        style = MaterialTheme.typography.bodySmall
+                                    )
+                                    Text(
+                                        formatDistanceAway(cafe.distanceMeters) ?: cafe.address,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = caramel,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis
+                                    )
+                                }
+                                Icon(
+                                    Icons.Filled.ChevronRight,
+                                    contentDescription = null,
+                                    tint = caramel,
+                                    modifier = Modifier.size(18.dp)
+                                )
+                            }
+                            if (index < recentCafes.lastIndex) {
+                                HorizontalDivider(color = lightBrown)
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Logout
+            item {
+                OutlinedButton(
+                    onClick = {
+                        scope.launch {
+                            supabase.auth.signOut()
+                            navController.navigate(Screen.LoginScreen.route) {
+                                popUpTo(0) { inclusive = true }
+                            }
+                        }
+                    },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp, vertical = 14.dp)
+                        .height(50.dp),
+                    shape = RoundedCornerShape(12.dp),
+                    border = BorderStroke(1.dp, Color.Red),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = Color.Transparent
+                    )
+                ) {
+                    Icon(Icons.Filled.Person, contentDescription = null, tint = Color.Red)
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        "Logout",
+                        color = Color.Red,
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
             }
         }
     }
 }
 
+// Stat Pill
+
 @Composable
-fun ProfileAction( // Removed private
-    icon: ImageVector,
-    label: String
+private fun ProfileStatPill(
+    count: Int,
+    label: String,
+    isActive: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
 ) {
-    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Icon(icon, contentDescription = label, modifier = Modifier.size(28.dp), tint = CafeDark)
-        Spacer(Modifier.height(4.dp))
-        Text(text = label, style = MaterialTheme.typography.bodySmall, color = CoffeeDark)
+    val heroBg = Color(0xFF4A231C)
+    val caramel = Color(0xFFC5A07D)
+
+    Surface(
+        modifier = modifier
+            .height(56.dp)
+            .clickable { onClick() },
+        shape = RoundedCornerShape(20.dp),
+        color = if (isActive) heroBg else Color.White,
+        border = BorderStroke(
+            width = if (isActive) 1.5.dp else 1.dp,
+            color = if (isActive) heroBg else Color(0xFFEAD7CE)
+        ),
+        shadowElevation = if (isActive) 0.dp else 1.dp
+    ) {
+        Column(
+            modifier = Modifier.fillMaxSize(),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = count.toString(),
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = if (isActive) Color(0xFFF6E9D8) else heroBg
+            )
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelSmall,
+                color = if (isActive) caramel else caramel,
+                letterSpacing = 0.3.sp,
+                fontSize = 8.sp
+            )
+        }
     }
 }
 
+// Stat Panel (expands below pills)
 @Composable
-fun RecentItemRow(name: String, address: String) {
+private fun ProfileStatPanel(
+    activeStat: String,
+    savedCafes: List<Cafe>,
+    studySessions: List<StudySession>,
+    navController: NavHostController,
+    onClose: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val heroBg = Color(0xFF4A231C)
+    val caramel = Color(0xFFC5A07D)
+    val cream = Color(0xFFF6E9D8)
+    val lightBrown = Color(0xFFEAD7CE)
+    val darkBrown = Color(0xFF694B2E)
+
+    val title = when (activeStat) {
+        "saved" -> "SAVED CAFES"
+        "sessions" -> "STUDY SESSIONS"
+        "reviews" -> "MY REVIEWS"
+        else -> ""
+    }
+
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        color = Color.White,
+        border = BorderStroke(0.5.dp, lightBrown),
+        shadowElevation = 2.dp
+    ) {
+        Column {
+            // Panel header
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(heroBg, RoundedCornerShape(topStart = 14.dp, topEnd = 14.dp))
+                    .padding(horizontal = 14.dp, vertical = 10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = caramel,
+                    letterSpacing = 0.4.sp,
+                    modifier = Modifier.weight(1f)
+                )
+                Surface(
+                    modifier = Modifier
+                        .size(22.dp)
+                        .clickable { onClose() },
+                    shape = CircleShape,
+                    color = caramel.copy(alpha = 0.25f)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = "Close",
+                            tint = caramel,
+                            modifier = Modifier.size(13.dp)
+                        )
+                    }
+                }
+            }
+
+            // Panel content
+            Column(modifier = Modifier.padding(12.dp)) {
+                when (activeStat) {
+
+                    "saved" -> {
+                        if (savedCafes.isEmpty()) {
+                            Text(
+                                "No saved cafes yet. Swipe right on a cafe to save it.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = darkBrown.copy(alpha = 0.5f),
+                                modifier = Modifier.padding(vertical = 8.dp)
+                            )
+                        } else {
+                            savedCafes.take(5).forEachIndexed { index, cafe ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            navController.navigate(
+                                                Screen.CafeDetails.createRoute(cafe.id)
+                                            )
+                                        }
+                                        .padding(vertical = 7.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Surface(
+                                        modifier = Modifier.size(36.dp),
+                                        shape = RoundedCornerShape(7.dp),
+                                        color = lightBrown
+                                    ) {
+                                        AsyncImage(
+                                            model = cafe.heroImageBitmap ?: cafe.imageUrl
+                                            ?: cafe.imageResId,
+                                            contentDescription = cafe.name,
+                                            modifier = Modifier.fillMaxSize(),
+                                            contentScale = ContentScale.Crop
+                                        )
+                                    }
+                                    Spacer(Modifier.width(10.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            cafe.name,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = darkBrown,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            formatDistanceAway(cafe.distanceMeters)
+                                                ?: "Distance unavailable",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = caramel
+                                        )
+                                    }
+                                    Surface(
+                                        shape = CircleShape,
+                                        color = lightBrown
+                                    ) {
+                                        Text(
+                                            "Saved",
+                                            modifier = Modifier.padding(
+                                                horizontal = 8.dp,
+                                                vertical = 3.dp
+                                            ),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = darkBrown,
+                                            fontSize = 8.sp
+                                        )
+                                    }
+                                }
+                                if (index < minOf(savedCafes.size, 5) - 1) {
+                                    HorizontalDivider(color = lightBrown)
+                                }
+                            }
+                            if (savedCafes.size > 5) {
+                                TextButton(
+                                    onClick = {
+                                        navController.navigate(Screen.BookmarkScreen.route)
+                                    },
+                                    colors = ButtonDefaults.textButtonColors(contentColor = caramel),
+                                    modifier = Modifier.align(Alignment.End)
+                                ) {
+                                    Text(
+                                        "View all ${savedCafes.size}",
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    "sessions" -> {
+                        if (studySessions.isEmpty()) {
+                            Text(
+                                "No study sessions yet. Open a cafe and tap the study icon to create one.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = darkBrown.copy(alpha = 0.5f),
+                                modifier = Modifier.padding(vertical = 8.dp)
+                            )
+                        } else {
+                            studySessions.take(5).forEachIndexed { index, session ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            navController.navigate(
+                                                Screen.CafeDetails.createRoute(session.cafeId)
+                                            )
+                                        }
+                                        .padding(vertical = 7.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Surface(
+                                        modifier = Modifier.size(36.dp),
+                                        shape = RoundedCornerShape(7.dp),
+                                        color = Color(0xFFD5F1FF)
+                                    ) {
+                                        Box(contentAlignment = Alignment.Center) {
+                                            Icon(
+                                                painter = painterResource(id = R.drawable.study),
+                                                contentDescription = null,
+                                                modifier = Modifier.size(20.dp),
+                                                tint = Color.Unspecified
+                                            )
+                                        }
+                                    }
+                                    Spacer(Modifier.width(10.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            session.title,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = darkBrown,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Text(
+                                            "${session.cafeName} · ${session.dateText}",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = caramel,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                    }
+                                    Surface(
+                                        shape = CircleShape,
+                                        color = Color(0xFFD5F1FF)
+                                    ) {
+                                        Text(
+                                            session.timeText,
+                                            modifier = Modifier.padding(
+                                                horizontal = 8.dp,
+                                                vertical = 3.dp
+                                            ),
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = Color(0xFF185FA5),
+                                            fontSize = 8.sp
+                                        )
+                                    }
+                                }
+                                if (index < minOf(studySessions.size, 5) - 1) {
+                                    HorizontalDivider(color = lightBrown)
+                                }
+                            }
+                            if (studySessions.size > 5) {
+                                TextButton(
+                                    onClick = {
+                                        navController.navigate(Screen.BookmarkScreen.route)
+                                    },
+                                    colors = ButtonDefaults.textButtonColors(contentColor = caramel),
+                                    modifier = Modifier.align(Alignment.End)
+                                ) {
+                                    Text(
+                                        "View all ${studySessions.size}",
+                                        style = MaterialTheme.typography.labelSmall
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    "reviews" -> {
+                        val allReviews = savedCafes.flatMap { cafe ->
+                            ReviewRepository.reviewsFor(cafe.id).map { review ->
+                                Pair(cafe, review)
+                            }
+                        }
+                        if (allReviews.isEmpty()) {
+                            Text(
+                                "No reviews yet. Open a cafe and tap \"Write review\" to add one.",
+                                style = MaterialTheme.typography.bodySmall,
+                                color = darkBrown.copy(alpha = 0.5f),
+                                modifier = Modifier.padding(vertical = 8.dp)
+                            )
+                        } else {
+                            allReviews.take(5).forEachIndexed { index, (cafe, review) ->
+                                Row(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .clickable {
+                                            navController.navigate(
+                                                Screen.CafeDetails.createRoute(cafe.id)
+                                            )
+                                        }
+                                        .padding(vertical = 7.dp),
+                                    verticalAlignment = Alignment.Top
+                                ) {
+                                    Surface(
+                                        modifier = Modifier.size(36.dp),
+                                        shape = RoundedCornerShape(7.dp),
+                                        color = lightBrown
+                                    ) {
+                                        AsyncImage(
+                                            model = cafe.heroImageBitmap ?: cafe.imageUrl
+                                            ?: cafe.imageResId,
+                                            contentDescription = cafe.name,
+                                            modifier = Modifier.fillMaxSize(),
+                                            contentScale = ContentScale.Crop
+                                        )
+                                    }
+                                    Spacer(Modifier.width(10.dp))
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text(
+                                            cafe.name,
+                                            fontWeight = FontWeight.SemiBold,
+                                            color = darkBrown,
+                                            style = MaterialTheme.typography.bodySmall,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis
+                                        )
+                                        Spacer(Modifier.height(2.dp))
+                                        Text(
+                                            review,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = darkBrown.copy(alpha = 0.75f),
+                                            maxLines = 2,
+                                            overflow = TextOverflow.Ellipsis,
+                                            lineHeight = 16.sp
+                                        )
+                                    }
+                                }
+                                if (index < minOf(allReviews.size, 5) - 1) {
+                                    HorizontalDivider(color = lightBrown)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+@Composable
+private fun CompactPrefBar(label: String, value: Int, max: Int = 5) {
+    val caramel = Color(0xFFC5A07D)
+    val darkBrown = Color(0xFF694B2E)
+    val lightBrown = Color(0xFFEAD7CE)
+
     Row(
         modifier = Modifier.fillMaxWidth(),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Surface(
-            modifier = Modifier.size(44.dp),
-            shape = RoundedCornerShape(8.dp),
-            color = CoffeeSurfaceLight
-        ) {}
-
-        Spacer(Modifier.width(12.dp))
-
-        Column(modifier = Modifier.weight(1f)) {
-            Text(name, fontWeight = FontWeight.SemiBold, color = CafeDark)
-            Text(
-                address,
-                style = MaterialTheme.typography.bodySmall,
-                color = CoffeeDark.copy(alpha = 0.78f)
+        Text(
+            text = label,
+            modifier = Modifier.width(48.dp),
+            style = MaterialTheme.typography.labelSmall,
+            color = darkBrown,
+            fontSize = 10.sp
+        )
+        Box(
+            modifier = Modifier
+                .weight(1f)
+                .height(4.dp)
+                .background(lightBrown, RoundedCornerShape(2.dp))
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxHeight()
+                    .fillMaxWidth(
+                        fraction = value.coerceIn(0, max).toFloat() / max.toFloat()
+                    )
+                    .background(Color(0xFF694B2E), RoundedCornerShape(2.dp))
             )
         }
+        Spacer(Modifier.width(6.dp))
+        Text(
+            text = value.toString(),
+            modifier = Modifier.width(12.dp),
+            style = MaterialTheme.typography.labelSmall,
+            color = caramel,
+            fontSize = 10.sp,
+            textAlign = TextAlign.End
+        )
+    }
+}
 
-        IconButton(onClick = { }) {
-            Icon(
-                Icons.Filled.BookmarkBorder,
-                contentDescription = "Bookmark",
-                tint = CafeDark
-            )
-        }
+@Composable
+private fun ProfileSectionCard(
+    modifier: Modifier = Modifier,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        color = Color.White,
+        shadowElevation = 1.dp
+    ) {
+        Column(modifier = Modifier.padding(14.dp), content = content)
+    }
+}
+
+@Composable
+private fun ProfileEditChip(onClick: () -> Unit) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(20.dp),
+        color = Color(0xFFC5A07D).copy(alpha = 0.12f),
+        border = BorderStroke(1.dp, Color(0xFFC5A07D).copy(alpha = 0.45f))
+    ) {
+        Text(
+            text = "Edit",
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.labelSmall,
+            color = Color(0xFFC5A07D)
+        )
+    }
+}
+
+@Composable
+private fun ProfileBadgeChip(label: String) {
+    Surface(
+        shape = RoundedCornerShape(20.dp),
+        color = Color(0xFFEAD7CE)
+    ) {
+        Text(
+            text = label,
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
+            style = MaterialTheme.typography.labelSmall,
+            fontWeight = FontWeight.Medium,
+            color = Color(0xFF4A231C)
+        )
     }
 }
 
@@ -9857,10 +10302,29 @@ fun PreferencesScreen(navController: NavHostController) {
                                 wifi_importance = wifi
                             )
                             try {
-                                supabase.from("user_preferences").upsert(prefs)
-                                navController.navigate(Screen.MainScreen.route) {
-                                    popUpTo(0)
+                                val user = supabase.auth.currentUserOrNull() ?: return@launch
+                                val prefs = UserPreferences(
+                                    user_id = user.id,
+                                    noise_level = noise,
+                                    outlet_importance = outlet,
+                                    seating_importance = seating,
+                                    wifi_importance = wifi
+                                )
+
+                                val existing = supabase.from("user_preferences")
+                                    .select { filter { eq("user_id", user.id) } }
+                                    .decodeSingleOrNull<UserPreferences>()
+
+                                if (existing != null) {
+                                    supabase.from("user_preferences")
+                                        .update(prefs) {
+                                            filter { eq("user_id", user.id) }
+                                        }
+                                } else {
+                                    supabase.from("user_preferences").insert(prefs)
                                 }
+
+                                navController.navigate(Screen.MainScreen.route) { popUpTo(0) }
                             } catch (e: Exception) {
                                 e.printStackTrace()
                             }
