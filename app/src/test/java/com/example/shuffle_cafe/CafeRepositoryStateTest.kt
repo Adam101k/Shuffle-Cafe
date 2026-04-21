@@ -1,10 +1,14 @@
 package com.example.shuffle_cafe
 
+import android.graphics.Bitmap
 import com.google.android.gms.maps.model.LatLng
+import com.google.android.libraries.places.api.model.PhotoMetadata
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Before
 import org.junit.Test
@@ -160,6 +164,161 @@ class CafeRepositoryStateTest {
     }
 
     @Test
+    fun cachedCafeEnvelopeIsFreshOnlyWithinThirtyMinuteWindow() {
+        val savedAt = 10_000L
+        val envelope = CachedCafeEnvelope(
+            cityKey = "cache_window",
+            savedAtEpochMillis = savedAt,
+            cafes = emptyList()
+        )
+
+        assertTrue(envelope.isFresh(nowMillis = savedAt + CAFE_RESULT_CACHE_TTL_MILLIS - 1))
+        assertFalse(envelope.isFresh(nowMillis = savedAt + CAFE_RESULT_CACHE_TTL_MILLIS))
+    }
+
+    @Test
+    fun loadedHomeFeedStaysReusableOnlyWhileFreshAndIdle() {
+        val savedAt = 10_000L
+        val loadedFeed = CafeFeedUiState(
+            cafes = listOf(testCafe(id = "fresh")),
+            isLoading = false,
+            isRefreshing = false,
+            lastUpdatedEpochMillis = savedAt
+        )
+
+        assertTrue(loadedFeed.hasFreshLoadedCafes(nowMillis = savedAt + CAFE_RESULT_CACHE_TTL_MILLIS - 1))
+        assertFalse(loadedFeed.copy(isRefreshing = true).hasFreshLoadedCafes(nowMillis = savedAt + 1))
+        assertFalse(loadedFeed.copy(isLoading = true).hasFreshLoadedCafes(nowMillis = savedAt + 1))
+        assertFalse(loadedFeed.copy(cafes = emptyList()).hasFreshLoadedCafes(nowMillis = savedAt + 1))
+        assertFalse(loadedFeed.hasFreshLoadedCafes(nowMillis = savedAt + CAFE_RESULT_CACHE_TTL_MILLIS))
+    }
+
+    @Test
+    fun cachedCafeEnvelopeRequiresImageDataBeforeSkippingCardRefresh() {
+        val envelopeWithoutImages = CachedCafeEnvelope(
+            cityKey = "missing_images",
+            savedAtEpochMillis = 10_000L,
+            cafes = listOf(
+                CachedCafeDto(
+                    id = "missing",
+                    name = "Missing Image Cafe",
+                    address = "123 Bean Street",
+                    phone = "555-0100",
+                    status = "Open",
+                    hours = linkedMapOf("Monday" to "7:00 AM - 5:00 PM"),
+                    features = listOf("Coffee house"),
+                    ambience = listOf("Coffee"),
+                    expectedPhotoCount = 1
+                )
+            )
+        )
+        val envelopeWithImages = envelopeWithoutImages.copy(
+            cafes = listOf(
+                envelopeWithoutImages.cafes.single().copy(
+                    heroImageBase64 = "not-real-image-data"
+                )
+            )
+        )
+
+        assertFalse(envelopeWithoutImages.hasCompleteCachedCardImages())
+        assertTrue(envelopeWithImages.hasCompleteCachedCardImages())
+    }
+
+    @Test
+    fun detailEnrichmentUpdatesExistingCafeWithoutChangingFeedMembership() {
+        CafeRepository.setHomeFeedForTest(
+            cafes = listOf(
+                testCafe(id = "shared", phone = "Phone unavailable", address = "Address unavailable"),
+                testCafe(id = "home_only")
+            )
+        )
+        CafeRepository.setMapFeedForTest(
+            cafes = listOf(
+                testCafe(id = "shared", phone = "Phone unavailable", address = "Address unavailable"),
+                testCafe(id = "map_only")
+            )
+        )
+
+        CafeRepository.updateCafeDetails(
+            cafeId = "shared",
+            detailCafe = testCafe(
+                id = "shared",
+                phone = "+1 555-0199",
+                address = "999 Detail Lane",
+                rating = 4.8f,
+                userRatingCount = 42
+            )
+        )
+
+        assertEquals(listOf("shared", "home_only"), CafeRepository.homeUiState.cafes.map { it.id })
+        assertEquals(listOf("shared", "map_only"), CafeRepository.mapUiState.cafes.map { it.id })
+        assertEquals("+1 555-0199", CafeRepository.homeUiState.cafes.first { it.id == "shared" }.phone)
+        assertEquals("999 Detail Lane", CafeRepository.mapUiState.cafes.first { it.id == "shared" }.address)
+        assertEquals("map_only", CafeRepository.mapUiState.cafes.last().id)
+    }
+
+    @Test
+    fun detailEnrichmentPreservesExistingDistanceWhenDetailHasNoDistance() {
+        CafeRepository.setHomeFeedForTest(
+            cafes = listOf(testCafe(id = "distance", distanceMeters = 1450f))
+        )
+
+        CafeRepository.updateCafeDetails(
+            cafeId = "distance",
+            detailCafe = testCafe(id = "distance", distanceMeters = null, latLng = LatLng(35.0, -118.0))
+        )
+
+        assertEquals(1450f, CafeRepository.getCafe("distance")?.distanceMeters ?: 0f, 0.001f)
+    }
+
+    @Test
+    fun detailEnrichmentPreservesLoadedPhotoBitmapsWhenMetadataIsRefreshed() {
+        val loadedBitmap = fakeBitmap()
+        CafeRepository.setHomeFeedForTest(
+            cafes = listOf(
+                testCafe(id = "photos").copy(
+                    photoMetadatas = placeholderPhotoMetadatas(1),
+                    photoBitmaps = listOf(loadedBitmap)
+                )
+            )
+        )
+
+        CafeRepository.updateCafeDetails(
+            cafeId = "photos",
+            detailCafe = testCafe(id = "photos").copy(
+                photoMetadatas = placeholderPhotoMetadatas(2),
+                photoBitmaps = emptyList()
+            )
+        )
+
+        val updatedCafe = CafeRepository.getCafe("photos")
+        assertEquals(2, updatedCafe?.photoMetadatas?.size)
+        assertEquals(2, updatedCafe?.photoBitmaps?.size)
+        assertSame(loadedBitmap, updatedCafe?.photoBitmaps?.first())
+        assertNull(updatedCafe?.photoBitmaps?.get(1))
+    }
+
+    @Test
+    fun missingDetailDetectionIdentifiesIncompleteAndCompleteCafes() {
+        val completeCafe = testCafe(
+            id = "complete",
+            phone = "+1 555-0100",
+            address = "123 Bean Street",
+            rating = 4.4f,
+            userRatingCount = 18
+        ).copy(photoMetadatas = placeholderPhotoMetadatas(1))
+
+        assertFalse(isCafeDetailDataIncomplete(completeCafe))
+        assertTrue(isCafeDetailDataIncomplete(completeCafe.copy(phone = "Phone unavailable")))
+        assertTrue(isCafeDetailDataIncomplete(completeCafe.copy(photoMetadatas = emptyList(), photoBitmaps = emptyList())))
+        assertTrue(isCafeDetailDataIncomplete(completeCafe.copy(address = "Address unavailable")))
+        assertTrue(isCafeDetailDataIncomplete(completeCafe.copy(latLng = null)))
+        assertTrue(isCafeDetailDataIncomplete(completeCafe.copy(rating = null)))
+        assertTrue(isCafeDetailDataIncomplete(completeCafe.copy(userRatingCount = null)))
+        assertTrue(isCafeDetailDataIncomplete(completeCafe.copy(hours = linkedMapOf("Hours" to "Hours unavailable"))))
+    }
+
+    @Test
     fun cafePhoneSelectionPrefersInternationalNumber() {
         val phone = selectCafePhoneNumber(
             internationalPhoneNumber = "+1 555-0100",
@@ -209,20 +368,40 @@ class CafeRepositoryStateTest {
     private fun testCafe(
         id: String,
         status: String = "Open",
+        address: String = "123 Bean Street",
+        phone: String = "555-0100",
         latLng: LatLng = LatLng(34.1000, -117.3000),
-        distanceMeters: Float? = 1200f
+        distanceMeters: Float? = 1200f,
+        rating: Float? = 4.6f,
+        userRatingCount: Int? = 120
     ): Cafe {
         return Cafe(
             id = id,
             name = "Cafe $id",
-            address = "123 Bean Street",
-            phone = "555-0100",
+            address = address,
+            phone = phone,
             status = status,
             hours = linkedMapOf("Monday" to "7:00 AM - 5:00 PM"),
             features = listOf("Coffee house"),
             ambience = listOf("Coffee"),
+            rating = rating,
+            userRatingCount = userRatingCount,
             distanceMeters = distanceMeters,
             latLng = latLng
         )
+    }
+
+    @Suppress("UNCHECKED_CAST")
+    private fun placeholderPhotoMetadatas(count: Int): List<PhotoMetadata> {
+        return List<PhotoMetadata?>(count) { null } as List<PhotoMetadata>
+    }
+
+    private fun fakeBitmap(): Bitmap {
+        val unsafeClass = Class.forName("sun.misc.Unsafe")
+        val unsafeField = unsafeClass.getDeclaredField("theUnsafe")
+        unsafeField.isAccessible = true
+        val unsafe = unsafeField.get(null)
+        val allocateInstance = unsafeClass.getMethod("allocateInstance", Class::class.java)
+        return allocateInstance.invoke(unsafe, Bitmap::class.java) as Bitmap
     }
 }

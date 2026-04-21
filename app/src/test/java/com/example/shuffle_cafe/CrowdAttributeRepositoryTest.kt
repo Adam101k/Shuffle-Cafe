@@ -60,6 +60,10 @@ class CrowdAttributeRepositoryTest {
             ProtectedSecretDisplayState.Unknown,
             protectedSecretDisplayState(ProtectedCrowdSecret(), isNearby = true, isAvailable = null)
         )
+        assertEquals(
+            ProtectedSecretDisplayState.Unknown,
+            protectedSecretDisplayState(ProtectedCrowdSecret(), isNearby = true, isAvailable = true)
+        )
     }
 
     @Test
@@ -100,6 +104,58 @@ class CrowdAttributeRepositoryTest {
         assertEquals(NoiseLevel.QUIET, bravo.noiseLevel)
         assertEquals(listOf("content://bravo-menu"), bravo.menuPhotoUris)
         assertEquals(200L, bravo.lastUpdatedEpochMillis)
+    }
+
+    @Test
+    fun emptyKeySuggestionsDoNotMarkSecretsKnownButTypedKeysDo() {
+        CrowdAttributeRepository.applySuggestion(
+            cafeId = "keys",
+            suggestion = CrowdAttributeSuggestion(
+                wifiSpeed = WifiSpeed.FAST,
+                wifiPassword = ProtectedCrowdSecret(value = "   "),
+                bathroomAvailability = BathroomAvailability.AVAILABLE,
+                bathroomCode = ProtectedCrowdSecret(value = "")
+            ),
+            nowMillis = 300L
+        )
+
+        val emptyKeys = CrowdAttributeRepository.attributesFor("keys")
+
+        assertEquals(ProtectedCrowdSecret(), emptyKeys.wifiPassword)
+        assertEquals(ProtectedCrowdSecret(), emptyKeys.bathroomCode)
+        assertEquals(
+            ProtectedSecretDisplayState.Unknown,
+            protectedSecretDisplayState(emptyKeys.wifiPassword, isNearby = true, isAvailable = true)
+        )
+        assertEquals(
+            ProtectedSecretDisplayState.Unknown,
+            protectedSecretDisplayState(emptyKeys.bathroomCode, isNearby = true, isAvailable = true)
+        )
+
+        CrowdAttributeRepository.applySuggestion(
+            cafeId = "keys",
+            suggestion = CrowdAttributeSuggestion(
+                wifiPassword = ProtectedCrowdSecret(value = " bean-fi "),
+                bathroomCode = ProtectedCrowdSecret(value = " 2468 ")
+            ),
+            nowMillis = 400L
+        )
+
+        val typedKeys = CrowdAttributeRepository.attributesFor("keys")
+
+        assertEquals(ProtectedCrowdSecret(value = "bean-fi", knownToExist = true), typedKeys.wifiPassword)
+        assertEquals(ProtectedCrowdSecret(value = "2468", knownToExist = true), typedKeys.bathroomCode)
+
+        CrowdAttributeRepository.applySuggestion(
+            cafeId = "keys",
+            suggestion = CrowdAttributeSuggestion(wifiSpeed = WifiSpeed.DECENT),
+            nowMillis = 500L
+        )
+
+        val unchangedKeys = CrowdAttributeRepository.attributesFor("keys")
+
+        assertEquals(ProtectedCrowdSecret(value = "bean-fi", knownToExist = true), unchangedKeys.wifiPassword)
+        assertEquals(ProtectedCrowdSecret(value = "2468", knownToExist = true), unchangedKeys.bathroomCode)
     }
 
     @Test

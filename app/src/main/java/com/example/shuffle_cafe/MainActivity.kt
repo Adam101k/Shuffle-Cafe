@@ -20,6 +20,7 @@ import android.os.Bundle
 import android.net.Uri
 import android.text.TextPaint
 import android.text.TextUtils
+import android.util.Base64
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -28,13 +29,18 @@ import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
@@ -59,6 +65,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.graphicsLayer
@@ -82,9 +89,15 @@ import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.VisualTransformation
+import androidx.compose.ui.text.TextMeasurer
+import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntRect
 import androidx.compose.ui.unit.IntSize
@@ -92,6 +105,7 @@ import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.tooling.preview.Preview
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.lerp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -99,6 +113,7 @@ import androidx.compose.ui.window.Popup
 import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.PopupProperties
 import androidx.core.content.ContextCompat
+import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.NavHostController
 import androidx.navigation.NavType
 import androidx.navigation.navArgument
@@ -136,9 +151,11 @@ import com.google.maps.android.compose.MapProperties
 import com.google.maps.android.compose.MapUiSettings
 import com.google.maps.android.compose.Marker
 import com.google.maps.android.compose.rememberCameraPositionState
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.coroutineScope
@@ -152,7 +169,11 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import java.util.Calendar
+import java.io.ByteArrayOutputStream
 import java.util.Locale
+import java.util.UUID
+import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.roundToInt
@@ -161,7 +182,10 @@ import kotlin.math.sqrt
 
 import io.github.jan.supabase.auth.Auth
 import io.github.jan.supabase.createSupabaseClient
+import io.github.jan.supabase.exceptions.HttpRequestException
+import io.github.jan.supabase.exceptions.RestException
 import io.github.jan.supabase.postgrest.Postgrest
+import io.github.jan.supabase.postgrest.exception.PostgrestRestException
 import io.github.jan.supabase.postgrest.from
 import io.github.jan.supabase.storage.storage
 import io.github.jan.supabase.auth.auth
@@ -224,7 +248,10 @@ internal data class CachedCafeDto(
     val imageResId: Int? = null,
     val imageUrl: String? = null,
     val latitude: Double? = null,
-    val longitude: Double? = null
+    val longitude: Double? = null,
+    val expectedPhotoCount: Int? = null,
+    val heroImageBase64: String? = null,
+    val photoImageBase64s: List<String?> = emptyList()
 )
 
 @Serializable
@@ -249,6 +276,14 @@ data class CafeFeedUiState(
     val cityName: String? = null,
     val lastUpdatedEpochMillis: Long? = null
 )
+
+internal fun CafeFeedUiState.hasFreshLoadedCafes(
+    nowMillis: Long = System.currentTimeMillis()
+): Boolean {
+    val lastUpdated = lastUpdatedEpochMillis ?: return false
+    if (cafes.isEmpty() || isLoading || isRefreshing) return false
+    return nowMillis - lastUpdated < CAFE_RESULT_CACHE_TTL_MILLIS
+}
 
 private data class ResolvedViewportCoffeeContext(
     val searchLocation: Location,
@@ -281,13 +316,18 @@ private const val CAFE_CACHE_ENTRY_PREFIX = "city_cache_"
 private const val BOOKMARK_CACHE_PREFS_NAME = "shuffle_cafe_bookmark_cache"
 private const val BOOKMARK_CACHE_ENTRY_KEY = "saved_bookmark_cafes"
 private const val UNKNOWN_CITY_CACHE_KEY = "nearby_unknown_city"
+private const val ADDRESS_UNAVAILABLE_TEXT = "Address unavailable"
 private const val PHONE_UNAVAILABLE_TEXT = "Phone unavailable"
-private const val CAFE_CACHE_MAX_AGE_MILLIS = 7L * 24L * 60L * 60L * 1000L
+private const val HOURS_UNAVAILABLE_TEXT = "Hours unavailable"
+private const val NO_RATINGS_TEXT = "No ratings yet"
+internal const val CAFE_RESULT_CACHE_TTL_MILLIS = 30L * 60L * 1000L
+internal const val SAVED_CAFE_CACHE_ATTEMPT_TTL_MILLIS = CAFE_RESULT_CACHE_TTL_MILLIS
+private const val BOOKMARK_CACHE_WRITE_DEBOUNCE_MILLIS = 350L
 private const val MAP_VIEWPORT_QUERY_DEBOUNCE_MILLIS = 650L
 private const val MAP_VIEWPORT_MIN_QUERY_ZOOM = 6f
 private const val MAP_VIEWPORT_SEARCH_MIN_RADIUS_METERS = 1_500.0
 private const val MAP_VIEWPORT_SEARCH_MAX_RADIUS_METERS = 18_000.0
-internal const val MAP_SESSION_CACHE_TTL_MILLIS = 15L * 60L * 1000L
+internal const val MAP_SESSION_CACHE_TTL_MILLIS = CAFE_RESULT_CACHE_TTL_MILLIS
 
 private fun LatLng.toLocation(provider: String = "map_viewport"): Location {
     return Location(provider).apply {
@@ -463,10 +503,23 @@ private val cafePhonePlaceFields = listOf(
     Place.Field.NATIONAL_PHONE_NUMBER
 )
 
+private val cafeDetailPlaceFields = listOf(
+    Place.Field.ID,
+    Place.Field.DISPLAY_NAME,
+    Place.Field.FORMATTED_ADDRESS,
+    Place.Field.RATING,
+    Place.Field.USER_RATING_COUNT,
+    Place.Field.PHOTO_METADATAS,
+    Place.Field.LOCATION,
+    Place.Field.OPENING_HOURS,
+    Place.Field.CURRENT_OPENING_HOURS
+) + cafePhonePlaceFields
+
 private fun Cafe.primaryImageModel(): Any = heroImageBitmap ?: imageUrl ?: imageResId
 
 private fun Cafe.photoPageCount(): Int = when {
     photoMetadatas.isNotEmpty() -> photoMetadatas.size
+    photoBitmaps.isNotEmpty() -> photoBitmaps.size
     else -> 1
 }
 
@@ -505,6 +558,11 @@ private fun Cafe.mergeLoadedMedia(existing: Cafe?): Cafe {
         List(mergedPhotoMetadatas.size) { index ->
             photoBitmaps.getOrNull(index) ?: existingCafe.photoBitmaps.getOrNull(index)
         }
+    } else if (photoBitmaps.isNotEmpty() || existingCafe.photoBitmaps.isNotEmpty()) {
+        val mergedPhotoCount = maxOf(photoBitmaps.size, existingCafe.photoBitmaps.size)
+        List(mergedPhotoCount) { index ->
+            photoBitmaps.getOrNull(index) ?: existingCafe.photoBitmaps.getOrNull(index)
+        }
     } else {
         emptyList()
     }
@@ -514,6 +572,91 @@ private fun Cafe.mergeLoadedMedia(existing: Cafe?): Cafe {
         heroImageBitmap = heroImageBitmap
             ?: mergedPhotoBitmaps.firstOrNull { it != null }
             ?: existingCafe.heroImageBitmap,
+        photoBitmaps = mergedPhotoBitmaps
+    )
+}
+
+internal fun isCafeAddressUnavailable(address: String): Boolean {
+    return address.isBlank() || address.equals(ADDRESS_UNAVAILABLE_TEXT, ignoreCase = true)
+}
+
+internal fun areCafeHoursUnavailable(hours: Map<String, String>): Boolean {
+    return hours.isEmpty() || hours.values.all { value ->
+        value.isBlank() || value.equals(HOURS_UNAVAILABLE_TEXT, ignoreCase = true)
+    }
+}
+
+internal fun isCafeDetailDataIncomplete(cafe: Cafe): Boolean {
+    return isPhoneUnavailable(cafe.phone) ||
+        cafe.photoMetadatas.isEmpty() ||
+        isCafeAddressUnavailable(cafe.address) ||
+        cafe.latLng == null ||
+        cafe.rating == null ||
+        cafe.userRatingCount == null ||
+        areCafeHoursUnavailable(cafe.hours)
+}
+
+private fun Cafe.hasCachedImages(): Boolean {
+    return heroImageBitmap != null || photoBitmaps.any { bitmap -> bitmap != null } || !imageUrl.isNullOrBlank()
+}
+
+internal fun isBookmarkCacheDataIncomplete(cafe: Cafe): Boolean {
+    return isPhoneUnavailable(cafe.phone) ||
+        isCafeAddressUnavailable(cafe.address) ||
+        cafe.latLng == null ||
+        cafe.rating == null ||
+        cafe.userRatingCount == null ||
+        areCafeHoursUnavailable(cafe.hours) ||
+        !cafe.hasCachedImages()
+}
+
+private fun Cafe.nextUnloadedPhotoIndex(): Int? {
+    if (photoMetadatas.isEmpty()) return null
+    return photoMetadatas.indices.firstOrNull { index -> photoBitmaps.getOrNull(index) == null }
+}
+
+internal fun mergeCafeDetailData(existingCafe: Cafe, detailCafe: Cafe): Cafe {
+    val mergedPhotoMetadatas = if (detailCafe.photoMetadatas.isNotEmpty()) {
+        detailCafe.photoMetadatas
+    } else {
+        existingCafe.photoMetadatas
+    }
+    val mergedPhotoBitmaps = if (mergedPhotoMetadatas.isNotEmpty()) {
+        List(mergedPhotoMetadatas.size) { index ->
+            detailCafe.photoBitmaps.getOrNull(index) ?: existingCafe.photoBitmaps.getOrNull(index)
+        }
+    } else if (detailCafe.photoBitmaps.isNotEmpty() || existingCafe.photoBitmaps.isNotEmpty()) {
+        val mergedPhotoCount = maxOf(detailCafe.photoBitmaps.size, existingCafe.photoBitmaps.size)
+        List(mergedPhotoCount) { index ->
+            detailCafe.photoBitmaps.getOrNull(index) ?: existingCafe.photoBitmaps.getOrNull(index)
+        }
+    } else {
+        emptyList()
+    }
+    val detailHasRating = detailCafe.rating != null && (detailCafe.userRatingCount ?: 0) > 0
+    val mergedStatus = when {
+        detailHasRating -> detailCafe.status
+        existingCafe.status.isNotBlank() && !existingCafe.status.equals(NO_RATINGS_TEXT, ignoreCase = true) -> existingCafe.status
+        detailCafe.status.isNotBlank() -> detailCafe.status
+        else -> existingCafe.status
+    }
+
+    return existingCafe.copy(
+        name = detailCafe.name.trim().takeIf { it.isNotBlank() } ?: existingCafe.name,
+        address = detailCafe.address.takeUnless(::isCafeAddressUnavailable) ?: existingCafe.address,
+        phone = detailCafe.phone.takeUnless(::isPhoneUnavailable) ?: existingCafe.phone,
+        status = mergedStatus,
+        hours = if (!areCafeHoursUnavailable(detailCafe.hours)) detailCafe.hours else existingCafe.hours,
+        rating = detailCafe.rating ?: existingCafe.rating,
+        userRatingCount = detailCafe.userRatingCount ?: existingCafe.userRatingCount,
+        distanceMeters = existingCafe.distanceMeters ?: detailCafe.distanceMeters,
+        imageResId = existingCafe.imageResId,
+        imageUrl = detailCafe.imageUrl ?: existingCafe.imageUrl,
+        heroImageBitmap = existingCafe.heroImageBitmap
+            ?: detailCafe.heroImageBitmap
+            ?: mergedPhotoBitmaps.firstOrNull { it != null },
+        latLng = detailCafe.latLng ?: existingCafe.latLng,
+        photoMetadatas = mergedPhotoMetadatas,
         photoBitmaps = mergedPhotoBitmaps
     )
 }
@@ -534,17 +677,21 @@ internal class MapSessionCafeCache(
     private val cafesById = linkedMapOf<String, MapSessionCafeCacheEntry>()
     private val viewportLoadedAtMillis = mutableMapOf<String, Long>()
 
-    fun recordViewport(viewportKey: String, cafes: List<Cafe>) {
+    fun recordViewport(
+        viewportKey: String,
+        cafes: List<Cafe>,
+        savedAtEpochMillis: Long = nowMillis()
+    ) {
         if (viewportKey.isBlank() || cafes.isEmpty()) return
 
         val now = nowMillis()
         prune(now)
-        viewportLoadedAtMillis[viewportKey] = now
+        viewportLoadedAtMillis[viewportKey] = savedAtEpochMillis
         cafes.distinctBy { cafe -> cafe.id }.forEach { cafe ->
             val existingCafe = cafesById[cafe.id]?.cafe
             cafesById[cafe.id] = MapSessionCafeCacheEntry(
                 cafe = cafe.mergeLoadedMedia(existingCafe),
-                savedAtEpochMillis = now
+                savedAtEpochMillis = savedAtEpochMillis
             )
         }
     }
@@ -575,6 +722,11 @@ internal class MapSessionCafeCache(
             )
     }
 
+    fun updateCafe(cafeId: String, transform: (Cafe) -> Cafe) {
+        val existingEntry = cafesById[cafeId] ?: return
+        cafesById[cafeId] = existingEntry.copy(cafe = transform(existingEntry.cafe))
+    }
+
     fun clear() {
         cafesById.clear()
         viewportLoadedAtMillis.clear()
@@ -590,7 +742,39 @@ internal class MapSessionCafeCache(
     }
 }
 
+private fun Bitmap.toCacheBase64(): String? {
+    return runCatching {
+        val output = ByteArrayOutputStream()
+        compress(Bitmap.CompressFormat.JPEG, 82, output)
+        Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
+    }.getOrNull()
+}
+
+private fun String.toCachedBitmap(): Bitmap? {
+    return runCatching {
+        val decoded = Base64.decode(this, Base64.DEFAULT)
+        BitmapFactory.decodeByteArray(decoded, 0, decoded.size)
+    }.getOrNull()
+}
+
+private fun CachedCafeDto.hasCompleteCachedCardImage(): Boolean {
+    val expectedCount = expectedPhotoCount ?: return false
+    if (expectedCount <= 0) return true
+    return heroImageBase64 != null || photoImageBase64s.firstOrNull() != null
+}
+
+internal fun CachedCafeEnvelope.hasCompleteCachedCardImages(): Boolean {
+    return cafes.isNotEmpty() && cafes.all { dto -> dto.hasCompleteCachedCardImage() }
+}
+
 private fun Cafe.toCachedDto(): CachedCafeDto {
+    val cachedHeroBitmap = heroImageBitmap ?: photoBitmaps.firstOrNull { it != null }
+    val expectedPhotoCount = maxOf(
+        photoMetadatas.size,
+        photoBitmaps.size,
+        if (cachedHeroBitmap != null) 1 else 0
+    )
+
     return CachedCafeDto(
         id = id,
         name = name,
@@ -606,12 +790,27 @@ private fun Cafe.toCachedDto(): CachedCafeDto {
         imageResId = imageResId,
         imageUrl = imageUrl,
         latitude = latLng?.latitude,
-        longitude = latLng?.longitude
+        longitude = latLng?.longitude,
+        expectedPhotoCount = expectedPhotoCount,
+        heroImageBase64 = cachedHeroBitmap?.toCacheBase64(),
+        photoImageBase64s = if (expectedPhotoCount > 0) {
+            List(expectedPhotoCount) { index -> photoBitmaps.getOrNull(index)?.toCacheBase64() }
+        } else {
+            emptyList()
+        }
     )
 }
 
 internal fun CachedCafeDto.toCafe(distanceReference: LatLng? = null): Cafe {
     val cafeLatLng = if (latitude != null && longitude != null) LatLng(latitude, longitude) else null
+    val cachedHeroBitmap = heroImageBase64?.toCachedBitmap()
+    val cachedPhotoBitmaps = photoImageBase64s.map { encoded -> encoded?.toCachedBitmap() }
+    val restoredPhotoBitmaps = when {
+        cachedPhotoBitmaps.isNotEmpty() -> cachedPhotoBitmaps
+        cachedHeroBitmap != null -> listOf(cachedHeroBitmap)
+        else -> emptyList()
+    }
+
     return Cafe(
         id = id,
         name = name,
@@ -626,7 +825,9 @@ internal fun CachedCafeDto.toCafe(distanceReference: LatLng? = null): Cafe {
         distanceMeters = computeCafeDistanceMeters(cafeLatLng, distanceReference) ?: distanceMeters,
         imageResId = imageResId ?: R.drawable.ic_launcher_foreground,
         imageUrl = imageUrl,
-        latLng = cafeLatLng
+        heroImageBitmap = cachedHeroBitmap ?: restoredPhotoBitmaps.firstOrNull { it != null },
+        latLng = cafeLatLng,
+        photoBitmaps = restoredPhotoBitmaps
     )
 }
 
@@ -640,8 +841,8 @@ private fun normalizeCityCacheKey(cityName: String?): String {
     return normalized?.takeIf { it.isNotBlank() } ?: UNKNOWN_CITY_CACHE_KEY
 }
 
-private fun CachedCafeEnvelope.isFresh(nowMillis: Long = System.currentTimeMillis()): Boolean {
-    return nowMillis - savedAtEpochMillis < CAFE_CACHE_MAX_AGE_MILLIS
+internal fun CachedCafeEnvelope.isFresh(nowMillis: Long = System.currentTimeMillis()): Boolean {
+    return nowMillis - savedAtEpochMillis < CAFE_RESULT_CACHE_TTL_MILLIS
 }
 
 private object MapMarkerDescriptorCache {
@@ -884,6 +1085,16 @@ object CafeRepository {
         )
     }
 
+    private suspend fun preloadCrowdAttributes(cafes: List<Cafe>) {
+        if (cafes.isEmpty()) return
+
+        runCatching {
+            CrowdAttributeRepository.loadManyFromSupabase(cafes.map { cafe -> cafe.id })
+        }.onFailure { error ->
+            error.printStackTrace()
+        }
+    }
+
     private fun updateFeedCafe(cafes: List<Cafe>, cafeId: String, transform: (Cafe) -> Cafe): List<Cafe> {
         var changed = false
         val updatedCafes = cafes.map { cafe ->
@@ -911,6 +1122,9 @@ object CafeRepository {
         if (updatedMapCafes !== mapFeedState.cafes) {
             mapFeedState = mapFeedState.copy(cafes = updatedMapCafes)
         }
+
+        mapSessionCafeCache.updateCafe(cafeId, transform)
+        BookmarkRepository.persistIfBookmarked(cafeId)
     }
 
     fun cacheCafes(cafes: List<Cafe>) {
@@ -935,6 +1149,12 @@ object CafeRepository {
 
         applyCafeUpdate(cafeId) { cafe ->
             if (cafe.phone == phone) cafe else cafe.copy(phone = phone)
+        }
+    }
+
+    fun updateCafeDetails(cafeId: String, detailCafe: Cafe) {
+        applyCafeUpdate(cafeId) { cafe ->
+            mergeCafeDetailData(cafe, detailCafe)
         }
     }
 
@@ -995,12 +1215,18 @@ object CafeRepository {
                 return
             }
 
+            if (homeFeedState.hasFreshLoadedCafes()) {
+                return
+            }
+
             val queryContext = resolveCurrentCityCoffeeContext(context, fusedLocationClient)
             val distanceReference = queryContext.location.toLatLng()
             val cachedEnvelope = CafeCacheStore.load(context, queryContext.cityKey)
             val cachedCafes = cachedEnvelope?.cafes?.map { dto ->
                 dto.toCafe(distanceReference = distanceReference)
             }.orEmpty()
+            val hasCompleteCachedCardImages = cachedEnvelope?.hasCompleteCachedCardImages() == true
+            val isCachedFeedFresh = cachedEnvelope?.isFresh() == true && hasCompleteCachedCardImages
 
             if (
                 homeFeedState.cityKey == queryContext.cityKey &&
@@ -1011,7 +1237,7 @@ object CafeRepository {
                 return
             }
 
-            if (cachedCafes.isNotEmpty()) {
+            if (cachedCafes.isNotEmpty() && hasCompleteCachedCardImages) {
                 replaceHomeFeed(
                     cafes = cachedCafes,
                     cityKey = queryContext.cityKey,
@@ -1020,9 +1246,11 @@ object CafeRepository {
                 )
                 homeFeedState = homeFeedState.copy(
                     isLoading = false,
-                    isRefreshing = true,
+                    isRefreshing = !isCachedFeedFresh,
                     loadError = null
                 )
+                preloadCrowdAttributes(cachedCafes)
+                if (isCachedFeedFresh) return
             } else {
                 homeFeedState = CafeFeedUiState(
                     cafes = emptyList(),
@@ -1038,10 +1266,10 @@ object CafeRepository {
                 val freshCafes = fetchCoffeeHousesForResolvedCity(
                     placesClient = placesClient,
                     location = queryContext.location,
-                    cityName = queryContext.cityName,
-                    onCafePhotoLoaded = ::updateCafePhoto
+                    cityName = queryContext.cityName
                 ).distinctBy { it.id }
 
+                preloadCrowdAttributes(freshCafes)
                 replaceHomeFeed(
                     cafes = freshCafes,
                     cityKey = queryContext.cityKey,
@@ -1118,6 +1346,11 @@ object CafeRepository {
             val sessionCachedCafes = mapSessionCafeCache.snapshot(distanceReference)
             val isViewportFresh = mapSessionCafeCache.isViewportFresh(queryContext.cityKey)
             val sessionLastUpdated = mapSessionCafeCache.latestLoadedAtEpochMillis()
+            val cachedEnvelope = CafeCacheStore.load(context, queryContext.cityKey)
+            val diskCachedCafes = cachedEnvelope?.cafes?.map { dto ->
+                dto.toCafe(distanceReference = distanceReference)
+            }.orEmpty()
+            val isDiskCacheFresh = cachedEnvelope?.isFresh() == true
 
             if (sessionCachedCafes.isNotEmpty()) {
                 replaceMapFeed(
@@ -1134,8 +1367,34 @@ object CafeRepository {
                     cityName = queryContext.cityName,
                     lastUpdatedEpochMillis = sessionLastUpdated
                 )
+                preloadCrowdAttributes(sessionCachedCafes)
 
                 if (isViewportFresh) return
+            } else if (diskCachedCafes.isNotEmpty()) {
+                if (isDiskCacheFresh) {
+                    mapSessionCafeCache.recordViewport(
+                        viewportKey = queryContext.cityKey,
+                        cafes = diskCachedCafes,
+                        savedAtEpochMillis = cachedEnvelope?.savedAtEpochMillis ?: System.currentTimeMillis()
+                    )
+                }
+                replaceMapFeed(
+                    cafes = diskCachedCafes,
+                    cityKey = queryContext.cityKey,
+                    cityName = queryContext.cityName,
+                    lastUpdatedEpochMillis = cachedEnvelope?.savedAtEpochMillis
+                )
+                mapFeedState = mapFeedState.copy(
+                    isLoading = false,
+                    isRefreshing = !isDiskCacheFresh,
+                    loadError = null,
+                    cityKey = queryContext.cityKey,
+                    cityName = queryContext.cityName,
+                    lastUpdatedEpochMillis = cachedEnvelope?.savedAtEpochMillis
+                )
+                preloadCrowdAttributes(diskCachedCafes)
+
+                if (isDiskCacheFresh) return
             } else {
                 mapFeedState = CafeFeedUiState(
                     cafes = emptyList(),
@@ -1158,10 +1417,12 @@ object CafeRepository {
                 ).distinctBy { it.id }
 
                 mapSessionCafeCache.recordViewport(queryContext.cityKey, freshCafes)
+                CafeCacheStore.save(context, queryContext.cityKey, freshCafes)
                 val updatedSessionCafes = mapSessionCafeCache.snapshot(distanceReference)
                 val updatedLastUpdated = mapSessionCafeCache.latestLoadedAtEpochMillis()
                     ?: System.currentTimeMillis()
 
+                preloadCrowdAttributes(updatedSessionCafes)
                 replaceMapFeed(
                     cafes = updatedSessionCafes,
                     cityKey = queryContext.cityKey,
@@ -1176,12 +1437,15 @@ object CafeRepository {
             } catch (error: Exception) {
                 val errorMessage = error.localizedMessage ?: "Failed to load coffee houses for this map area."
                 val fallbackSessionCafes = mapSessionCafeCache.snapshot(distanceReference)
-                if (fallbackSessionCafes.isNotEmpty()) {
+                val fallbackCafes = fallbackSessionCafes.ifEmpty { diskCachedCafes }
+                val fallbackLastUpdated = mapSessionCafeCache.latestLoadedAtEpochMillis()
+                    ?: cachedEnvelope?.savedAtEpochMillis
+                if (fallbackCafes.isNotEmpty()) {
                     replaceMapFeed(
-                        cafes = fallbackSessionCafes,
+                        cafes = fallbackCafes,
                         cityKey = queryContext.cityKey,
                         cityName = queryContext.cityName,
-                        lastUpdatedEpochMillis = mapSessionCafeCache.latestLoadedAtEpochMillis()
+                        lastUpdatedEpochMillis = fallbackLastUpdated
                     )
                     mapFeedState = mapFeedState.copy(
                         isLoading = false,
@@ -1245,8 +1509,14 @@ object CafeRepository {
 object BookmarkRepository {
     // store just IDs
     private val bookmarkedIds = mutableStateListOf<String>()
+    private val completedSavedCacheIds = mutableSetOf<String>()
+    private val savedCacheAttemptedAtMillisById = mutableMapOf<String, Long>()
+    private val persistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private var appContext: Context? = null
     private var isInitialized = false
+    private var persistJob: Job? = null
+    @Volatile
+    private var persistGeneration = 0
 
     fun initialize(context: Context) {
         val applicationContext = context.applicationContext
@@ -1258,6 +1528,12 @@ object BookmarkRepository {
             CafeRepository.cacheCafes(cachedBookmarks)
             bookmarkedIds.clear()
             bookmarkedIds.addAll(cachedBookmarks.map { cafe -> cafe.id })
+            completedSavedCacheIds.clear()
+            completedSavedCacheIds.addAll(
+                cachedBookmarks
+                    .filterNot { cafe -> isBookmarkCacheDataIncomplete(cafe) }
+                    .map { cafe -> cafe.id }
+            )
         }
 
         isInitialized = true
@@ -1266,14 +1542,18 @@ object BookmarkRepository {
     fun isBookmarked(cafeId: String): Boolean = bookmarkedIds.contains(cafeId)
 
     fun add(cafeId: String) {
-        bookmarkedIds.remove(cafeId)
+        val wasBookmarked = bookmarkedIds.remove(cafeId)
         bookmarkedIds.add(0, cafeId)
+        if (!wasBookmarked) {
+            clearSavedCafeCacheState(cafeId)
+        }
         persistBookmarks()
     }
 
     fun toggle(cafeId: String) {
         if (bookmarkedIds.contains(cafeId)) {
             bookmarkedIds.remove(cafeId)
+            clearSavedCafeCacheState(cafeId)
             persistBookmarks()
         }
         else add(cafeId)
@@ -1281,6 +1561,7 @@ object BookmarkRepository {
 
     fun remove(cafeId: String) {
         bookmarkedIds.remove(cafeId)
+        clearSavedCafeCacheState(cafeId)
         persistBookmarks()
     }
 
@@ -1290,13 +1571,93 @@ object BookmarkRepository {
     fun cafes(): List<Cafe> = bookmarkedIds.toList()
         .mapNotNull { id -> CafeRepository.getCafe(id) }
 
+    fun persistIfBookmarked(cafeId: String) {
+        if (bookmarkedIds.contains(cafeId)) {
+            persistBookmarks()
+        }
+    }
+
+    internal fun shouldEnrichSavedCafeCache(cafe: Cafe, nowMillis: Long = System.currentTimeMillis()): Boolean {
+        if (!bookmarkedIds.contains(cafe.id)) return false
+        if (!isBookmarkCacheDataIncomplete(cafe)) return false
+        completedSavedCacheIds.remove(cafe.id)
+
+        val attemptedAt = savedCacheAttemptedAtMillisById[cafe.id] ?: return true
+        return nowMillis - attemptedAt >= SAVED_CAFE_CACHE_ATTEMPT_TTL_MILLIS
+    }
+
+    internal fun markSavedCafeCacheEnrichmentStarted(
+        cafeId: String,
+        nowMillis: Long = System.currentTimeMillis()
+    ): Boolean {
+        if (!bookmarkedIds.contains(cafeId)) return false
+
+        val attemptedAt = savedCacheAttemptedAtMillisById[cafeId]
+        if (attemptedAt != null && nowMillis - attemptedAt < SAVED_CAFE_CACHE_ATTEMPT_TTL_MILLIS) {
+            return false
+        }
+
+        completedSavedCacheIds.remove(cafeId)
+        savedCacheAttemptedAtMillisById[cafeId] = nowMillis
+        return true
+    }
+
+    internal fun finishSavedCafeCacheEnrichment(cafe: Cafe, nowMillis: Long = System.currentTimeMillis()) {
+        if (!bookmarkedIds.contains(cafe.id)) return
+
+        if (isBookmarkCacheDataIncomplete(cafe)) {
+            completedSavedCacheIds.remove(cafe.id)
+            savedCacheAttemptedAtMillisById[cafe.id] = nowMillis
+        } else {
+            savedCacheAttemptedAtMillisById.remove(cafe.id)
+            completedSavedCacheIds.add(cafe.id)
+        }
+    }
+
+    internal fun markSavedCafeCacheEnrichmentFailed(
+        cafeId: String,
+        nowMillis: Long = System.currentTimeMillis()
+    ) {
+        if (!bookmarkedIds.contains(cafeId)) return
+        completedSavedCacheIds.remove(cafeId)
+        savedCacheAttemptedAtMillisById[cafeId] = nowMillis
+    }
+
+    private fun clearSavedCafeCacheState(cafeId: String) {
+        completedSavedCacheIds.remove(cafeId)
+        savedCacheAttemptedAtMillisById.remove(cafeId)
+    }
+
     private fun persistBookmarks() {
         val context = appContext ?: return
-        BookmarkCacheStore.save(context, cafes())
+        val cafesSnapshot = cafes()
+        val generation = ++persistGeneration
+
+        persistJob?.cancel()
+        persistJob = persistenceScope.launch {
+            delay(BOOKMARK_CACHE_WRITE_DEBOUNCE_MILLIS)
+            if (generation != persistGeneration) return@launch
+            BookmarkCacheStore.save(context, cafesSnapshot)
+        }
+    }
+
+    internal fun savedCafeCacheSnapshotForTest(): List<Cafe> = cafes()
+
+    internal fun isSavedCafeCacheEnrichmentCompleteForTest(cafeId: String): Boolean {
+        return completedSavedCacheIds.contains(cafeId)
+    }
+
+    internal fun savedCafeCacheAttemptedAtForTest(cafeId: String): Long? {
+        return savedCacheAttemptedAtMillisById[cafeId]
     }
 
     internal fun resetForTest() {
+        persistJob?.cancel()
+        persistJob = null
+        persistGeneration++
         bookmarkedIds.clear()
+        completedSavedCacheIds.clear()
+        savedCacheAttemptedAtMillisById.clear()
         appContext = null
         isInitialized = false
     }
@@ -1388,19 +1749,109 @@ fun AppNav(){
         is SessionStatus.Authenticated -> Screen.MainScreen.route
         else -> Screen.LoginScreen.route
     }
+    val bottomNavMotionState = remember { BottomNavMotionState() }
+    val bottomNavUiState = remember { BottomNavUiState() }
+    val navBackStackEntry by navController.currentBackStackEntryAsState()
+    val currentRoute = navBackStackEntry?.destination?.route ?: startDestination
+    val showBottomNav = currentRoute in bottomNavRoutes
+    val bottomNavIsBehindOverlay = bottomNavUiState.dimFraction > 0.01f || bottomNavUiState.overlayCoversToolbar
 
-    NavHost(navController = navController, startDestination = startDestination) {
-        composable(Screen.LoginScreen.route) { LoginScreen(navController) }
-        composable(Screen.MainScreen.route) { MainScreen(navController) }
-        composable(Screen.MapScreen.route) { MapScreen(navController) }
-        composable(Screen.BookmarkScreen.route) { BookmarkScreen(navController) }
-        composable(Screen.ProfileScreen.route) { ProfileScreen(navController) }
-        composable(Screen.Preferences.route) { PreferencesScreen(navController) }
-        composable(Screen.CafeDetails.route, arguments = listOf(navArgument("cafeId") { type = NavType.StringType })) {
-            CafeDetailsScreen(navController, it.arguments?.getString("cafeId") ?: "")
+    LaunchedEffect(currentRoute) {
+        bottomNavUiState.enabled = true
+        bottomNavUiState.dimFraction = 0f
+        bottomNavUiState.overlayCoversToolbar = false
+    }
+
+    CompositionLocalProvider(
+        LocalBottomNavMotionState provides bottomNavMotionState,
+        LocalBottomNavUiState provides bottomNavUiState,
+        LocalUsesPersistentBottomNav provides true
+    ) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            NavHost(navController = navController, startDestination = startDestination) {
+                composable(Screen.LoginScreen.route) { LoginScreen(navController) }
+                composable(Screen.MainScreen.route) { MainScreen(navController) }
+                composable(Screen.MapScreen.route) { MapScreen(navController) }
+                composable(Screen.BookmarkScreen.route) { BookmarkScreen(navController) }
+                composable(Screen.ProfileScreen.route) { ProfileScreen(navController) }
+                composable(Screen.Preferences.route) { PreferencesScreen(navController) }
+                composable(Screen.CafeDetails.route, arguments = listOf(navArgument("cafeId") { type = NavType.StringType })) {
+                    CafeDetailsScreen(navController, it.arguments?.getString("cafeId") ?: "")
+                }
+                composable(Screen.WriteReview.route, arguments = listOf(navArgument("cafeId") { type = NavType.StringType })) {
+                    WriteReviewScreen(navController, it.arguments?.getString("cafeId") ?: "")
+                }
+            }
+
+            if (showBottomNav) {
+                FloatingBottomNavBar(
+                    navController = navController,
+                    enabled = bottomNavUiState.enabled,
+                    dimFraction = bottomNavUiState.dimFraction,
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .zIndex(if (bottomNavIsBehindOverlay) -1f else 1f)
+                )
+            }
         }
-        composable(Screen.WriteReview.route, arguments = listOf(navArgument("cafeId") { type = NavType.StringType })) {
-            WriteReviewScreen(navController, it.arguments?.getString("cafeId") ?: "")
+    }
+}
+
+@Composable
+private fun ShuffleCafeLoadingAnimation(modifier: Modifier = Modifier) {
+    val transition = rememberInfiniteTransition(label = "shuffleCafeLoader")
+    val pulseScale by transition.animateFloat(
+        initialValue = 0.92f,
+        targetValue = 1.08f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 820, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "shuffleCafeLoaderPulse"
+    )
+    val ringAlpha by transition.animateFloat(
+        initialValue = 0.45f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 820, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "shuffleCafeLoaderRing"
+    )
+
+    Box(
+        modifier = modifier.size(96.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        CircularProgressIndicator(
+            modifier = Modifier
+                .size(82.dp)
+                .graphicsLayer { alpha = ringAlpha },
+            color = CafeDark,
+            strokeWidth = 3.dp
+        )
+        Surface(
+            modifier = Modifier
+                .size(58.dp)
+                .graphicsLayer {
+                    scaleX = pulseScale
+                    scaleY = pulseScale
+                },
+            shape = CircleShape,
+            color = CoffeeLight.copy(alpha = 0.92f),
+            shadowElevation = 6.dp
+        ) {
+            Box(
+                modifier = Modifier.fillMaxSize(),
+                contentAlignment = Alignment.Center
+            ) {
+                Image(
+                    painter = painterResource(id = R.drawable.shuffle_cafe_logo),
+                    contentDescription = null,
+                    modifier = Modifier.size(34.dp),
+                    contentScale = ContentScale.Fit
+                )
+            }
         }
     }
 }
@@ -1419,6 +1870,7 @@ fun MainScreen(navController: NavHostController) {
     val allCafes = cafeFeedState.cafes
     val isLoading = cafeFeedState.isLoading && allCafes.isEmpty()
     val loadError = cafeFeedState.loadError.takeIf { allCafes.isEmpty() }
+    val showLoadError = loadError != null && !isNoCoffeeHousesMessage(loadError)
     var currentVisibleCafes by remember { mutableStateOf<List<Cafe>>(emptyList()) }
     var nextCafeIndex by rememberSaveable { mutableIntStateOf(0) }
     var expandedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
@@ -1435,8 +1887,7 @@ fun MainScreen(navController: NavHostController) {
         }
     }
     val isDetailExpanded = expandedCafe != null
-    val loadedExpandedPhotoCount = expandedCafe?.photoBitmaps?.count { it != null } ?: 0
-    MissingCafePhoneEffect(cafe = expandedCafe, placesClient = placesClient)
+    CafeDetailDataEffect(cafe = expandedCafe, placesClient = placesClient)
 
     LaunchedEffect(hasLocationPermission, placesClient, inspectionMode) {
         if (inspectionMode) {
@@ -1517,18 +1968,6 @@ fun MainScreen(navController: NavHostController) {
         expandedCafeId = null
     }
 
-    LaunchedEffect(expandedCafe?.id, loadedExpandedPhotoCount, placesClient) {
-        val cafe = expandedCafe ?: return@LaunchedEffect
-        val client = placesClient ?: return@LaunchedEffect
-        if (cafe.photoMetadatas.isEmpty()) return@LaunchedEffect
-
-        val nextPhotoIndex = cafe.photoBitmaps.indexOfFirst { it == null }
-        if (nextPhotoIndex == -1) return@LaunchedEffect
-
-        val bitmap = fetchCafePhotoBitmap(client, cafe.photoMetadatas[nextPhotoIndex]) ?: return@LaunchedEffect
-        CafeRepository.updateCafePhoto(cafe.id, nextPhotoIndex, bitmap)
-    }
-
     LaunchedEffect(
         currentVisibleCafes.firstOrNull()?.id,
         currentVisibleCafes.firstOrNull()?.photoBitmaps?.count { it != null } ?: 0,
@@ -1604,15 +2043,13 @@ fun MainScreen(navController: NavHostController) {
                 ) {
                     when {
                         isLoading -> {
-                            CircularProgressIndicator()
-                            Spacer(Modifier.height(12.dp))
-                            Text("Loading coffee houses in your city...")
+                            ShuffleCafeLoadingAnimation()
                         }
-                        loadError != null -> {
+                        showLoadError -> {
                             Text(loadError ?: "Unable to load cafes.", style = MaterialTheme.typography.bodyLarge, textAlign = TextAlign.Center)
                         }
                         allCafes.isEmpty() -> {
-                            Text("No coffee houses found in your city.", style = MaterialTheme.typography.headlineSmall)
+                            ShuffleCafeLoadingAnimation()
                         }
                         else -> {
                             val renderTopCardOnly = isPreparingDetailTransition ||
@@ -1789,8 +2226,7 @@ private suspend fun resolveViewportCoffeeContext(
 private suspend fun fetchCoffeeHousesForResolvedCity(
     placesClient: PlacesClient,
     location: Location,
-    cityName: String?,
-    onCafePhotoLoaded: (String, Int, Bitmap) -> Unit
+    cityName: String?
 ): List<Cafe> {
     val places = searchCoffeeHousesNearLocation(
         placesClient = placesClient,
@@ -1810,21 +2246,14 @@ private suspend fun fetchCoffeeHousesForResolvedCity(
         )
     }
 
-    filteredPlaces.forEach { place ->
-        val placeId = place.id ?: return@forEach
-        val metadata = place.photoMetadatas?.firstOrNull() ?: return@forEach
-        fetchCafePhoto(
-            placesClient = placesClient,
-            placeId = placeId,
-            photoIndex = 0,
-            photoMetadata = metadata,
-            onSuccess = onCafePhotoLoaded
-        )
-    }
-
-    return filteredPlaces
+    val cafes = filteredPlaces
         .mapNotNull { place -> place.toCafe(distanceReference = location.toLatLng()) }
         .sortedBy { it.distanceMeters ?: Float.MAX_VALUE }
+
+    return loadCafeCardImages(
+        placesClient = placesClient,
+        cafes = cafes
+    )
 }
 
 private suspend fun fetchCoffeeHousesForViewport(
@@ -1984,6 +2413,49 @@ private suspend fun fetchCafePhotoBitmap(
     }.getOrNull()
 }
 
+private suspend fun loadCafeCardImages(
+    placesClient: PlacesClient,
+    cafes: List<Cafe>
+): List<Cafe> = coroutineScope {
+    cafes.map { cafe ->
+        async {
+            val metadata = cafe.photoMetadatas.firstOrNull() ?: return@async cafe
+            if (cafe.heroImageBitmap != null || cafe.photoBitmaps.firstOrNull() != null) return@async cafe
+            val bitmap = fetchCafePhotoBitmap(placesClient, metadata) ?: return@async cafe
+            cafe.withLoadedPhoto(index = 0, bitmap = bitmap)
+        }
+    }.awaitAll()
+}
+
+private suspend fun loadCompleteCafeImages(
+    placesClient: PlacesClient,
+    cafe: Cafe
+): Cafe {
+    if (cafe.photoMetadatas.isEmpty()) return cafe
+
+    var updatedCafe = cafe
+    cafe.photoMetadatas.forEachIndexed { index, metadata ->
+        if (updatedCafe.photoBitmaps.getOrNull(index) != null) return@forEachIndexed
+        val bitmap = fetchCafePhotoBitmap(placesClient, metadata) ?: return@forEachIndexed
+        updatedCafe = updatedCafe.withLoadedPhoto(index = index, bitmap = bitmap)
+    }
+    return updatedCafe
+}
+
+private suspend fun fetchCafeDetails(
+    placesClient: PlacesClient,
+    placeId: String
+): Cafe? {
+    if (placeId.isBlank()) return null
+
+    val request = FetchPlaceRequest
+        .builder(placeId, cafeDetailPlaceFields)
+        .build()
+    val place = placesClient.fetchPlace(request).await().place
+
+    return place.toCafe(distanceReference = null)
+}
+
 private fun Place.isLikelyCoffeeHouse(): Boolean {
     val normalizedName = displayName?.lowercase(Locale.US).orEmpty()
     val primaryTypeValue = primaryType?.lowercase(Locale.US)
@@ -2024,31 +2496,18 @@ internal fun isPhoneUnavailable(phone: String): Boolean {
     return phone.isBlank() || phone.equals(PHONE_UNAVAILABLE_TEXT, ignoreCase = true)
 }
 
-private suspend fun fetchCafePhoneNumber(
-    placesClient: PlacesClient,
-    placeId: String
-): String? {
-    if (placeId.isBlank()) return null
-
-    val request = FetchPlaceRequest
-        .builder(placeId, cafePhonePlaceFields)
-        .build()
-    val place = placesClient.fetchPlace(request).await().place
-
-    return selectCafePhoneNumber(
-        internationalPhoneNumber = place.internationalPhoneNumber,
-        nationalPhoneNumber = place.nationalPhoneNumber
-    ).takeUnless { isPhoneUnavailable(it) }
-}
-
 private fun Cafe.directionsDestination(): String? {
     latLng?.let { coordinates ->
         return "${coordinates.latitude},${coordinates.longitude}"
     }
 
     return address
-        .takeUnless { it.isBlank() || it.equals("Address unavailable", ignoreCase = true) }
+        .takeUnless(::isCafeAddressUnavailable)
         ?: name.takeIf { it.isNotBlank() }
+}
+
+private fun isNoCoffeeHousesMessage(message: String?): Boolean {
+    return message?.startsWith("No coffee houses found", ignoreCase = true) == true
 }
 
 private fun openDirectionsInGoogleMaps(context: Context, cafe: Cafe) {
@@ -2227,14 +2686,14 @@ private fun Place.toHoursMap(): LinkedHashMap<String, String> {
     return if (parsed.isNotEmpty()) {
         parsed
     } else {
-        linkedMapOf("Hours" to "Hours unavailable")
+        linkedMapOf("Hours" to HOURS_UNAVAILABLE_TEXT)
     }
 }
 
 private fun Place.toCafe(distanceReference: LatLng?): Cafe? {
     val placeId = id ?: return null
     val cafeName = displayName?.trim().takeIf { !it.isNullOrBlank() } ?: return null
-    val cafeAddress = formattedAddress?.trim().takeIf { !it.isNullOrBlank() } ?: "Address unavailable"
+    val cafeAddress = formattedAddress?.trim().takeIf { !it.isNullOrBlank() } ?: ADDRESS_UNAVAILABLE_TEXT
     val cafePhone = selectCafePhoneNumber(
         internationalPhoneNumber = internationalPhoneNumber,
         nationalPhoneNumber = nationalPhoneNumber
@@ -2246,7 +2705,7 @@ private fun Place.toCafe(distanceReference: LatLng?): Cafe? {
     val statusText = if (ratingValue != null && ratingCount != null && ratingCount > 0) {
         String.format(Locale.US, "%.1f (%d reviews)", ratingValue, ratingCount)
     } else {
-        "No ratings yet"
+        NO_RATINGS_TEXT
     }
 
     val cafeHours = toHoursMap()
@@ -2281,6 +2740,7 @@ fun MapScreen(navController: NavHostController) {
     val allCafes = cafeFeedState.cafes
     val isLoading = cafeFeedState.isLoading && allCafes.isEmpty()
     val loadError = cafeFeedState.loadError.takeIf { allCafes.isEmpty() }
+    val showLoadError = loadError != null && !isNoCoffeeHousesMessage(loadError)
     var selectedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
     var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
     val detailProgress = remember { Animatable(0f) }
@@ -2350,9 +2810,8 @@ fun MapScreen(navController: NavHostController) {
                 ?: CafeRepository.getCafe(cafeId)
         }
     }
-    val loadedSelectedPhotoCount = selectedCafe?.photoBitmaps?.count { it != null } ?: 0
     val cafesWithCoordinates = remember(renderedMapCafes) { renderedMapCafes.filter { it.latLng != null } }
-    MissingCafePhoneEffect(cafe = selectedCafe, placesClient = placesClient)
+    CafeDetailDataEffect(cafe = selectedCafe, placesClient = placesClient)
 
     LaunchedEffect(selectedCafe) {
         if (selectedCafe != null) {
@@ -2475,18 +2934,6 @@ fun MapScreen(navController: NavHostController) {
         selectedCafeId = null
     }
 
-    LaunchedEffect(selectedCafe?.id, loadedSelectedPhotoCount, placesClient) {
-        val cafe = selectedCafe ?: return@LaunchedEffect
-        val client = placesClient ?: return@LaunchedEffect
-        if (cafe.photoMetadatas.isEmpty()) return@LaunchedEffect
-
-        val nextPhotoIndex = cafe.photoBitmaps.indexOfFirst { it == null }
-        if (nextPhotoIndex == -1) return@LaunchedEffect
-
-        val bitmap = fetchCafePhotoBitmap(client, cafe.photoMetadatas[nextPhotoIndex]) ?: return@LaunchedEffect
-        CafeRepository.updateCafePhoto(cafe.id, nextPhotoIndex, bitmap)
-    }
-
     Box(modifier = Modifier.fillMaxSize()) {
         Scaffold(
             topBar = {
@@ -2547,27 +2994,10 @@ fun MapScreen(navController: NavHostController) {
 
                 when {
                     isLoading -> {
-                        Surface(
-                            modifier = Modifier.align(Alignment.Center),
-                            shape = RoundedCornerShape(18.dp),
-                            color = Color.White.copy(alpha = 0.94f),
-                            tonalElevation = 8.dp
-                        ) {
-                            Row(
-                                modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                CircularProgressIndicator(
-                                    modifier = Modifier.size(24.dp),
-                                    strokeWidth = 2.5.dp
-                                )
-                                Spacer(Modifier.width(14.dp))
-                                Text("Loading coffee houses in this map area...")
-                            }
-                        }
+                        ShuffleCafeLoadingAnimation(modifier = Modifier.align(Alignment.Center))
                     }
 
-                    loadError != null -> {
+                    showLoadError -> {
                         Surface(
                             modifier = Modifier
                                 .align(Alignment.Center)
@@ -2586,21 +3016,7 @@ fun MapScreen(navController: NavHostController) {
                     }
 
                     allCafes.isEmpty() -> {
-                        Surface(
-                            modifier = Modifier
-                                .align(Alignment.Center)
-                                .padding(horizontal = 24.dp),
-                            shape = RoundedCornerShape(20.dp),
-                            color = Color.White.copy(alpha = 0.96f),
-                            tonalElevation = 8.dp
-                        ) {
-                            Text(
-                                text = "No coffee houses found in this map area.",
-                                modifier = Modifier.padding(horizontal = 20.dp, vertical = 18.dp),
-                                textAlign = TextAlign.Center,
-                                style = MaterialTheme.typography.bodyLarge
-                            )
-                        }
+                        ShuffleCafeLoadingAnimation(modifier = Modifier.align(Alignment.Center))
                     }
                 }
             }
@@ -2678,6 +3094,7 @@ fun BookmarkScreen(navController: NavHostController) {
     var selectedStudySession by remember { mutableStateOf<StudySession?>(null) }
     var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
     val detailProgress = remember { Animatable(0f) }
+    ReportBottomNavOverlayCoverage(isActive = selectedStudySession != null)
     val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
     val interactionSource = remember { MutableInteractionSource() }
     val selectedSavedCafe = remember(savedCafes, selectedSavedCafeId) {
@@ -2685,8 +3102,8 @@ fun BookmarkScreen(navController: NavHostController) {
             savedCafes.firstOrNull { it.id == cafeId } ?: CafeRepository.getCafe(cafeId)
         }
     }
-    val loadedSelectedPhotoCount = selectedSavedCafe?.photoBitmaps?.count { it != null } ?: 0
-    MissingCafePhoneEffect(cafe = selectedSavedCafe, placesClient = placesClient)
+    SavedCafeCacheEffect(savedCafes = savedCafes, placesClient = placesClient)
+    CafeDetailDataEffect(cafe = selectedSavedCafe, placesClient = placesClient)
 
     LaunchedEffect(selectedSavedCafe) {
         if (selectedSavedCafe != null) {
@@ -2711,18 +3128,6 @@ fun BookmarkScreen(navController: NavHostController) {
 
     BackHandler(enabled = selectedSavedCafeId != null) {
         selectedSavedCafeId = null
-    }
-
-    LaunchedEffect(selectedSavedCafe?.id, loadedSelectedPhotoCount, placesClient) {
-        val cafe = selectedSavedCafe ?: return@LaunchedEffect
-        val client = placesClient ?: return@LaunchedEffect
-        if (cafe.photoMetadatas.isEmpty()) return@LaunchedEffect
-
-        val nextPhotoIndex = cafe.photoBitmaps.indexOfFirst { it == null }
-        if (nextPhotoIndex == -1) return@LaunchedEffect
-
-        val bitmap = fetchCafePhotoBitmap(client, cafe.photoMetadatas[nextPhotoIndex]) ?: return@LaunchedEffect
-        CafeRepository.updateCafePhoto(cafe.id, nextPhotoIndex, bitmap)
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
@@ -2991,20 +3396,96 @@ fun MapSearchBar(searchQuery: String, onQueryChanged: (String) -> Unit, onPlaceS
 }
 
 @Composable
-private fun MissingCafePhoneEffect(
+private fun SavedCafeCacheEffect(
+    savedCafes: List<Cafe>,
+    placesClient: PlacesClient?
+) {
+    val savedCafeKey = remember(savedCafes) {
+        savedCafes.joinToString(separator = "|") { cafe -> cafe.id }
+    }
+
+    LaunchedEffect(savedCafeKey, placesClient) {
+        val client = placesClient ?: return@LaunchedEffect
+        savedCafes.forEach { savedCafe ->
+            val currentCafe = CafeRepository.getCafe(savedCafe.id) ?: savedCafe
+            if (!BookmarkRepository.shouldEnrichSavedCafeCache(currentCafe)) return@forEach
+            if (!BookmarkRepository.markSavedCafeCacheEnrichmentStarted(currentCafe.id)) return@forEach
+
+            val completeCafe = runCatching {
+                fetchCompleteCafeForBookmarkCache(client, currentCafe)
+            }.getOrNull()
+
+            if (completeCafe == null) {
+                BookmarkRepository.markSavedCafeCacheEnrichmentFailed(currentCafe.id)
+                return@forEach
+            }
+
+            CafeRepository.updateCafeDetails(savedCafe.id, completeCafe)
+            BookmarkRepository.finishSavedCafeCacheEnrichment(
+                CafeRepository.getCafe(savedCafe.id) ?: completeCafe
+            )
+        }
+    }
+}
+
+private suspend fun fetchCompleteCafeForBookmarkCache(
+    placesClient: PlacesClient,
+    cafe: Cafe
+): Cafe {
+    val detailCafe = if (isBookmarkCacheDataIncomplete(cafe)) {
+        fetchCafeDetails(placesClient, cafe.id)
+    } else {
+        null
+    }
+    val enrichedCafe = detailCafe?.let { detail -> mergeCafeDetailData(cafe, detail) } ?: cafe
+    return loadCompleteCafeImages(placesClient, enrichedCafe)
+}
+
+@Composable
+private fun CafeDetailDataEffect(
     cafe: Cafe?,
     placesClient: PlacesClient?
 ) {
-    LaunchedEffect(cafe?.id, cafe?.phone, placesClient) {
+    val loadedPhotoCount = cafe?.photoBitmaps?.count { it != null } ?: 0
+
+    LaunchedEffect(
+        cafe?.id,
+        cafe?.phone,
+        cafe?.address,
+        cafe?.latLng,
+        cafe?.rating,
+        cafe?.userRatingCount,
+        cafe?.hours,
+        cafe?.photoMetadatas?.size,
+        placesClient
+    ) {
         val selectedCafe = cafe ?: return@LaunchedEffect
         val client = placesClient ?: return@LaunchedEffect
-        if (!isPhoneUnavailable(selectedCafe.phone)) return@LaunchedEffect
+        if (!isCafeDetailDataIncomplete(selectedCafe)) return@LaunchedEffect
 
-        val fetchedPhone = runCatching {
-            fetchCafePhoneNumber(client, selectedCafe.id)
+        val detailCafe = runCatching {
+            fetchCafeDetails(client, selectedCafe.id)
         }.getOrNull() ?: return@LaunchedEffect
 
-        CafeRepository.updateCafePhone(selectedCafe.id, fetchedPhone)
+        CafeRepository.updateCafeDetails(selectedCafe.id, detailCafe)
+    }
+
+    LaunchedEffect(
+        cafe?.id,
+        cafe?.photoMetadatas?.size,
+        loadedPhotoCount,
+        placesClient
+    ) {
+        val selectedCafe = cafe ?: return@LaunchedEffect
+        val client = placesClient ?: return@LaunchedEffect
+        val nextPhotoIndex = selectedCafe.nextUnloadedPhotoIndex() ?: return@LaunchedEffect
+
+        val bitmap = fetchCafePhotoBitmap(
+            placesClient = client,
+            photoMetadata = selectedCafe.photoMetadatas[nextPhotoIndex]
+        ) ?: return@LaunchedEffect
+
+        CafeRepository.updateCafePhoto(selectedCafe.id, nextPhotoIndex, bitmap)
     }
 }
 
@@ -3329,17 +3810,20 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
     val placesClient = remember(context) { if (Places.isInitialized()) Places.createClient(context) else null }
     val detailTextColor = Color.White
     val detailSecondaryTextColor = Color.White.copy(alpha = 0.78f)
+    val cafe = CafeRepository.getCafe(cafeId)
+    val crowdAttributeBackendState = rememberCrowdAttributeBackendState(cafe?.id ?: cafeId)
 
     LaunchedEffect(cafeId) {
         RecentRepository.add(cafeId)
     }
 
-    val cafe = CafeRepository.getCafe(cafeId)
     val reviews = ReviewRepository.reviewsFor(cafeId)
 
     val isBookmarked = BookmarkRepository.isBookmarked(cafeId)
-    MissingCafePhoneEffect(cafe = cafe, placesClient = placesClient)
+    CafeDetailDataEffect(cafe = cafe, placesClient = placesClient)
     var studyComposerCafe by remember { mutableStateOf<Cafe?>(null) }
+    var suggestionCafe by remember { mutableStateOf<Cafe?>(null) }
+    ReportBottomNavOverlayCoverage(isActive = studyComposerCafe != null || suggestionCafe != null)
 
     BackHandler(enabled = studyComposerCafe != null) {
         studyComposerCafe = null
@@ -3430,7 +3914,9 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
             item {
                 CafeCrowdAttributesPanel(
                     cafe = cafe,
-                    attributes = crowdAttributes
+                    attributes = crowdAttributes,
+                    backendState = crowdAttributeBackendState,
+                    onSuggestChanges = { suggestionCafe = cafe }
                 )
             }
 
@@ -3492,6 +3978,15 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
             StudySessionComposerOverlay(
                 cafe = selectedCafe,
                 onDismiss = { studyComposerCafe = null },
+                modifier = Modifier.matchParentSize()
+            )
+        }
+
+        suggestionCafe?.let { selectedCafe ->
+            CrowdAttributeSuggestionOverlay(
+                cafe = selectedCafe,
+                attributes = CrowdAttributeRepository.attributesFor(selectedCafe.id),
+                onDismiss = { suggestionCafe = null },
                 modifier = Modifier.matchParentSize()
             )
         }
@@ -3625,6 +4120,7 @@ private val StudySessionPopupFieldTextColor = Color.Black
 private val StudySessionCafeButtonColor = Color(0xFFB44436)
 private val CrowdActionBubbleSize = 42.dp
 private const val CROWD_TOOLTIP_DISPLAY_MILLIS = 2400L
+private const val CAFE_CROWD_PHOTO_BUCKET = "cafe-crowd-photos"
 
 private data class VisitorPhotoViewerState(
     val title: String,
@@ -3632,155 +4128,265 @@ private data class VisitorPhotoViewerState(
     val initialIndex: Int
 )
 
-@OptIn(ExperimentalMaterial3Api::class)
+private data class CrowdAttributeBackendState(
+    val isLoading: Boolean = false,
+    val message: String? = null,
+    val isError: Boolean = false
+)
+
+@Composable
+private fun rememberCrowdAttributeBackendState(cafeId: String?): CrowdAttributeBackendState {
+    var backendState by remember(cafeId) { mutableStateOf(CrowdAttributeBackendState()) }
+
+    LaunchedEffect(cafeId) {
+        if (cafeId.isNullOrBlank()) {
+            backendState = CrowdAttributeBackendState()
+            return@LaunchedEffect
+        }
+
+        backendState = CrowdAttributeBackendState(isLoading = true)
+        backendState = runCatching {
+            CrowdAttributeRepository.loadFromSupabase(cafeId)
+        }.fold(
+            onSuccess = { loaded ->
+                if (loaded) {
+                    CrowdAttributeBackendState()
+                } else {
+                    CrowdAttributeBackendState(
+                        message = "No community suggestions saved yet for this cafe id: ${cafeId.shortCafeId()}."
+                    )
+                }
+            },
+            onFailure = { error ->
+                error.printStackTrace()
+                CrowdAttributeBackendState(
+                    message = error.toCrowdLoadMessage(),
+                    isError = true
+                )
+            }
+        )
+    }
+
+    return backendState
+}
+
+private fun String.shortCafeId(): String {
+    return if (length <= 14) this else "${take(14)}..."
+}
+
 @Composable
 private fun CafeCrowdAttributesPanel(
     cafe: Cafe,
     attributes: CafeCrowdAttributes,
+    backendState: CrowdAttributeBackendState = CrowdAttributeBackendState(),
+    onSuggestChanges: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val panelTextColor = LocalContentColor.current
-    var showSuggestionSheet by remember { mutableStateOf(false) }
+    val density = LocalDensity.current
+    val textMeasurer = rememberTextMeasurer()
     var visitorPhotoViewerState by remember(cafe.id) { mutableStateOf<VisitorPhotoViewerState?>(null) }
 
-    Column(
+    BoxWithConstraints(
         modifier = modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
-        CrowdAttributeBubbleSection(
-            densePacking = true,
-            maxItemWidthFraction = 0.62f,
-            topEndAction = {
-                SuggestChangesIconBubble(onClick = { showSuggestionSheet = true })
-            }
-        ) {
-            CrowdAttributeBubble(
-                iconRes = R.drawable.outlets,
-                iconName = "Outlets",
-                value = attributes.outletAvailability.label
-            )
-            CrowdAttributeBubbleWithProtectedKey(
-                iconRes = R.drawable.wifi,
-                iconName = "WiFi",
-                value = attributes.wifiName.displayCrowdValue(),
-                keyIconRes = R.drawable.key,
-                keyIconName = "WiFi key",
-                secret = attributes.wifiPassword,
-                isAvailable = attributes.wifiSpeed.toAvailabilityFlag(),
-                cafeLatLng = cafe.latLng,
-                secretLabel = "WiFi password",
-                clipboardLabel = "${cafe.name} WiFi key",
-                isCopyable = true
-            )
-            CrowdAttributeBubble(
-                iconRes = R.drawable.wifi_speed,
-                iconName = "WiFi Speed",
-                value = attributes.wifiSpeed.label
-            )
-            CrowdAttributeBubble(
-                iconRes = R.drawable.seating_availability,
-                iconName = "Seating Availability",
-                value = attributes.seatingAvailability.label,
-                iconSize = 26.dp
-            )
-            CrowdAttributeBubble(
-                iconRes = R.drawable.seating_space,
-                iconName = "Seating space",
-                value = attributes.seatingSpace.label,
-                iconSize = 26.dp
-            )
-            CrowdAttributeBubble(
-                iconRes = R.drawable.seating_comfort,
-                iconName = "Seating Comfort",
-                value = attributes.seatingComfort.label
-            )
-            CrowdAttributeBubbleWithProtectedKey(
-                iconRes = R.drawable.bathroom,
-                iconName = "Bathroom",
-                value = attributes.bathroomAvailability.label,
-                keyIconRes = R.drawable.key,
-                keyIconName = "Bathroom key",
-                secret = attributes.bathroomCode,
-                isAvailable = attributes.bathroomAvailability.toAvailabilityFlag(),
-                cafeLatLng = cafe.latLng,
-                secretLabel = "Bathroom code",
-                clipboardLabel = "${cafe.name} bathroom key",
-                isCopyable = false
-            )
-            CrowdAttributeBubble(
-                iconRes = R.drawable.pet_friendly,
-                iconName = "Pet friendly",
-                value = attributes.petFriendly.label
-            )
-            CrowdAttributeBubble(
-                iconRes = R.drawable.cleanliness,
-                iconName = "Cleanliness",
-                value = attributes.cleanlinessRating.label
-            )
-            CrowdAttributeBubble(
-                iconRes = R.drawable.crowd_level,
-                iconName = "Crowd Level",
-                value = attributes.crowdLevel.label
-            )
-            CrowdAttributeBubble(
-                iconRes = R.drawable.noise_level,
-                iconName = "Noise Level",
-                value = attributes.noiseLevel.label
-            )
-            CrowdAttributeBubble(
-                iconRes = R.drawable.vibe_and_atmosphere,
-                iconName = "Vibe and Atmosphere",
-                value = attributes.vibeTags.displayVibeValue()
-            )
-        }
+        val compactAttributeMaxWidth = maxWidth * 0.62f
+        val compactBubbleTextStyle = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold)
+        val wifiValue = attributes.wifiName.displayCrowdValue()
+        val bathroomValue = attributes.bathroomAvailability.label
+        val shouldKeepWifiCompact = protectedAttributeFitsCompact(
+            value = wifiValue,
+            compactMaxWidth = compactAttributeMaxWidth,
+            textStyle = compactBubbleTextStyle,
+            textMeasurer = textMeasurer,
+            density = density
+        )
+        val shouldKeepBathroomCompact = protectedAttributeFitsCompact(
+            value = bathroomValue,
+            compactMaxWidth = compactAttributeMaxWidth,
+            textStyle = compactBubbleTextStyle,
+            textMeasurer = textMeasurer,
+            density = density
+        )
 
-        Row(
+        Column(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            verticalAlignment = Alignment.Top
+            verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
-            VisitorPhotoCarousel(
-                title = "Seating photos",
-                photoUris = attributes.seatingPhotoUris,
-                modifier = Modifier.weight(1f),
-                onPhotoClick = { index ->
-                    visitorPhotoViewerState = VisitorPhotoViewerState(
-                        title = "Seating photos",
-                        photoUris = attributes.seatingPhotoUris,
-                        initialIndex = index
+            CrowdAttributeBubbleSection(
+                densePacking = true,
+                maxItemWidthFraction = 0.62f,
+                topEndAction = {
+                    SuggestChangesIconBubble(onClick = onSuggestChanges)
+                }
+            ) {
+                CrowdAttributeBubble(
+                    iconRes = R.drawable.outlets,
+                    iconName = "Outlets",
+                    value = attributes.outletAvailability.label
+                )
+                if (shouldKeepWifiCompact) {
+                    CrowdAttributeBubbleWithProtectedKey(
+                        iconRes = R.drawable.wifi,
+                        iconName = "WiFi",
+                        value = wifiValue,
+                        keyIconRes = R.drawable.key,
+                        keyIconName = "WiFi key",
+                        secret = attributes.wifiPassword,
+                        isAvailable = attributes.wifiSpeed.toAvailabilityFlag(),
+                        cafeLatLng = cafe.latLng,
+                        secretLabel = "WiFi password",
+                        clipboardLabel = "${cafe.name} WiFi key",
+                        isCopyable = true
                     )
                 }
-            )
-            VisitorPhotoCarousel(
-                title = "Menu Photos",
-                photoUris = attributes.menuPhotoUris,
-                modifier = Modifier.weight(1f),
-                onPhotoClick = { index ->
-                    visitorPhotoViewerState = VisitorPhotoViewerState(
-                        title = "Menu Photos",
-                        photoUris = attributes.menuPhotoUris,
-                        initialIndex = index
+                CrowdAttributeBubble(
+                    iconRes = R.drawable.wifi_speed,
+                    iconName = "WiFi Speed",
+                    value = attributes.wifiSpeed.label
+                )
+                CrowdAttributeBubble(
+                    iconRes = R.drawable.seating_availability,
+                    iconName = "Seating Availability",
+                    value = attributes.seatingAvailability.label,
+                    iconSize = 26.dp
+                )
+                CrowdAttributeBubble(
+                    iconRes = R.drawable.seating_space,
+                    iconName = "Seating space",
+                    value = attributes.seatingSpace.label,
+                    iconSize = 26.dp
+                )
+                CrowdAttributeBubble(
+                    iconRes = R.drawable.seating_comfort,
+                    iconName = "Seating Comfort",
+                    value = attributes.seatingComfort.label
+                )
+                if (shouldKeepBathroomCompact) {
+                    CrowdAttributeBubbleWithProtectedKey(
+                        iconRes = R.drawable.bathroom,
+                        iconName = "Bathroom",
+                        value = bathroomValue,
+                        keyIconRes = R.drawable.key,
+                        keyIconName = "Bathroom key",
+                        secret = attributes.bathroomCode,
+                        isAvailable = attributes.bathroomAvailability.toAvailabilityFlag(),
+                        cafeLatLng = cafe.latLng,
+                        secretLabel = "Bathroom code",
+                        clipboardLabel = "${cafe.name} bathroom key",
+                        isCopyable = false
                     )
                 }
-            )
-        }
+                CrowdAttributeBubble(
+                    iconRes = R.drawable.pet_friendly,
+                    iconName = "Pet friendly",
+                    value = attributes.petFriendly.label
+                )
+                CrowdAttributeBubble(
+                    iconRes = R.drawable.cleanliness,
+                    iconName = "Cleanliness",
+                    value = attributes.cleanlinessRating.label
+                )
+                CrowdAttributeBubble(
+                    iconRes = R.drawable.crowd_level,
+                    iconName = "Crowd Level",
+                    value = attributes.crowdLevel.label
+                )
+                CrowdAttributeBubble(
+                    iconRes = R.drawable.noise_level,
+                    iconName = "Noise Level",
+                    value = attributes.noiseLevel.label
+                )
+                CrowdAttributeBubble(
+                    iconRes = R.drawable.vibe_and_atmosphere,
+                    iconName = "Vibe and Atmosphere",
+                    value = attributes.vibeTags.displayVibeValue()
+                )
+            }
 
-        if (attributes.lastUpdatedEpochMillis != null) {
-            Text(
-                text = "Updated from local suggestions this session.",
-                color = panelTextColor.copy(alpha = 0.78f),
-                style = MaterialTheme.typography.bodySmall
-            )
-        }
-    }
+            if (!shouldKeepWifiCompact || !shouldKeepBathroomCompact) {
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    if (!shouldKeepWifiCompact) {
+                        CrowdAttributeBubbleWithProtectedKey(
+                            iconRes = R.drawable.wifi,
+                            iconName = "WiFi",
+                            value = wifiValue,
+                            keyIconRes = R.drawable.key,
+                            keyIconName = "WiFi key",
+                            secret = attributes.wifiPassword,
+                            isAvailable = attributes.wifiSpeed.toAvailabilityFlag(),
+                            cafeLatLng = cafe.latLng,
+                            secretLabel = "WiFi password",
+                            clipboardLabel = "${cafe.name} WiFi key",
+                            isCopyable = true,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                    if (!shouldKeepBathroomCompact) {
+                        CrowdAttributeBubbleWithProtectedKey(
+                            iconRes = R.drawable.bathroom,
+                            iconName = "Bathroom",
+                            value = bathroomValue,
+                            keyIconRes = R.drawable.key,
+                            keyIconName = "Bathroom key",
+                            secret = attributes.bathroomCode,
+                            isAvailable = attributes.bathroomAvailability.toAvailabilityFlag(),
+                            cafeLatLng = cafe.latLng,
+                            secretLabel = "Bathroom code",
+                            clipboardLabel = "${cafe.name} bathroom key",
+                            isCopyable = false,
+                            modifier = Modifier.fillMaxWidth()
+                        )
+                    }
+                }
+            }
 
-    if (showSuggestionSheet) {
-        ModalBottomSheet(onDismissRequest = { showSuggestionSheet = false }) {
-            CrowdAttributeSuggestionForm(
-                cafe = cafe,
-                attributes = attributes,
-                onSubmit = { showSuggestionSheet = false },
-                modifier = Modifier.heightIn(max = 680.dp)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.Top
+            ) {
+                VisitorPhotoCarousel(
+                    title = "Seating photos",
+                    photoUris = attributes.seatingPhotoUris,
+                    modifier = Modifier.weight(1f),
+                    onPhotoClick = { index ->
+                        visitorPhotoViewerState = VisitorPhotoViewerState(
+                            title = "Seating photos",
+                            photoUris = attributes.seatingPhotoUris,
+                            initialIndex = index
+                        )
+                    }
+                )
+                VisitorPhotoCarousel(
+                    title = "Menu Photos",
+                    photoUris = attributes.menuPhotoUris,
+                    modifier = Modifier.weight(1f),
+                    onPhotoClick = { index ->
+                        visitorPhotoViewerState = VisitorPhotoViewerState(
+                            title = "Menu Photos",
+                            photoUris = attributes.menuPhotoUris,
+                            initialIndex = index
+                        )
+                    }
+                )
+            }
+
+            if (attributes.lastUpdatedEpochMillis != null) {
+                Text(
+                    text = "Updated from community suggestions.",
+                    color = panelTextColor.copy(alpha = 0.78f),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            }
+
+            CrowdAttributeBackendStatusText(
+                backendState = backendState,
+                hasCommunityAttributes = attributes.lastUpdatedEpochMillis != null,
+                textColor = panelTextColor
             )
         }
     }
@@ -3794,7 +4400,182 @@ private fun CafeCrowdAttributesPanel(
                 initialPage = viewerState.initialIndex,
                 onDismiss = { visitorPhotoViewerState = null }
             )
+    }
+}
+
+@Composable
+private fun CrowdAttributeBackendStatusText(
+    backendState: CrowdAttributeBackendState,
+    hasCommunityAttributes: Boolean,
+    textColor: Color
+) {
+    val message = when {
+        backendState.isLoading -> "Loading community suggestions..."
+        backendState.isError -> backendState.message
+        hasCommunityAttributes -> null
+        else -> backendState.message
+    } ?: return
+
+    Text(
+        text = message,
+        color = if (backendState.isError) MaterialTheme.colorScheme.error else textColor.copy(alpha = 0.78f),
+        style = MaterialTheme.typography.bodySmall
+    )
+}
+
+@Composable
+private fun CrowdAttributeSuggestionOverlay(
+    cafe: Cafe,
+    attributes: CafeCrowdAttributes,
+    onDismiss: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val interactionSource = remember { MutableInteractionSource() }
+    var isVisible by remember { mutableStateOf(false) }
+    var isClosing by remember { mutableStateOf(false) }
+
+    LaunchedEffect(Unit) {
+        isVisible = true
+    }
+
+    fun closeSuggestion() {
+        if (isClosing) return
+        isClosing = true
+        isVisible = false
+        scope.launch {
+            delay(140)
+            onDismiss()
         }
+    }
+
+    BackHandler(enabled = true) {
+        closeSuggestion()
+    }
+
+    val overlayAlpha by animateFloatAsState(
+        targetValue = if (isVisible) 1f else 0f,
+        animationSpec = tween(durationMillis = 140, easing = FastOutSlowInEasing),
+        label = "crowdSuggestionAlpha"
+    )
+    val overlayScale by animateFloatAsState(
+        targetValue = if (isVisible) 1f else 0.92f,
+        animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing),
+        label = "crowdSuggestionScale"
+    )
+
+    Box(modifier = modifier.zIndex(10f)) {
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .background(Color.Black.copy(alpha = 0.24f * overlayAlpha))
+                .clickable(
+                    interactionSource = interactionSource,
+                    indication = null
+                ) {
+                    closeSuggestion()
+                }
+        )
+
+        Card(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .padding(20.dp)
+                .fillMaxWidth()
+                .widthIn(max = 420.dp)
+                .heightIn(max = 660.dp)
+                .graphicsLayer {
+                    alpha = overlayAlpha
+                    scaleX = overlayScale
+                    scaleY = overlayScale
+                },
+            shape = RoundedCornerShape(20.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = StudySessionPopupSurfaceColor,
+                contentColor = StudySessionPopupTextColor
+            ),
+            elevation = CardDefaults.cardElevation(defaultElevation = 12.dp),
+            border = BorderStroke(2.dp, Color.Black)
+        ) {
+            Column(
+                modifier = Modifier.padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        modifier = Modifier.size(44.dp),
+                        shape = CircleShape,
+                        color = SuggestChangesBubbleColor
+                    ) {
+                        Icon(
+                            painter = painterResource(id = R.drawable.edit),
+                            contentDescription = null,
+                            modifier = Modifier.padding(10.dp),
+                            tint = Color.Unspecified
+                        )
+                    }
+                    Spacer(modifier = Modifier.width(12.dp))
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Suggest changes",
+                            style = MaterialTheme.typography.titleMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = StudySessionPopupTextColor
+                        )
+                        Text(
+                            text = cafe.name,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = StudySessionPopupSecondaryTextColor,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                    IconButton(onClick = { closeSuggestion() }) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = "Close suggestion form",
+                            tint = StudySessionPopupTextColor
+                        )
+                    }
+                }
+
+                CrowdAttributeSuggestionForm(
+                    cafe = cafe,
+                    attributes = attributes,
+                    onSubmitSuggestion = { suggestion ->
+                        val suggestionWithUploadedPhotos = suggestion.copy(
+                            seatingPhotoUris = uploadCafeCrowdPhotos(
+                                context = context,
+                                cafeId = cafe.id,
+                                photoKind = "seating",
+                                photoUris = suggestion.seatingPhotoUris
+                            ),
+                            menuPhotoUris = uploadCafeCrowdPhotos(
+                                context = context,
+                                cafeId = cafe.id,
+                                photoKind = "menu",
+                                photoUris = suggestion.menuPhotoUris
+                            )
+                        )
+                        CrowdAttributeRepository.submitSuggestionToSupabase(
+                            cafeId = cafe.id,
+                            suggestion = suggestionWithUploadedPhotos
+                        )
+                    },
+                    onCancel = { closeSuggestion() },
+                    onSubmit = { closeSuggestion() },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .weight(1f, fill = false),
+                    contentPadding = PaddingValues(bottom = 0.dp)
+                )
+            }
+        }
+    }
 }
 
 @Composable
@@ -4181,6 +4962,30 @@ private fun CrowdAttributePlainSection(
     }
 }
 
+private fun protectedAttributeFitsCompact(
+    value: String,
+    compactMaxWidth: Dp,
+    textStyle: TextStyle,
+    textMeasurer: TextMeasurer,
+    density: Density
+): Boolean {
+    val displayValue = value.displayCrowdBubbleValue()
+    val requiredWidthPx = with(density) {
+        if (displayValue == null) {
+            CrowdActionBubbleSize.toPx() + 20.dp.toPx() + CrowdActionBubbleSize.toPx()
+        } else {
+            val textWidthPx = textMeasurer.measure(
+                text = displayValue,
+                style = textStyle
+            ).size.width
+            12.dp.toPx() + 20.dp.toPx() + 8.dp.toPx() + textWidthPx + 12.dp.toPx() +
+                20.dp.toPx() + CrowdActionBubbleSize.toPx()
+        }
+    }
+
+    return requiredWidthPx <= with(density) { compactMaxWidth.toPx() }
+}
+
 @Composable
 private fun CrowdAttributeBubble(
     iconRes: Int,
@@ -4289,15 +5094,18 @@ private fun CrowdAttributeBubbleWithProtectedKey(
     cafeLatLng: LatLng?,
     secretLabel: String,
     clipboardLabel: String,
-    isCopyable: Boolean
+    isCopyable: Boolean,
+    modifier: Modifier = Modifier
 ) {
     Row(
+        modifier = modifier,
         verticalAlignment = Alignment.CenterVertically
     ) {
         CrowdAttributeBubble(
             iconRes = iconRes,
             iconName = iconName,
-            value = value
+            value = value,
+            modifier = Modifier.weight(1f, fill = false)
         )
         ProtectedKeyConnectorLine()
         ProtectedSecretKeyBubble(
@@ -4775,57 +5583,157 @@ private fun addPickedPhotoUris(
         }
 }
 
+private suspend fun uploadCafeCrowdPhotos(
+    context: Context,
+    cafeId: String,
+    photoKind: String,
+    photoUris: List<String>
+): List<String> {
+    if (photoUris.isEmpty()) return emptyList()
+
+    val bucket = supabase.storage.from(CAFE_CROWD_PHOTO_BUCKET)
+    val cafePath = cafeId.toStoragePathSegment()
+    val kindPath = photoKind.toStoragePathSegment()
+    val uploadedUrls = mutableListOf<String>()
+
+    photoUris
+        .mapNotNull { uriText -> uriText.trim().takeIf { it.isNotBlank() } }
+        .distinct()
+        .forEach { uriText ->
+            if (uriText.startsWith("http://") || uriText.startsWith("https://")) {
+                uploadedUrls.add(uriText)
+                return@forEach
+            }
+
+            val uri = Uri.parse(uriText)
+            val bytes = withContext(Dispatchers.IO) {
+                context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                    inputStream.readBytes()
+                }
+            } ?: return@forEach
+
+            val storagePath = "$cafePath/$kindPath/${UUID.randomUUID()}.jpg"
+            bucket.upload(
+                path = storagePath,
+                data = bytes
+            )
+            uploadedUrls.add(bucket.publicUrl(storagePath))
+        }
+
+    return uploadedUrls
+}
+
+private fun String.toStoragePathSegment(): String {
+    return replace(Regex("[^A-Za-z0-9._-]"), "_").ifBlank { "unknown" }
+}
+
+private fun Throwable.toCrowdSuggestionMessage(): String = toCrowdBackendMessage("submit this suggestion")
+
+private fun Throwable.toCrowdLoadMessage(): String = toCrowdBackendMessage("load community suggestions")
+
+private fun Throwable.toCrowdBackendMessage(operation: String): String {
+    val details = buildList {
+        message?.takeIf { it.isNotBlank() }?.let { add(it) }
+        when (this@toCrowdBackendMessage) {
+            is PostgrestRestException -> {
+                code?.takeIf { it.isNotBlank() }?.let { add("Code: $it") }
+                hint?.takeIf { it.isNotBlank() }?.let { add("Hint: $it") }
+                details?.toString()?.takeIf { it.isNotBlank() && it != "null" }?.let { add("Details: $it") }
+            }
+            is RestException -> {
+                description?.takeIf { it.isNotBlank() }?.let { add(it) }
+            }
+        }
+    }.joinToString(" ")
+
+    return when {
+        this is RestException && (statusCode == 401 || statusCode == 403) ->
+            "Supabase rejected this request. Check that you are signed in and that the cafe_crowd_attributes RLS policies were created. ${details.toDebugSuffix()}"
+        this is RestException && statusCode == 404 ->
+            "Supabase could not find the cafe_crowd_attributes table. Run the SQL setup file in Supabase. ${details.toDebugSuffix()}"
+        this is HttpRequestException ->
+            "The app could not reach Supabase. Check your connection and Supabase project URL. ${details.toDebugSuffix()}"
+        details.contains("cafe_crowd_attributes", ignoreCase = true) ||
+            details.contains("schema cache", ignoreCase = true) ||
+            details.contains("column", ignoreCase = true) ->
+            "Cafe attributes are not set up correctly in Supabase. Re-run the SQL setup file, then try again. ${details.toDebugSuffix()}"
+        details.contains(CAFE_CROWD_PHOTO_BUCKET, ignoreCase = true) ->
+            "Cafe photo uploads are not set up in Supabase yet. Create the cafe-crowd-photos bucket, then try again. ${details.toDebugSuffix()}"
+        details.contains("Sign in", ignoreCase = true) ->
+            "Sign in before suggesting changes."
+        else ->
+            "Could not $operation yet. Supabase said: ${details.ifBlank { this::class.simpleName ?: "Unknown error" }}"
+    }
+}
+
+private fun String.toDebugSuffix(): String {
+    return if (isBlank()) "" else "Supabase said: $this"
+}
+
 @Composable
 private fun SuggestionPhotoPickerField(
+    iconRes: Int,
     title: String,
     selectedPhotoUris: SnapshotStateList<String>,
-    onPickPhotos: () -> Unit
+    onPickPhotos: () -> Unit,
+    iconSize: Dp = 20.dp
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(title, style = MaterialTheme.typography.labelLarge, color = Color.Black)
-        OutlinedButton(
-            onClick = onPickPhotos,
-            modifier = Modifier.fillMaxWidth()
-        ) {
-            Icon(Icons.Filled.AddPhotoAlternate, contentDescription = null)
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(if (selectedPhotoUris.isEmpty()) "Select photos" else "Add more photos")
-        }
-        if (selectedPhotoUris.isEmpty()) {
-            Text(
-                text = "No photos selected yet.",
-                style = MaterialTheme.typography.bodySmall,
-                color = Color.Black.copy(alpha = 0.64f)
-            )
-        } else {
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                selectedPhotoUris.forEachIndexed { index, uri ->
-                    OutlinedCard(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(120.dp),
-                        shape = RoundedCornerShape(8.dp),
-                        border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.38f))
-                    ) {
-                        Box(modifier = Modifier.fillMaxSize()) {
-                            AsyncImage(
-                                model = uri,
-                                contentDescription = "$title selection ${index + 1}",
-                                modifier = Modifier.fillMaxSize(),
-                                contentScale = ContentScale.Crop
-                            )
-                            IconButton(
-                                onClick = { selectedPhotoUris.removeAt(index) },
-                                modifier = Modifier
-                                    .align(Alignment.TopEnd)
-                                    .padding(6.dp)
-                                    .background(Color.Black.copy(alpha = 0.45f), CircleShape)
-                            ) {
-                                Icon(
-                                    Icons.Filled.Close,
-                                    contentDescription = "Remove photo",
-                                    tint = Color.White
+    SuggestionBubbleContainer(
+        iconRes = iconRes,
+        iconName = title,
+        label = title,
+        iconSize = iconSize
+    ) {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(
+                onClick = onPickPhotos,
+                modifier = Modifier.fillMaxWidth(),
+                colors = ButtonDefaults.outlinedButtonColors(
+                    containerColor = StudySessionPopupFieldColor,
+                    contentColor = StudySessionPopupFieldTextColor
+                ),
+                border = BorderStroke(1.dp, Color.Black)
+            ) {
+                Icon(Icons.Filled.AddPhotoAlternate, contentDescription = null)
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(if (selectedPhotoUris.isEmpty()) "Select photos" else "Add more photos")
+            }
+            if (selectedPhotoUris.isEmpty()) {
+                Text(
+                    text = "No photos selected yet.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = StudySessionPopupFieldTextColor.copy(alpha = 0.64f)
+                )
+            } else {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    selectedPhotoUris.forEachIndexed { index, uri ->
+                        OutlinedCard(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(120.dp),
+                            shape = RoundedCornerShape(8.dp),
+                            border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.38f))
+                        ) {
+                            Box(modifier = Modifier.fillMaxSize()) {
+                                AsyncImage(
+                                    model = uri,
+                                    contentDescription = "$title selection ${index + 1}",
+                                    modifier = Modifier.fillMaxSize(),
+                                    contentScale = ContentScale.Crop
                                 )
+                                IconButton(
+                                    onClick = { selectedPhotoUris.removeAt(index) },
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(6.dp)
+                                        .background(Color.Black.copy(alpha = 0.45f), CircleShape)
+                                ) {
+                                    Icon(
+                                        Icons.Filled.Close,
+                                        contentDescription = "Remove photo",
+                                        tint = Color.White
+                                    )
+                                }
                             }
                         }
                     }
@@ -4839,18 +5747,19 @@ private fun SuggestionPhotoPickerField(
 private fun CrowdAttributeSuggestionForm(
     cafe: Cafe,
     attributes: CafeCrowdAttributes,
+    onSubmitSuggestion: suspend (CrowdAttributeSuggestion) -> Unit,
+    onCancel: () -> Unit,
     onSubmit: () -> Unit,
     modifier: Modifier = Modifier,
-    contentPadding: PaddingValues = PaddingValues(start = 20.dp, end = 20.dp, bottom = 28.dp)
+    contentPadding: PaddingValues = PaddingValues(bottom = 28.dp)
 ) {
+    val scope = rememberCoroutineScope()
     var outletAvailability by remember(cafe.id, attributes) { mutableStateOf(attributes.outletAvailability) }
     var wifiName by remember(cafe.id, attributes) { mutableStateOf(attributes.wifiName.orEmpty()) }
     var wifiSpeed by remember(cafe.id, attributes) { mutableStateOf(attributes.wifiSpeed) }
-    var wifiPassword by remember(cafe.id, attributes) { mutableStateOf(attributes.wifiPassword.value.orEmpty()) }
-    var wifiPasswordExists by remember(cafe.id, attributes) { mutableStateOf(attributes.wifiPassword.knownToExist) }
+    var wifiPassword by remember(cafe.id) { mutableStateOf("") }
     var bathroomAvailability by remember(cafe.id, attributes) { mutableStateOf(attributes.bathroomAvailability) }
-    var bathroomCode by remember(cafe.id, attributes) { mutableStateOf(attributes.bathroomCode.value.orEmpty()) }
-    var bathroomCodeExists by remember(cafe.id, attributes) { mutableStateOf(attributes.bathroomCode.knownToExist) }
+    var bathroomCode by remember(cafe.id) { mutableStateOf("") }
     var seatingAvailability by remember(cafe.id, attributes) { mutableStateOf(attributes.seatingAvailability) }
     var seatingSpace by remember(cafe.id, attributes) { mutableStateOf(attributes.seatingSpace) }
     var seatingComfort by remember(cafe.id, attributes) { mutableStateOf(attributes.seatingComfort) }
@@ -4859,6 +5768,8 @@ private fun CrowdAttributeSuggestionForm(
     var petFriendly by remember(cafe.id, attributes) { mutableStateOf(attributes.petFriendly) }
     var cleanlinessRating by remember(cafe.id, attributes) { mutableStateOf(attributes.cleanlinessRating) }
     var selectedVibeTags by remember(cafe.id, attributes) { mutableStateOf(attributes.vibeTags) }
+    var isSubmitting by remember(cafe.id) { mutableStateOf(false) }
+    var submitError by remember(cafe.id) { mutableStateOf<String?>(null) }
     val selectedSeatingPhotoUris = remember(cafe.id) { mutableStateListOf<String>() }
     val selectedMenuPhotoUris = remember(cafe.id) { mutableStateListOf<String>() }
     val seatingPhotoPicker = rememberLauncherForActivityResult(
@@ -4878,106 +5789,143 @@ private fun CrowdAttributeSuggestionForm(
         verticalArrangement = Arrangement.spacedBy(14.dp)
     ) {
             item {
-                Text(
-                    text = cafe.name,
-                    color = Color.Black.copy(alpha = 0.72f),
-                    style = MaterialTheme.typography.bodyMedium
-                )
-            }
-
-            item {
-                SuggestionDropdown("Outlets", outletAvailability, OutletAvailability.entries, { it.label }) {
+                SuggestionDropdown(
+                    iconRes = R.drawable.outlets,
+                    label = "Outlets",
+                    selected = outletAvailability,
+                    options = OutletAvailability.entries,
+                    optionLabel = { it.label }
+                ) {
                     outletAvailability = it
                 }
             }
             item {
-                OutlinedTextField(
+                SuggestionTextField(
+                    iconRes = R.drawable.wifi,
+                    label = "WiFi",
                     value = wifiName,
                     onValueChange = { wifiName = it },
-                    label = { Text("WiFi") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true
-                )
-            }
-            item {
-                SuggestionDropdown("Wi-Fi speed", wifiSpeed, WifiSpeed.entries, { it.label }) {
-                    wifiSpeed = it
-                }
-            }
-            item {
-                OutlinedTextField(
-                    value = wifiPassword,
-                    onValueChange = { wifiPassword = it },
-                    label = { Text("WiFi key") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true
-                )
-            }
-            item {
-                ToggleRow(
-                    label = "WiFi key exists, but I do not know it",
-                    checked = wifiPasswordExists,
-                    onCheckedChange = { wifiPasswordExists = it }
-                )
-            }
-            item {
-                SuggestionDropdown("Bathroom", bathroomAvailability, BathroomAvailability.entries, { it.label }) {
-                    bathroomAvailability = it
-                }
-            }
-            item {
-                OutlinedTextField(
-                    value = bathroomCode,
-                    onValueChange = { bathroomCode = it },
-                    label = { Text("Bathroom key") },
-                    modifier = Modifier.fillMaxWidth(),
-                    singleLine = true
-                )
-            }
-            item {
-                ToggleRow(
-                    label = "Bathroom key exists, but I do not know it",
-                    checked = bathroomCodeExists,
-                    onCheckedChange = { bathroomCodeExists = it }
+                    placeholder = "Network name"
                 )
             }
             item {
                 SuggestionDropdown(
-                    "Seating availability",
-                    seatingAvailability,
-                    SeatingAvailability.entries,
-                    { it.label }
+                    iconRes = R.drawable.wifi_speed,
+                    label = "WiFi Speed",
+                    selected = wifiSpeed,
+                    options = WifiSpeed.entries,
+                    optionLabel = { it.label }
+                ) {
+                    wifiSpeed = it
+                }
+            }
+            item {
+                SuggestionTextField(
+                    iconRes = R.drawable.key,
+                    label = "WiFi key",
+                    value = wifiPassword,
+                    onValueChange = { wifiPassword = it },
+                    placeholder = "WiFi Password",
+                    visualTransformation = PasswordVisualTransformation()
+                )
+            }
+            item {
+                SuggestionDropdown(
+                    iconRes = R.drawable.bathroom,
+                    label = "Bathroom",
+                    selected = bathroomAvailability,
+                    options = BathroomAvailability.entries,
+                    optionLabel = { it.label }
+                ) {
+                    bathroomAvailability = it
+                }
+            }
+            item {
+                SuggestionTextField(
+                    iconRes = R.drawable.key,
+                    label = "Bathroom key",
+                    value = bathroomCode,
+                    onValueChange = { bathroomCode = it },
+                    placeholder = "Bathroom code",
+                    visualTransformation = PasswordVisualTransformation()
+                )
+            }
+            item {
+                SuggestionDropdown(
+                    iconRes = R.drawable.seating_availability,
+                    label = "Seating Availability",
+                    selected = seatingAvailability,
+                    options = SeatingAvailability.entries,
+                    optionLabel = { it.label },
+                    iconSize = 26.dp
                 ) {
                     seatingAvailability = it
                 }
             }
             item {
-                SuggestionDropdown("Seating space", seatingSpace, SeatingSpace.entries, { it.label }) {
+                SuggestionDropdown(
+                    iconRes = R.drawable.seating_space,
+                    label = "Seating space",
+                    selected = seatingSpace,
+                    options = SeatingSpace.entries,
+                    optionLabel = { it.label },
+                    iconSize = 26.dp
+                ) {
                     seatingSpace = it
                 }
             }
             item {
-                SuggestionDropdown("Seating comfort", seatingComfort, SeatingComfort.entries, { it.label }) {
+                SuggestionDropdown(
+                    iconRes = R.drawable.seating_comfort,
+                    label = "Seating Comfort",
+                    selected = seatingComfort,
+                    options = SeatingComfort.entries,
+                    optionLabel = { it.label }
+                ) {
                     seatingComfort = it
                 }
             }
             item {
-                SuggestionDropdown("Crowd level", crowdLevel, CrowdLevel.entries, { it.label }) {
+                SuggestionDropdown(
+                    iconRes = R.drawable.crowd_level,
+                    label = "Crowd Level",
+                    selected = crowdLevel,
+                    options = CrowdLevel.entries,
+                    optionLabel = { it.label }
+                ) {
                     crowdLevel = it
                 }
             }
             item {
-                SuggestionDropdown("Noise level", noiseLevel, NoiseLevel.entries, { it.label }) {
+                SuggestionDropdown(
+                    iconRes = R.drawable.noise_level,
+                    label = "Noise Level",
+                    selected = noiseLevel,
+                    options = NoiseLevel.entries,
+                    optionLabel = { it.label }
+                ) {
                     noiseLevel = it
                 }
             }
             item {
-                SuggestionDropdown("Pet-friendly", petFriendly, PetFriendly.entries, { it.label }) {
+                SuggestionDropdown(
+                    iconRes = R.drawable.pet_friendly,
+                    label = "Pet friendly",
+                    selected = petFriendly,
+                    options = PetFriendly.entries,
+                    optionLabel = { it.label }
+                ) {
                     petFriendly = it
                 }
             }
             item {
-                SuggestionDropdown("Cleanliness", cleanlinessRating, CleanlinessRating.entries, { it.label }) {
+                SuggestionDropdown(
+                    iconRes = R.drawable.cleanliness,
+                    label = "Cleanliness",
+                    selected = cleanlinessRating,
+                    options = CleanlinessRating.entries,
+                    optionLabel = { it.label }
+                ) {
                     cleanlinessRating = it
                 }
             }
@@ -4989,36 +5937,46 @@ private fun CrowdAttributeSuggestionForm(
             }
             item {
                 SuggestionPhotoPickerField(
+                    iconRes = R.drawable.seating_availability,
                     title = "Seating photos",
                     selectedPhotoUris = selectedSeatingPhotoUris,
-                    onPickPhotos = { seatingPhotoPicker.launch("image/*") }
+                    onPickPhotos = { seatingPhotoPicker.launch("image/*") },
+                    iconSize = 26.dp
                 )
             }
             item {
                 SuggestionPhotoPickerField(
+                    iconRes = R.drawable.edit,
                     title = "Menu photos",
                     selectedPhotoUris = selectedMenuPhotoUris,
                     onPickPhotos = { menuPhotoPicker.launch("image/*") }
                 )
             }
             item {
-                Button(
-                    onClick = {
-                        CrowdAttributeRepository.applySuggestion(
-                            cafeId = cafe.id,
-                            suggestion = CrowdAttributeSuggestion(
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(
+                        onClick = onCancel,
+                        enabled = !isSubmitting,
+                        colors = ButtonDefaults.textButtonColors(
+                            contentColor = StudySessionPopupTextColor,
+                            disabledContentColor = StudySessionPopupTextColor.copy(alpha = 0.5f)
+                        )
+                    ) {
+                        Text("Cancel")
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = {
+                        val suggestion = CrowdAttributeSuggestion(
                                 outletAvailability = outletAvailability,
                                 wifiName = wifiName,
                                 wifiSpeed = wifiSpeed,
-                                wifiPassword = ProtectedCrowdSecret(
-                                    value = wifiPassword,
-                                    knownToExist = wifiPasswordExists
-                                ),
+                                wifiPassword = wifiPassword.toTypedSecretSuggestion(),
                                 bathroomAvailability = bathroomAvailability,
-                                bathroomCode = ProtectedCrowdSecret(
-                                    value = bathroomCode,
-                                    knownToExist = bathroomCodeExists
-                                ),
+                                bathroomCode = bathroomCode.toTypedSecretSuggestion(),
                                 seatingAvailability = seatingAvailability,
                                 seatingSpace = seatingSpace,
                                 seatingComfort = seatingComfort,
@@ -5030,12 +5988,49 @@ private fun CrowdAttributeSuggestionForm(
                                 seatingPhotoUris = selectedSeatingPhotoUris.toList(),
                                 menuPhotoUris = selectedMenuPhotoUris.toList()
                             )
+                        scope.launch {
+                            isSubmitting = true
+                            submitError = null
+                            try {
+                                onSubmitSuggestion(suggestion)
+                                onSubmit()
+                            } catch (error: Exception) {
+                                submitError = error.toCrowdSuggestionMessage()
+                                error.printStackTrace()
+                            } finally {
+                                isSubmitting = false
+                            }
+                        }
+                        },
+                        enabled = !isSubmitting,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = StudySessionPopupFieldColor,
+                            contentColor = StudySessionPopupFieldTextColor,
+                            disabledContainerColor = StudySessionPopupFieldColor.copy(alpha = 0.42f),
+                            disabledContentColor = StudySessionPopupFieldTextColor.copy(alpha = 0.5f)
                         )
-                        onSubmit()
-                    },
-                    modifier = Modifier.fillMaxWidth()
-                ) {
-                    Text("Submit suggestion")
+                    ) {
+                        if (isSubmitting) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = LocalContentColor.current
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Submitting...")
+                        } else {
+                            Text("Submit")
+                        }
+                    }
+                }
+            }
+            submitError?.let { message ->
+                item {
+                    Text(
+                        text = message,
+                        color = MaterialTheme.colorScheme.error,
+                        style = MaterialTheme.typography.bodySmall
+                    )
                 }
             }
     }
@@ -5043,27 +6038,41 @@ private fun CrowdAttributeSuggestionForm(
 
 @Composable
 private fun <T> SuggestionDropdown(
+    iconRes: Int,
     label: String,
     selected: T,
     options: Iterable<T>,
     optionLabel: (T) -> String,
+    iconSize: Dp = 20.dp,
     onSelected: (T) -> Unit
 ) {
     var expanded by remember { mutableStateOf(false) }
 
     Box(modifier = Modifier.fillMaxWidth()) {
-        OutlinedButton(
-            onClick = { expanded = true },
-            modifier = Modifier.fillMaxWidth()
+        SuggestionBubbleContainer(
+            iconRes = iconRes,
+            iconName = label,
+            label = label,
+            iconSize = iconSize,
+            modifier = Modifier.clickable { expanded = true }
         ) {
-            Column(
-                modifier = Modifier.weight(1f),
-                horizontalAlignment = Alignment.Start
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
             ) {
-                Text(label, style = MaterialTheme.typography.labelMedium, color = Color.Gray)
-                Text(optionLabel(selected), textAlign = TextAlign.Start)
+                Text(
+                    text = optionLabel(selected),
+                    modifier = Modifier.weight(1f),
+                    color = StudySessionPopupFieldTextColor,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Icon(
+                    Icons.Filled.ArrowDropDown,
+                    contentDescription = null,
+                    tint = StudySessionPopupFieldTextColor
+                )
             }
-            Icon(Icons.Filled.ArrowDropDown, contentDescription = null)
         }
         DropdownMenu(
             expanded = expanded,
@@ -5083,20 +6092,81 @@ private fun <T> SuggestionDropdown(
 }
 
 @Composable
-private fun ToggleRow(
+private fun SuggestionTextField(
+    iconRes: Int,
     label: String,
-    checked: Boolean,
-    onCheckedChange: (Boolean) -> Unit
+    value: String,
+    onValueChange: (String) -> Unit,
+    placeholder: String,
+    iconSize: Dp = 20.dp,
+    visualTransformation: VisualTransformation = VisualTransformation.None
 ) {
-    Row(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onCheckedChange(!checked) },
-        verticalAlignment = Alignment.CenterVertically
+    SuggestionBubbleContainer(
+        iconRes = iconRes,
+        iconName = label,
+        label = label,
+        iconSize = iconSize
     ) {
-        Checkbox(checked = checked, onCheckedChange = onCheckedChange)
-        Spacer(modifier = Modifier.width(8.dp))
-        Text(label, style = MaterialTheme.typography.bodyMedium)
+        OutlinedTextField(
+            value = value,
+            onValueChange = onValueChange,
+            placeholder = { Text(placeholder, color = DetailInfoBubbleTextColor) },
+            modifier = Modifier.fillMaxWidth(),
+            singleLine = true,
+            visualTransformation = visualTransformation,
+            colors = studySessionTextFieldColors()
+        )
+    }
+}
+
+private fun String.toTypedSecretSuggestion(): ProtectedCrowdSecret? {
+    return trim()
+        .takeIf { it.isNotBlank() }
+        ?.let { ProtectedCrowdSecret(value = it, knownToExist = false) }
+}
+
+@Composable
+private fun SuggestionBubbleContainer(
+    iconRes: Int,
+    iconName: String,
+    label: String,
+    modifier: Modifier = Modifier,
+    iconSize: Dp = 20.dp,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    Surface(
+        modifier = modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(24.dp),
+        color = StudySessionPopupFieldColor,
+        contentColor = StudySessionPopupFieldTextColor,
+        border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.72f))
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.Top
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(CrowdActionBubbleSize)
+                    .background(Color.White.copy(alpha = 0.18f), CircleShape),
+                contentAlignment = Alignment.Center
+            ) {
+                CrowdBubbleIcon(iconRes = iconRes, contentDescription = iconName, size = iconSize)
+            }
+            Spacer(modifier = Modifier.width(12.dp))
+            Column(
+                modifier = Modifier.weight(1f),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = label,
+                    color = StudySessionPopupFieldTextColor.copy(alpha = 0.72f),
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                content()
+            }
+        }
     }
 }
 
@@ -5105,10 +6175,20 @@ private fun VibeTagSelector(
     selectedTags: Set<VibeTag>,
     onSelectedTagsChanged: (Set<VibeTag>) -> Unit
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text("Vibe / atmosphere", style = MaterialTheme.typography.titleSmall, fontWeight = FontWeight.SemiBold)
+    SuggestionBubbleContainer(
+        iconRes = R.drawable.vibe_and_atmosphere,
+        iconName = "Vibe and Atmosphere",
+        label = "Vibe and Atmosphere"
+    ) {
+        val chipColors = FilterChipDefaults.filterChipColors(
+            containerColor = Color.White.copy(alpha = 0.18f),
+            labelColor = StudySessionPopupFieldTextColor,
+            selectedContainerColor = SelectedCafeSurfaceColor,
+            selectedLabelColor = StudySessionPopupTextColor
+        )
+
         VibeTag.entries.chunked(2).forEach { rowTags ->
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
                 rowTags.forEach { tag ->
                     FilterChip(
                         selected = tag in selectedTags,
@@ -5117,8 +6197,29 @@ private fun VibeTagSelector(
                                 if (tag in selectedTags) selectedTags - tag else selectedTags + tag
                             )
                         },
-                        label = { Text(tag.label) },
-                        modifier = Modifier.weight(1f)
+                        label = {
+                            Text(
+                                text = tag.label,
+                                modifier = Modifier.fillMaxWidth(),
+                                textAlign = TextAlign.Center,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis,
+                                style = MaterialTheme.typography.labelSmall.copy(fontSize = 10.sp)
+                            )
+                        },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(32.dp),
+                        shape = RoundedCornerShape(8.dp),
+                        colors = chipColors,
+                        border = FilterChipDefaults.filterChipBorder(
+                            enabled = true,
+                            selected = tag in selectedTags,
+                            borderColor = Color.Black.copy(alpha = 0.38f),
+                            selectedBorderColor = Color.Black.copy(alpha = 0.76f),
+                            borderWidth = 1.dp,
+                            selectedBorderWidth = 1.dp
+                        )
                     )
                 }
                 if (rowTags.size == 1) {
@@ -5866,6 +6967,7 @@ fun ExpandedCafeDetailOverlay(
     val reviews = ReviewRepository.reviewsFor(cafe.id)
     val isBookmarked = BookmarkRepository.isBookmarked(cafe.id)
     val crowdAttributes = CrowdAttributeRepository.attributesFor(cafe.id)
+    val crowdAttributeBackendState = rememberCrowdAttributeBackendState(cafe.id)
     val pageCount = cafe.photoPageCount()
     val pagerState = rememberPagerState(pageCount = { pageCount })
     val detailRevealAlpha = transitionRevealAlpha(transitionProgress)
@@ -5875,6 +6977,7 @@ fun ExpandedCafeDetailOverlay(
     val detailTextColor = Color.White
     val detailSecondaryTextColor = Color.White.copy(alpha = 0.78f)
     var showStudyComposer by remember(cafe.id) { mutableStateOf(false) }
+    var showSuggestionOverlay by remember(cafe.id) { mutableStateOf(false) }
 
     BackHandler(enabled = showStudyComposer) {
         showStudyComposer = false
@@ -6103,6 +7206,8 @@ fun ExpandedCafeDetailOverlay(
                     CafeCrowdAttributesPanel(
                         cafe = cafe,
                         attributes = crowdAttributes,
+                        backendState = crowdAttributeBackendState,
+                        onSuggestChanges = { showSuggestionOverlay = true },
                         modifier = Modifier.padding(horizontal = 20.dp)
                     )
                 }
@@ -6154,6 +7259,15 @@ fun ExpandedCafeDetailOverlay(
                 StudySessionComposerOverlay(
                     cafe = cafe,
                     onDismiss = { showStudyComposer = false },
+                    modifier = Modifier.matchParentSize()
+                )
+            }
+
+            if (showSuggestionOverlay) {
+                CrowdAttributeSuggestionOverlay(
+                    cafe = cafe,
+                    attributes = CrowdAttributeRepository.attributesFor(cafe.id),
+                    onDismiss = { showSuggestionOverlay = false },
                     modifier = Modifier.matchParentSize()
                 )
             }
@@ -6547,17 +7661,223 @@ fun RatingStars(rating: Float) {
     Row { repeat(rating.toInt()) { Icon(Icons.Filled.Star, contentDescription = null, tint = Color(0xFFFFC107)) }; repeat(5 - rating.toInt()) { Icon(Icons.Filled.Star, contentDescription = null, tint = Color.LightGray) } }
 }
 
+private data class BottomNavItem(
+    val route: String,
+    val iconRes: Int,
+    val contentDescription: String
+)
+
+private class BottomNavMotionState {
+    var settledIndex by mutableIntStateOf(0)
+    var bubblePosition by mutableFloatStateOf(0f)
+}
+
+private class BottomNavUiState {
+    var enabled by mutableStateOf(true)
+    var dimFraction by mutableFloatStateOf(0f)
+    var overlayCoversToolbar by mutableStateOf(false)
+}
+
+private val LocalBottomNavMotionState = staticCompositionLocalOf { BottomNavMotionState() }
+private val LocalBottomNavUiState = staticCompositionLocalOf { BottomNavUiState() }
+private val LocalUsesPersistentBottomNav = staticCompositionLocalOf { false }
+
+private val bottomNavItems = listOf(
+    BottomNavItem(Screen.MainScreen.route, R.drawable.nav_cards, "Cards"),
+    BottomNavItem(Screen.MapScreen.route, R.drawable.nav_map, "Map"),
+    BottomNavItem(Screen.BookmarkScreen.route, R.drawable.nav_save, "Save"),
+    BottomNavItem(Screen.ProfileScreen.route, R.drawable.nav_profile, "Profile")
+)
+
+private val bottomNavRoutes = setOf(
+    Screen.MainScreen.route,
+    Screen.MapScreen.route,
+    Screen.BookmarkScreen.route,
+    Screen.ProfileScreen.route,
+    Screen.Preferences.route,
+    Screen.CafeDetails.route,
+    Screen.WriteReview.route
+)
+
+private val bottomNavToolbarHeight = 68.dp
+private val bottomNavBubbleSize = 50.dp
+
+private fun Modifier.bottomNavFrame(): Modifier {
+    return fillMaxWidth()
+        .navigationBarsPadding()
+        .padding(start = 28.dp, end = 28.dp, top = 6.dp, bottom = 14.dp)
+        .height(bottomNavToolbarHeight)
+}
+
+@Composable
+private fun ReportBottomNavOverlayCoverage(isActive: Boolean) {
+    val usesPersistentBottomNav = LocalUsesPersistentBottomNav.current
+    val uiState = LocalBottomNavUiState.current
+
+    SideEffect {
+        if (usesPersistentBottomNav) {
+            uiState.overlayCoversToolbar = isActive
+        }
+    }
+
+    DisposableEffect(usesPersistentBottomNav) {
+        onDispose {
+            if (usesPersistentBottomNav) {
+                uiState.overlayCoversToolbar = false
+            }
+        }
+    }
+}
+
 @Composable
 fun BottomNavBar(navController: NavHostController, enabled: Boolean = true, dimFraction: Float = if (enabled) 0f else 1f) {
+    if (LocalUsesPersistentBottomNav.current) {
+        val uiState = LocalBottomNavUiState.current
+
+        SideEffect {
+            uiState.enabled = enabled
+            uiState.dimFraction = dimFraction
+        }
+
+        Spacer(modifier = Modifier.bottomNavFrame())
+        return
+    }
+
+    FloatingBottomNavBar(
+        navController = navController,
+        enabled = enabled,
+        dimFraction = dimFraction
+    )
+}
+
+@Composable
+private fun FloatingBottomNavBar(
+    navController: NavHostController,
+    enabled: Boolean = true,
+    dimFraction: Float = if (enabled) 0f else 1f,
+    modifier: Modifier = Modifier
+) {
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val route = navBackStackEntry?.destination?.route
-    NavigationBar(
-        modifier = Modifier.graphicsLayer { alpha = 1f - (0.55f * dimFraction) }
+    val motionState = LocalBottomNavMotionState.current
+    val routeIndex = bottomNavItems.indexOfFirst { item -> item.route == route }
+    val selectedIndex = routeIndex.takeIf { index -> index >= 0 } ?: motionState.settledIndex
+    val bubblePosition = remember { Animatable(motionState.bubblePosition) }
+    var motionStart by remember { mutableFloatStateOf(motionState.bubblePosition) }
+    var motionEnd by remember { mutableFloatStateOf(motionState.bubblePosition) }
+
+    LaunchedEffect(selectedIndex) {
+        val start = motionState.bubblePosition
+        val target = selectedIndex.toFloat()
+
+        if (abs(bubblePosition.value - start) > 0.001f) {
+            bubblePosition.snapTo(start)
+        }
+
+        motionStart = start
+        motionEnd = target
+
+        if (abs(start - target) > 0.001f) {
+            bubblePosition.animateTo(
+                targetValue = target,
+                animationSpec = tween(durationMillis = 520, easing = FastOutSlowInEasing)
+            )
+        } else {
+            bubblePosition.snapTo(target)
+        }
+
+        motionState.bubblePosition = target
+        motionState.settledIndex = selectedIndex
+    }
+
+    LaunchedEffect(bubblePosition) {
+        snapshotFlow { bubblePosition.value }.collect { position ->
+            motionState.bubblePosition = position
+        }
+    }
+
+    val motionRange = motionEnd - motionStart
+    val motionProgress = if (motionRange > -0.001f && motionRange < 0.001f) {
+        1f
+    } else {
+        ((bubblePosition.value - motionStart) / motionRange).coerceIn(0f, 1f)
+    }
+    val motionDirection = if (motionEnd >= motionStart) 1f else -1f
+    val bubbleCurveOffset = (sin(motionProgress * PI * 2).toFloat() * 8f * motionDirection).dp
+    val barAlpha = (1f - (0.55f * dimFraction)).coerceIn(0f, 1f)
+
+    BoxWithConstraints(
+        modifier = modifier
+            .bottomNavFrame()
+            .graphicsLayer { alpha = barAlpha }
     ) {
-        NavigationBarItem(selected = route == Screen.MainScreen.route, enabled = enabled, onClick = { navController.navigate(Screen.MainScreen.route) }, icon = { Icon(Icons.Filled.Search, null) })
-        NavigationBarItem(selected = route == Screen.MapScreen.route, enabled = enabled, onClick = { navController.navigate(Screen.MapScreen.route) }, icon = { Icon(Icons.Filled.Place, null) })
-        NavigationBarItem(selected = route == Screen.BookmarkScreen.route, enabled = enabled, onClick = { navController.navigate(Screen.BookmarkScreen.route) }, icon = { Icon(Icons.Filled.Bookmark, null) })
-        NavigationBarItem(selected = route == Screen.ProfileScreen.route, enabled = enabled, onClick = { navController.navigate(Screen.ProfileScreen.route) }, icon = { Icon(Icons.Filled.Person, null) })
+        val itemWidth = maxWidth / bottomNavItems.size
+        val bubbleX = itemWidth * bubblePosition.value + ((itemWidth - bottomNavBubbleSize) / 2)
+        val bubbleY = ((bottomNavToolbarHeight - bottomNavBubbleSize) / 2) + bubbleCurveOffset
+
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .shadow(elevation = 12.dp, shape = CircleShape, clip = false)
+                .background(Color(0xFF6B5947), CircleShape)
+        )
+        Box(
+            modifier = Modifier
+                .offset(x = bubbleX, y = bubbleY)
+                .size(bottomNavBubbleSize)
+                .background(Color.White.copy(alpha = 0.32f), CircleShape)
+        )
+        Row(
+            modifier = Modifier.matchParentSize(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            bottomNavItems.forEachIndexed { index, item ->
+                key(item.route) {
+                    val isSelected = selectedIndex == index
+                    val iconScale by animateFloatAsState(
+                        targetValue = if (isSelected) 1.08f else 1f,
+                        animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing),
+                        label = "bottomNavIconScale-${item.route}"
+                    )
+                    val interactionSource = remember { MutableInteractionSource() }
+
+                    Box(
+                        modifier = Modifier
+                            .weight(1f)
+                            .fillMaxHeight()
+                            .clickable(
+                                enabled = enabled && !isSelected,
+                                interactionSource = interactionSource,
+                                indication = null
+                            ) {
+                                motionState.settledIndex = selectedIndex
+                                motionState.bubblePosition = bubblePosition.value
+                                navController.navigate(item.route) {
+                                    popUpTo(navController.graph.findStartDestination().id) {
+                                        saveState = true
+                                    }
+                                    launchSingleTop = true
+                                    restoreState = true
+                                }
+                            },
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Image(
+                            painter = painterResource(item.iconRes),
+                            contentDescription = item.contentDescription,
+                            contentScale = ContentScale.Fit,
+                            modifier = Modifier
+                                .size(32.dp)
+                                .graphicsLayer {
+                                    alpha = if (enabled) 1f else 0.62f
+                                    scaleX = iconScale
+                                    scaleY = iconScale
+                                }
+                        )
+                    }
+                }
+            }
+        }
     }
 }
 

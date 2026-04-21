@@ -54,6 +54,24 @@ class MapSessionCafeCacheTest {
     }
 
     @Test
+    fun recordViewportCanPreserveOriginalCacheTimestamp() {
+        var now = 2_000L
+        val cache = MapSessionCafeCache(ttlMillis = 1_000L, nowMillis = { now })
+
+        cache.recordViewport(
+            viewportKey = "viewport_a",
+            cafes = listOf(testCafe(id = "alpha")),
+            savedAtEpochMillis = now - 999L
+        )
+
+        assertTrue(cache.isViewportFresh("viewport_a"))
+
+        now += 1L
+
+        assertFalse(cache.isViewportFresh("viewport_a"))
+    }
+
+    @Test
     fun snapshotPrunesStaleCafes() {
         var now = 500L
         val cache = MapSessionCafeCache(ttlMillis = 1_000L, nowMillis = { now })
