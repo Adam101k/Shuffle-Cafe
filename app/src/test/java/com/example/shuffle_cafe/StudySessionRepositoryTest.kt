@@ -36,8 +36,11 @@ class StudySessionRepositoryTest {
         val validDraft = StudySessionDraft(
             title = " Midterm Sprint ",
             className = " CS 101 ",
-            dateText = " Friday ",
-            timeText = " 4 PM ",
+            scheduledDateUtcMillis = 1_704_067_200_000L,
+            startHour = 16,
+            startMinute = 0,
+            endHour = 17,
+            endMinute = 0,
             summary = " Review chapters 4 and 5. "
         )
         val invalidDraft = validDraft.copy(summary = "   ")
@@ -108,8 +111,11 @@ class StudySessionRepositoryTest {
         return StudySessionDraft(
             title = title,
             className = "Biology 120",
-            dateText = "Tuesday",
-            timeText = "3 PM",
+            scheduledDateUtcMillis = 1_704_067_200_000L,
+            startHour = 15,
+            startMinute = 0,
+            endHour = 16,
+            endMinute = 0,
             summary = "Work through the study guide."
         )
     }

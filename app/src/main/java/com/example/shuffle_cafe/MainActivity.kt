@@ -73,6 +73,7 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
@@ -128,6 +129,7 @@ import com.example.shuffle_cafe.ui.theme.CafeBrown
 import com.example.shuffle_cafe.ui.theme.CafeDark
 import com.example.shuffle_cafe.ui.theme.CoffeeDark
 import com.example.shuffle_cafe.ui.theme.CoffeeLight
+import com.example.shuffle_cafe.ui.theme.CoffeeSurfaceLight
 import com.example.shuffle_cafe.ui.theme.Shuffle_CafeTheme
 import com.google.android.gms.location.FusedLocationProviderClient
 import com.google.android.gms.location.LocationServices
@@ -267,6 +269,13 @@ internal data class CachedBookmarkEnvelope(
     val cafes: List<CachedCafeDto>
 )
 
+private data class CafeCacheMetadata(
+    val homeCityKey: String?,
+    val homeCityName: String?,
+    val mapViewportKey: String?,
+    val mapCityName: String?
+)
+
 data class CafeFeedUiState(
     val cafes: List<Cafe> = emptyList(),
     val isLoading: Boolean = false,
@@ -283,6 +292,19 @@ internal fun CafeFeedUiState.hasFreshLoadedCafes(
     val lastUpdated = lastUpdatedEpochMillis ?: return false
     if (cafes.isEmpty() || isLoading || isRefreshing) return false
     return nowMillis - lastUpdated < CAFE_RESULT_CACHE_TTL_MILLIS
+}
+
+internal fun CafeFeedUiState.hasReusableLoadedCafesForCity(cityKey: String?): Boolean {
+    if (cityKey.isNullOrBlank()) return false
+    return this.cityKey == cityKey &&
+        cafes.isNotEmpty() &&
+        !isLoading &&
+        !isRefreshing
+}
+
+internal fun CafeFeedUiState.shouldPersistActiveCacheForCafe(cafeId: String): Boolean {
+    val key = cityKey ?: return false
+    return isPersistableCafeCacheKey(key) && cafes.any { cafe -> cafe.id == cafeId }
 }
 
 private data class ResolvedViewportCoffeeContext(
@@ -309,12 +331,42 @@ private data class MarkerDescriptorRequestKey(
     val zoomBucket: Int
 )
 
+private enum class CardsFilterOption(val label: String) {
+    Nearby("Nearby"),
+    Trending("Trending"),
+    Preferences("Preferences")
+}
+
+private data class MapSearchPing(
+    val title: String,
+    val latLng: LatLng
+)
+
+internal enum class CacheImageDecodeMode {
+    HeroOnly,
+    All
+}
+
+private enum class CafeCacheMetadataTarget {
+    Home,
+    Map
+}
+
 private const val CITY_COFFEE_SEARCH_RADIUS_METERS = 35_000.0
 private const val CITY_COFFEE_SEARCH_MAX_RESULTS = 20
 private const val CAFE_CACHE_PREFS_NAME = "shuffle_cafe_city_cache"
 private const val CAFE_CACHE_ENTRY_PREFIX = "city_cache_"
+private const val CAFE_CACHE_METADATA_HOME_CITY_KEY = "metadata_home_city_key"
+private const val CAFE_CACHE_METADATA_HOME_CITY_NAME = "metadata_home_city_name"
+private const val CAFE_CACHE_METADATA_MAP_VIEWPORT_KEY = "metadata_map_viewport_key"
+private const val CAFE_CACHE_METADATA_MAP_CITY_NAME = "metadata_map_city_name"
 private const val BOOKMARK_CACHE_PREFS_NAME = "shuffle_cafe_bookmark_cache"
 private const val BOOKMARK_CACHE_ENTRY_KEY = "saved_bookmark_cafes"
+private const val CARD_STACK_PROGRESS_PREFS_NAME = "shuffle_cafe_card_stack_progress"
+private const val CARD_STACK_TOP_CAFE_ID_KEY = "top_cafe_id"
+private const val CAFE_CACHE_MAX_CAFES_PER_ENTRY = 30
+private const val CAFE_CACHE_IMAGE_MAX_DIMENSION_PX = 640
+private const val CAFE_CACHE_IMAGE_JPEG_QUALITY = 72
 private const val UNKNOWN_CITY_CACHE_KEY = "nearby_unknown_city"
 private const val ADDRESS_UNAVAILABLE_TEXT = "Address unavailable"
 private const val PHONE_UNAVAILABLE_TEXT = "Phone unavailable"
@@ -323,6 +375,7 @@ private const val NO_RATINGS_TEXT = "No ratings yet"
 internal const val CAFE_RESULT_CACHE_TTL_MILLIS = 30L * 60L * 1000L
 internal const val SAVED_CAFE_CACHE_ATTEMPT_TTL_MILLIS = CAFE_RESULT_CACHE_TTL_MILLIS
 private const val BOOKMARK_CACHE_WRITE_DEBOUNCE_MILLIS = 350L
+private const val ACTIVE_CAFE_CACHE_WRITE_DEBOUNCE_MILLIS = 500L
 private const val MAP_VIEWPORT_QUERY_DEBOUNCE_MILLIS = 650L
 private const val MAP_VIEWPORT_MIN_QUERY_ZOOM = 6f
 private const val MAP_VIEWPORT_SEARCH_MIN_RADIUS_METERS = 1_500.0
@@ -744,10 +797,34 @@ internal class MapSessionCafeCache(
 
 private fun Bitmap.toCacheBase64(): String? {
     return runCatching {
+        val bitmapForCache = scaledForCafeCache()
         val output = ByteArrayOutputStream()
-        compress(Bitmap.CompressFormat.JPEG, 82, output)
-        Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
+        val didCompress = bitmapForCache.compress(
+            Bitmap.CompressFormat.JPEG,
+            CAFE_CACHE_IMAGE_JPEG_QUALITY,
+            output
+        )
+        if (!didCompress) return@runCatching null
+        val encoded = Base64.encodeToString(output.toByteArray(), Base64.NO_WRAP)
+        if (bitmapForCache !== this) {
+            bitmapForCache.recycle()
+        }
+        encoded
     }.getOrNull()
+}
+
+private fun Bitmap.scaledForCafeCache(): Bitmap {
+    val sourceWidth = width
+    val sourceHeight = height
+    if (sourceWidth <= 0 || sourceHeight <= 0) return this
+
+    val longestSide = maxOf(sourceWidth, sourceHeight)
+    if (longestSide <= CAFE_CACHE_IMAGE_MAX_DIMENSION_PX) return this
+
+    val scale = CAFE_CACHE_IMAGE_MAX_DIMENSION_PX.toFloat() / longestSide.toFloat()
+    val scaledWidth = (sourceWidth * scale).roundToInt().coerceAtLeast(1)
+    val scaledHeight = (sourceHeight * scale).roundToInt().coerceAtLeast(1)
+    return Bitmap.createScaledBitmap(this, scaledWidth, scaledHeight, true)
 }
 
 private fun String.toCachedBitmap(): Bitmap? {
@@ -767,13 +844,23 @@ internal fun CachedCafeEnvelope.hasCompleteCachedCardImages(): Boolean {
     return cafes.isNotEmpty() && cafes.all { dto -> dto.hasCompleteCachedCardImage() }
 }
 
+internal fun CachedCafeEnvelope.canRestoreFreshFeed(nowMillis: Long = System.currentTimeMillis()): Boolean {
+    return cafes.isNotEmpty() && isFresh(nowMillis)
+}
+
+internal fun CachedCafeEnvelope.needsHomeRefreshAfterRestore(
+    nowMillis: Long = System.currentTimeMillis()
+): Boolean {
+    return !isFresh(nowMillis) || !hasCompleteCachedCardImages()
+}
+
 private fun Cafe.toCachedDto(): CachedCafeDto {
     val cachedHeroBitmap = heroImageBitmap ?: photoBitmaps.firstOrNull { it != null }
     val expectedPhotoCount = maxOf(
         photoMetadatas.size,
-        photoBitmaps.size,
         if (cachedHeroBitmap != null) 1 else 0
     )
+    val cachedHeroBase64 = cachedHeroBitmap?.toCacheBase64()
 
     return CachedCafeDto(
         id = id,
@@ -792,23 +879,31 @@ private fun Cafe.toCachedDto(): CachedCafeDto {
         latitude = latLng?.latitude,
         longitude = latLng?.longitude,
         expectedPhotoCount = expectedPhotoCount,
-        heroImageBase64 = cachedHeroBitmap?.toCacheBase64(),
-        photoImageBase64s = if (expectedPhotoCount > 0) {
-            List(expectedPhotoCount) { index -> photoBitmaps.getOrNull(index)?.toCacheBase64() }
-        } else {
-            emptyList()
-        }
+        heroImageBase64 = cachedHeroBase64,
+        photoImageBase64s = emptyList()
     )
 }
 
-internal fun CachedCafeDto.toCafe(distanceReference: LatLng? = null): Cafe {
+internal fun CachedCafeDto.toCafe(
+    distanceReference: LatLng? = null,
+    imageDecodeMode: CacheImageDecodeMode = CacheImageDecodeMode.All
+): Cafe {
     val cafeLatLng = if (latitude != null && longitude != null) LatLng(latitude, longitude) else null
-    val cachedHeroBitmap = heroImageBase64?.toCachedBitmap()
-    val cachedPhotoBitmaps = photoImageBase64s.map { encoded -> encoded?.toCachedBitmap() }
-    val restoredPhotoBitmaps = when {
-        cachedPhotoBitmaps.isNotEmpty() -> cachedPhotoBitmaps
-        cachedHeroBitmap != null -> listOf(cachedHeroBitmap)
-        else -> emptyList()
+    val cachedHeroBitmap = when (imageDecodeMode) {
+        CacheImageDecodeMode.HeroOnly -> (heroImageBase64 ?: photoImageBase64s.firstOrNull { encoded -> encoded != null })
+            ?.toCachedBitmap()
+        CacheImageDecodeMode.All -> heroImageBase64?.toCachedBitmap()
+    }
+    val restoredPhotoBitmaps = when (imageDecodeMode) {
+        CacheImageDecodeMode.HeroOnly -> cachedHeroBitmap?.let { bitmap -> listOf(bitmap) }.orEmpty()
+        CacheImageDecodeMode.All -> {
+            val cachedPhotoBitmaps = photoImageBase64s.map { encoded -> encoded?.toCachedBitmap() }
+            when {
+                cachedPhotoBitmaps.isNotEmpty() -> cachedPhotoBitmaps
+                cachedHeroBitmap != null -> listOf(cachedHeroBitmap)
+                else -> emptyList()
+            }
+        }
     }
 
     return Cafe(
@@ -839,6 +934,10 @@ private fun normalizeCityCacheKey(cityName: String?): String {
         ?.trim('_')
 
     return normalized?.takeIf { it.isNotBlank() } ?: UNKNOWN_CITY_CACHE_KEY
+}
+
+private fun isPersistableCafeCacheKey(cityKey: String): Boolean {
+    return cityKey.isNotBlank() && !cityKey.startsWith("preview_")
 }
 
 internal fun CachedCafeEnvelope.isFresh(nowMillis: Long = System.currentTimeMillis()): Boolean {
@@ -878,13 +977,97 @@ private object CafeCacheStore {
         val envelope = CachedCafeEnvelope(
             cityKey = cityKey,
             savedAtEpochMillis = System.currentTimeMillis(),
-            cafes = cafes.map { it.toCachedDto() }
+            cafes = cafes
+                .take(CAFE_CACHE_MAX_CAFES_PER_ENTRY)
+                .map { it.toCachedDto() }
         )
 
         prefs(context)
             .edit()
             .putString(cacheEntryKey(cityKey), json.encodeToString(envelope))
             .apply()
+    }
+}
+
+private object CafeCacheMetadataStore {
+    private fun prefs(context: Context): SharedPreferences {
+        return context.applicationContext.getSharedPreferences(CAFE_CACHE_PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    fun load(context: Context): CafeCacheMetadata {
+        val preferences = prefs(context)
+        return CafeCacheMetadata(
+            homeCityKey = preferences.getString(CAFE_CACHE_METADATA_HOME_CITY_KEY, null),
+            homeCityName = preferences.getString(CAFE_CACHE_METADATA_HOME_CITY_NAME, null),
+            mapViewportKey = preferences.getString(CAFE_CACHE_METADATA_MAP_VIEWPORT_KEY, null),
+            mapCityName = preferences.getString(CAFE_CACHE_METADATA_MAP_CITY_NAME, null)
+        )
+    }
+
+    fun saveHome(context: Context, cityKey: String, cityName: String?) {
+        prefs(context)
+            .edit()
+            .putString(CAFE_CACHE_METADATA_HOME_CITY_KEY, cityKey)
+            .putOptionalString(CAFE_CACHE_METADATA_HOME_CITY_NAME, cityName)
+            .apply()
+    }
+
+    fun saveMap(context: Context, viewportKey: String, cityName: String?) {
+        prefs(context)
+            .edit()
+            .putString(CAFE_CACHE_METADATA_MAP_VIEWPORT_KEY, viewportKey)
+            .putOptionalString(CAFE_CACHE_METADATA_MAP_CITY_NAME, cityName)
+            .apply()
+    }
+
+    private fun SharedPreferences.Editor.putOptionalString(
+        key: String,
+        value: String?
+    ): SharedPreferences.Editor {
+        val normalizedValue = value?.trim()?.takeIf { it.isNotBlank() }
+        return if (normalizedValue == null) remove(key) else putString(key, normalizedValue)
+    }
+}
+
+private suspend fun loadCachedCafeEnvelope(
+    context: Context,
+    cityKey: String
+): CachedCafeEnvelope? = withContext(Dispatchers.IO) {
+    CafeCacheStore.load(context, cityKey)
+}
+
+private suspend fun CachedCafeEnvelope.toCafeListOffMain(
+    distanceReference: LatLng?,
+    imageDecodeMode: CacheImageDecodeMode = CacheImageDecodeMode.All
+): List<Cafe> {
+    return withContext(Dispatchers.Default) {
+        cafes.map { dto ->
+            dto.toCafe(
+                distanceReference = distanceReference,
+                imageDecodeMode = imageDecodeMode
+            )
+        }
+    }
+}
+
+private suspend fun saveCafeCacheOffMain(
+    context: Context,
+    cityKey: String,
+    cafes: List<Cafe>,
+    metadataTarget: CafeCacheMetadataTarget? = null,
+    cityName: String? = null
+) {
+    withContext(Dispatchers.IO) {
+        runCatching {
+            CafeCacheStore.save(context, cityKey, cafes)
+            when (metadataTarget) {
+                CafeCacheMetadataTarget.Home -> CafeCacheMetadataStore.saveHome(context, cityKey, cityName)
+                CafeCacheMetadataTarget.Map -> CafeCacheMetadataStore.saveMap(context, cityKey, cityName)
+                null -> Unit
+            }
+        }.onFailure { error ->
+            error.printStackTrace()
+        }
     }
 }
 
@@ -930,6 +1113,26 @@ private object BookmarkCacheStore {
         prefs(context)
             .edit()
             .remove(BOOKMARK_CACHE_ENTRY_KEY)
+            .apply()
+    }
+}
+
+private object CardStackProgressStore {
+    private fun prefs(context: Context): SharedPreferences {
+        return context.applicationContext.getSharedPreferences(
+            CARD_STACK_PROGRESS_PREFS_NAME,
+            Context.MODE_PRIVATE
+        )
+    }
+
+    fun load(context: Context): String? {
+        return prefs(context).getString(CARD_STACK_TOP_CAFE_ID_KEY, null)
+    }
+
+    fun save(context: Context, topCafeId: String) {
+        prefs(context)
+            .edit()
+            .putString(CARD_STACK_TOP_CAFE_ID_KEY, topCafeId)
             .apply()
     }
 }
@@ -980,15 +1183,25 @@ private data class VisibleCafeStack(
     val nextCafeIndex: Int
 )
 
-private fun buildVisibleCafeStack(cafes: List<Cafe>): VisibleCafeStack {
+private fun buildVisibleCafeStack(
+    cafes: List<Cafe>,
+    topCafeId: String? = null
+): VisibleCafeStack {
     if (cafes.isEmpty()) {
         return VisibleCafeStack(emptyList(), 0)
     }
 
     val visibleCount = minOf(3, cafes.size)
+    val startIndex = topCafeId
+        ?.let { cafeId -> cafes.indexOfFirst { cafe -> cafe.id == cafeId } }
+        ?.takeIf { it >= 0 }
+        ?: 0
+
     return VisibleCafeStack(
-        cafes = cafes.take(visibleCount),
-        nextCafeIndex = visibleCount % cafes.size
+        cafes = List(visibleCount) { index ->
+            cafes[(startIndex + index) % cafes.size]
+        },
+        nextCafeIndex = (startIndex + visibleCount) % cafes.size
     )
 }
 
@@ -1037,12 +1250,97 @@ object CafeRepository {
     private val homeLoadMutex = Mutex()
     private val mapLoadMutex = Mutex()
     private val mapSessionCafeCache = MapSessionCafeCache()
+    private val cachePersistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var appContext: Context? = null
+    private var isInitialized = false
+    private var homeCachePersistJob: Job? = null
+    private var mapCachePersistJob: Job? = null
+    @Volatile
+    private var homeCachePersistGeneration = 0
+    @Volatile
+    private var mapCachePersistGeneration = 0
 
     val homeUiState: CafeFeedUiState
         get() = homeFeedState
 
     val mapUiState: CafeFeedUiState
         get() = mapFeedState
+
+    fun initialize(context: Context) {
+        val applicationContext = context.applicationContext
+        appContext = applicationContext
+        if (isInitialized) return
+        isInitialized = true
+
+        cachePersistenceScope.launch {
+            runCatching {
+                restoreFreshCachedFeeds(applicationContext)
+            }.onFailure { error ->
+                error.printStackTrace()
+            }
+        }
+    }
+
+    private suspend fun restoreFreshCachedFeeds(context: Context) {
+        val metadata = withContext(Dispatchers.IO) {
+            CafeCacheMetadataStore.load(context)
+        }
+        val homeEnvelope = metadata.homeCityKey
+            ?.let { cityKey -> loadCachedCafeEnvelope(context, cityKey) }
+            ?.takeIf { envelope -> envelope.canRestoreFreshFeed() }
+        val mapEnvelope = metadata.mapViewportKey
+            ?.let { viewportKey -> loadCachedCafeEnvelope(context, viewportKey) }
+            ?.takeIf { envelope -> envelope.canRestoreFreshFeed() }
+        val restoredHomeCafes = homeEnvelope
+            ?.toCafeListOffMain(
+                distanceReference = null,
+                imageDecodeMode = CacheImageDecodeMode.HeroOnly
+            )
+            .orEmpty()
+        val restoredMapCafes = mapEnvelope
+            ?.toCafeListOffMain(
+                distanceReference = null,
+                imageDecodeMode = CacheImageDecodeMode.HeroOnly
+            )
+            .orEmpty()
+
+        withContext(Dispatchers.Main.immediate) {
+            if (homeEnvelope != null && restoredHomeCafes.isNotEmpty() && homeFeedState.cafes.isEmpty()) {
+                replaceHomeFeed(
+                    cafes = restoredHomeCafes,
+                    cityKey = metadata.homeCityKey,
+                    cityName = metadata.homeCityName,
+                    lastUpdatedEpochMillis = homeEnvelope.savedAtEpochMillis
+                )
+                homeFeedState = homeFeedState.copy(
+                    isLoading = false,
+                    isRefreshing = homeEnvelope.needsHomeRefreshAfterRestore(),
+                    loadError = null
+                )
+            }
+
+            if (mapEnvelope != null && restoredMapCafes.isNotEmpty() && mapFeedState.cafes.isEmpty()) {
+                metadata.mapViewportKey?.let { viewportKey ->
+                    mapSessionCafeCache.recordViewport(
+                        viewportKey = viewportKey,
+                        cafes = restoredMapCafes,
+                        savedAtEpochMillis = mapEnvelope.savedAtEpochMillis
+                    )
+                }
+                replaceMapFeed(
+                    cafes = restoredMapCafes,
+                    cityKey = metadata.mapViewportKey,
+                    cityName = metadata.mapCityName,
+                    lastUpdatedEpochMillis = mapEnvelope.savedAtEpochMillis
+                )
+                mapFeedState = mapFeedState.copy(
+                    isLoading = false,
+                    isRefreshing = false,
+                    loadError = null
+                )
+            }
+        }
+    }
 
     private fun indexCafes(cafes: List<Cafe>): List<Cafe> {
         if (cafes.isEmpty()) return emptyList()
@@ -1095,6 +1393,100 @@ object CafeRepository {
         }
     }
 
+    private fun scheduleActiveCachePersistForCafe(cafeId: String) {
+        val context = appContext ?: return
+
+        if (homeFeedState.shouldPersistActiveCacheForCafe(cafeId)) {
+            homeFeedState.cityKey?.let { homeCityKey ->
+                scheduleHomeCachePersist(
+                    context = context,
+                    cityKey = homeCityKey,
+                    cityName = homeFeedState.cityName,
+                    cafes = homeFeedState.cafes
+                )
+            }
+        }
+
+        if (mapFeedState.shouldPersistActiveCacheForCafe(cafeId)) {
+            mapFeedState.cityKey?.let { mapViewportKey ->
+                scheduleMapCachePersist(
+                    context = context,
+                    viewportKey = mapViewportKey,
+                    cityName = mapFeedState.cityName,
+                    cafes = mapFeedState.cafes
+                )
+            }
+        }
+    }
+
+    private fun scheduleHomeCachePersist(
+        context: Context,
+        cityKey: String,
+        cityName: String?,
+        cafes: List<Cafe>
+    ) {
+        val generation = ++homeCachePersistGeneration
+        homeCachePersistJob?.cancel()
+        homeCachePersistJob = cachePersistenceScope.launch {
+            delay(ACTIVE_CAFE_CACHE_WRITE_DEBOUNCE_MILLIS)
+            if (generation != homeCachePersistGeneration) return@launch
+            saveCafeCacheOffMain(
+                context = context,
+                cityKey = cityKey,
+                cafes = cafes,
+                metadataTarget = CafeCacheMetadataTarget.Home,
+                cityName = cityName
+            )
+        }
+    }
+
+    private fun scheduleMapCachePersist(
+        context: Context,
+        viewportKey: String,
+        cityName: String?,
+        cafes: List<Cafe>
+    ) {
+        val generation = ++mapCachePersistGeneration
+        mapCachePersistJob?.cancel()
+        mapCachePersistJob = cachePersistenceScope.launch {
+            delay(ACTIVE_CAFE_CACHE_WRITE_DEBOUNCE_MILLIS)
+            if (generation != mapCachePersistGeneration) return@launch
+            saveCafeCacheOffMain(
+                context = context,
+                cityKey = viewportKey,
+                cafes = cafes,
+                metadataTarget = CafeCacheMetadataTarget.Map,
+                cityName = cityName
+            )
+        }
+    }
+
+    private fun prefetchCardImagesInBackground(
+        placesClient: PlacesClient,
+        cafes: List<Cafe>
+    ) {
+        val cafesNeedingHeroImages = cafes.filter { cafe ->
+            cafe.photoMetadatas.isNotEmpty() &&
+                cafe.heroImageBitmap == null &&
+                cafe.photoBitmaps.firstOrNull() == null
+        }
+        if (cafesNeedingHeroImages.isEmpty()) return
+
+        cachePersistenceScope.launch {
+            cafesNeedingHeroImages.forEach { cafe ->
+                runCatching {
+                    val metadata = cafe.photoMetadatas.firstOrNull() ?: return@runCatching
+                    val bitmap = fetchCafeCardPhotoBitmap(placesClient, metadata) ?: return@runCatching
+                    withContext(Dispatchers.Main.immediate) {
+                        updateCafePhoto(cafe.id, 0, bitmap)
+                    }
+                }.onFailure { error ->
+                    error.printStackTrace()
+                }
+            }
+        }
+    }
+
     private fun updateFeedCafe(cafes: List<Cafe>, cafeId: String, transform: (Cafe) -> Cafe): List<Cafe> {
         var changed = false
         val updatedCafes = cafes.map { cafe ->
@@ -1125,6 +1517,7 @@ object CafeRepository {
 
         mapSessionCafeCache.updateCafe(cafeId, transform)
         BookmarkRepository.persistIfBookmarked(cafeId)
+        scheduleActiveCachePersistForCafe(cafeId)
     }
 
     fun cacheCafes(cafes: List<Cafe>) {
@@ -1221,23 +1614,23 @@ object CafeRepository {
 
             val queryContext = resolveCurrentCityCoffeeContext(context, fusedLocationClient)
             val distanceReference = queryContext.location.toLatLng()
-            val cachedEnvelope = CafeCacheStore.load(context, queryContext.cityKey)
-            val cachedCafes = cachedEnvelope?.cafes?.map { dto ->
-                dto.toCafe(distanceReference = distanceReference)
-            }.orEmpty()
-            val hasCompleteCachedCardImages = cachedEnvelope?.hasCompleteCachedCardImages() == true
-            val isCachedFeedFresh = cachedEnvelope?.isFresh() == true && hasCompleteCachedCardImages
 
-            if (
-                homeFeedState.cityKey == queryContext.cityKey &&
-                homeFeedState.cafes.isNotEmpty() &&
-                !homeFeedState.isLoading &&
-                !homeFeedState.isRefreshing
-            ) {
+            if (homeFeedState.hasReusableLoadedCafesForCity(queryContext.cityKey)) {
                 return
             }
 
-            if (cachedCafes.isNotEmpty() && hasCompleteCachedCardImages) {
+            val cachedEnvelope = loadCachedCafeEnvelope(context, queryContext.cityKey)
+            val shouldRefreshCachedFeed = cachedEnvelope?.needsHomeRefreshAfterRestore() ?: true
+            var cachedCafes = if (cachedEnvelope != null) {
+                cachedEnvelope.toCafeListOffMain(
+                    distanceReference = distanceReference,
+                    imageDecodeMode = CacheImageDecodeMode.HeroOnly
+                )
+            } else {
+                emptyList()
+            }
+
+            if (cachedCafes.isNotEmpty()) {
                 replaceHomeFeed(
                     cafes = cachedCafes,
                     cityKey = queryContext.cityKey,
@@ -1246,11 +1639,11 @@ object CafeRepository {
                 )
                 homeFeedState = homeFeedState.copy(
                     isLoading = false,
-                    isRefreshing = !isCachedFeedFresh,
+                    isRefreshing = shouldRefreshCachedFeed,
                     loadError = null
                 )
                 preloadCrowdAttributes(cachedCafes)
-                if (isCachedFeedFresh) return
+                if (!shouldRefreshCachedFeed) return
             } else {
                 homeFeedState = CafeFeedUiState(
                     cafes = emptyList(),
@@ -1269,7 +1662,6 @@ object CafeRepository {
                     cityName = queryContext.cityName
                 ).distinctBy { it.id }
 
-                preloadCrowdAttributes(freshCafes)
                 replaceHomeFeed(
                     cafes = freshCafes,
                     cityKey = queryContext.cityKey,
@@ -1281,9 +1673,24 @@ object CafeRepository {
                     isRefreshing = false,
                     loadError = null
                 )
-                CafeCacheStore.save(context, queryContext.cityKey, freshCafes)
+                saveCafeCacheOffMain(
+                    context = context,
+                    cityKey = queryContext.cityKey,
+                    cafes = freshCafes,
+                    metadataTarget = CafeCacheMetadataTarget.Home,
+                    cityName = queryContext.cityName
+                )
+                prefetchCardImagesInBackground(placesClient, freshCafes)
+                preloadCrowdAttributes(freshCafes)
             } catch (error: Exception) {
                 val errorMessage = error.localizedMessage ?: "Failed to fetch coffee houses in your city."
+                if (cachedCafes.isEmpty() && cachedEnvelope != null) {
+                    cachedCafes = cachedEnvelope.toCafeListOffMain(
+                        distanceReference = distanceReference,
+                        imageDecodeMode = CacheImageDecodeMode.HeroOnly
+                    )
+                }
+
                 if (cachedCafes.isNotEmpty()) {
                     homeFeedState = homeFeedState.copy(
                         isLoading = false,
@@ -1346,11 +1753,6 @@ object CafeRepository {
             val sessionCachedCafes = mapSessionCafeCache.snapshot(distanceReference)
             val isViewportFresh = mapSessionCafeCache.isViewportFresh(queryContext.cityKey)
             val sessionLastUpdated = mapSessionCafeCache.latestLoadedAtEpochMillis()
-            val cachedEnvelope = CafeCacheStore.load(context, queryContext.cityKey)
-            val diskCachedCafes = cachedEnvelope?.cafes?.map { dto ->
-                dto.toCafe(distanceReference = distanceReference)
-            }.orEmpty()
-            val isDiskCacheFresh = cachedEnvelope?.isFresh() == true
 
             if (sessionCachedCafes.isNotEmpty()) {
                 replaceMapFeed(
@@ -1370,7 +1772,18 @@ object CafeRepository {
                 preloadCrowdAttributes(sessionCachedCafes)
 
                 if (isViewportFresh) return
-            } else if (diskCachedCafes.isNotEmpty()) {
+            }
+
+            val cachedEnvelope = loadCachedCafeEnvelope(context, queryContext.cityKey)
+            val diskCachedCafes = cachedEnvelope
+                ?.toCafeListOffMain(
+                    distanceReference = distanceReference,
+                    imageDecodeMode = CacheImageDecodeMode.HeroOnly
+                )
+                .orEmpty()
+            val isDiskCacheFresh = cachedEnvelope?.isFresh() == true
+
+            if (diskCachedCafes.isNotEmpty()) {
                 if (isDiskCacheFresh) {
                     mapSessionCafeCache.recordViewport(
                         viewportKey = queryContext.cityKey,
@@ -1417,12 +1830,17 @@ object CafeRepository {
                 ).distinctBy { it.id }
 
                 mapSessionCafeCache.recordViewport(queryContext.cityKey, freshCafes)
-                CafeCacheStore.save(context, queryContext.cityKey, freshCafes)
+                saveCafeCacheOffMain(
+                    context = context,
+                    cityKey = queryContext.cityKey,
+                    cafes = freshCafes,
+                    metadataTarget = CafeCacheMetadataTarget.Map,
+                    cityName = queryContext.cityName
+                )
                 val updatedSessionCafes = mapSessionCafeCache.snapshot(distanceReference)
                 val updatedLastUpdated = mapSessionCafeCache.latestLoadedAtEpochMillis()
                     ?: System.currentTimeMillis()
 
-                preloadCrowdAttributes(updatedSessionCafes)
                 replaceMapFeed(
                     cafes = updatedSessionCafes,
                     cityKey = queryContext.cityKey,
@@ -1434,6 +1852,7 @@ object CafeRepository {
                     isRefreshing = false,
                     loadError = null
                 )
+                preloadCrowdAttributes(updatedSessionCafes)
             } catch (error: Exception) {
                 val errorMessage = error.localizedMessage ?: "Failed to load coffee houses for this map area."
                 val fallbackSessionCafes = mapSessionCafeCache.snapshot(distanceReference)
@@ -1469,10 +1888,18 @@ object CafeRepository {
     }
 
     internal fun resetForTest() {
+        homeCachePersistJob?.cancel()
+        mapCachePersistJob?.cancel()
+        homeCachePersistJob = null
+        mapCachePersistJob = null
+        homeCachePersistGeneration++
+        mapCachePersistGeneration++
         homeFeedState = CafeFeedUiState()
         mapFeedState = CafeFeedUiState()
         cafeIndexById = emptyMap()
         mapSessionCafeCache.clear()
+        appContext = null
+        isInitialized = false
     }
 
     internal fun setHomeFeedForTest(
@@ -1697,7 +2124,9 @@ class MainActivity : ComponentActivity() {
         if (!Places.isInitialized()) {
             Places.initializeWithNewPlacesApiEnabled(applicationContext, "AIzaSyC7QTmdJE2fnRXMiKWrMZftkXIG20gNWrA")
         }
+        CafeRepository.initialize(applicationContext)
         BookmarkRepository.initialize(applicationContext)
+        StudySessionRepository.initialize(applicationContext)
         requestPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
 
         setContent { Shuffle_CafeTheme { AppNav() } }
@@ -1878,6 +2307,7 @@ fun MainScreen(navController: NavHostController) {
     var transitionState by remember { mutableStateOf<SelectedCafeTransitionState?>(null) }
     var overlayHostBounds by remember { mutableStateOf<Rect?>(null) }
     var isPreparingDetailTransition by remember { mutableStateOf(false) }
+    var selectedFilterOption by remember { mutableStateOf(CardsFilterOption.Nearby) }
     val detailProgress = remember { Animatable(0f) }
     val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
 
@@ -1927,20 +2357,28 @@ fun MainScreen(navController: NavHostController) {
         }
     }
 
-    val setVisibleStack: (List<Cafe>) -> Unit = { cafes ->
-        val visibleStack = buildVisibleCafeStack(cafes)
+    val setVisibleStack: (List<Cafe>, String?) -> Unit = { cafes, topCafeId ->
+        val visibleStack = buildVisibleCafeStack(cafes, topCafeId)
         currentVisibleCafes = visibleStack.cafes
         nextCafeIndex = visibleStack.nextCafeIndex
     }
 
+    LaunchedEffect(currentVisibleCafes.firstOrNull()?.id) {
+        currentVisibleCafes.firstOrNull()?.id?.let { topCafeId ->
+            CardStackProgressStore.save(context, topCafeId)
+        }
+    }
+
     LaunchedEffect(allCafes) {
+        val restoredTopCafeId = currentVisibleCafes.firstOrNull()?.id ?: CardStackProgressStore.load(context)
+
         if (allCafes.isEmpty()) {
-            setVisibleStack(emptyList())
+            setVisibleStack(emptyList(), null)
             return@LaunchedEffect
         }
 
         if (currentVisibleCafes.isEmpty() || nextCafeIndex >= allCafes.size) {
-            setVisibleStack(allCafes)
+            setVisibleStack(allCafes, restoredTopCafeId)
             return@LaunchedEffect
         }
 
@@ -1950,7 +2388,7 @@ fun MainScreen(navController: NavHostController) {
         val expectedVisibleCount = minOf(3, allCafes.size)
 
         if (updatedVisibleCafes.isEmpty() || updatedVisibleCafes.size != currentVisibleCafes.size) {
-            setVisibleStack(allCafes)
+            setVisibleStack(allCafes, restoredTopCafeId)
             return@LaunchedEffect
         }
 
@@ -1998,7 +2436,9 @@ fun MainScreen(navController: NavHostController) {
     ) {
         Scaffold(
             topBar = {
-                TopSearchBar(
+                CardsExploreFilterBar(
+                    selectedOption = selectedFilterOption,
+                    onOptionSelected = { selectedFilterOption = it },
                     modifier = Modifier.graphicsLayer {
                         alpha = 1f - detailProgress.value
                     },
@@ -2246,14 +2686,9 @@ private suspend fun fetchCoffeeHousesForResolvedCity(
         )
     }
 
-    val cafes = filteredPlaces
+    return filteredPlaces
         .mapNotNull { place -> place.toCafe(distanceReference = location.toLatLng()) }
         .sortedBy { it.distanceMeters ?: Float.MAX_VALUE }
-
-    return loadCafeCardImages(
-        placesClient = placesClient,
-        cafes = cafes
-    )
 }
 
 private suspend fun fetchCoffeeHousesForViewport(
@@ -2410,6 +2845,44 @@ private suspend fun fetchCafePhotoBitmap(
             .setMaxHeight(1100)
             .build()
         placesClient.fetchPhoto(request).await().bitmap
+    }.getOrNull()
+}
+
+private suspend fun fetchCafeCardPhotoBitmap(
+    placesClient: PlacesClient,
+    photoMetadata: PhotoMetadata
+): Bitmap? {
+    return runCatching {
+        val request = FetchPhotoRequest.builder(photoMetadata)
+            .setMaxWidth(900)
+            .setMaxHeight(700)
+            .build()
+        placesClient.fetchPhoto(request).await().bitmap
+    }.getOrNull()
+}
+
+private suspend fun fetchPlaceSearchThumbnailBitmap(
+    placesClient: PlacesClient,
+    placeId: String
+): Bitmap? {
+    return runCatching {
+        val placeRequest = com.google.android.libraries.places.api.net.FetchPlaceRequest
+            .builder(
+                placeId,
+                listOf(Place.Field.PHOTO_METADATAS)
+            )
+            .build()
+        val metadata = placesClient.fetchPlace(placeRequest)
+            .await()
+            .place
+            .photoMetadatas
+            ?.firstOrNull()
+            ?: return@runCatching null
+        val photoRequest = FetchPhotoRequest.builder(metadata)
+            .setMaxWidth(180)
+            .setMaxHeight(180)
+            .build()
+        placesClient.fetchPhoto(photoRequest).await().bitmap
     }.getOrNull()
 }
 
@@ -2736,6 +3209,7 @@ fun MapScreen(navController: NavHostController) {
     val hasLocationPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
     val defaultCamera = rememberCameraPositionState()
     var searchQuery by remember { mutableStateOf("") }
+    var searchPing by remember { mutableStateOf<MapSearchPing?>(null) }
     val cafeFeedState = CafeRepository.mapUiState
     val allCafes = cafeFeedState.cafes
     val isLoading = cafeFeedState.isLoading && allCafes.isEmpty()
@@ -2748,6 +3222,7 @@ fun MapScreen(navController: NavHostController) {
     val interactionSource = remember { MutableInteractionSource() }
     val inspectionMode = LocalInspectionMode.current
     var isMapLoaded by remember { mutableStateOf(false) }
+    var hasRequestedInitialMapViewport by remember { mutableStateOf(false) }
     val markerDescriptors = remember { mutableStateMapOf<String, BitmapDescriptor>() }
     val currentMarkerStyle by remember(defaultCamera) {
         derivedStateOf { markerVisualStyleForZoom(defaultCamera.position.zoom) }
@@ -2907,7 +3382,25 @@ fun MapScreen(navController: NavHostController) {
             return@LaunchedEffect
         }
 
-        if (!isMapLoaded) return@LaunchedEffect
+        if (!isMapLoaded) {
+            if (!hasRequestedInitialMapViewport) {
+                val lastKnownLatLng = runCatching {
+                    fusedLocationClient.lastLocation.await()?.toLatLng()
+                }.getOrNull()
+                if (lastKnownLatLng != null) {
+                    hasRequestedInitialMapViewport = true
+                    CafeRepository.ensureMapLoadedForViewport(
+                        context = context,
+                        fusedLocationClient = fusedLocationClient,
+                        placesClient = placesClient,
+                        hasLocationPermission = hasLocationPermission,
+                        center = lastKnownLatLng,
+                        searchRadiusMeters = MAP_VIEWPORT_SEARCH_MAX_RADIUS_METERS
+                    )
+                }
+            }
+            return@LaunchedEffect
+        }
 
         snapshotFlow {
             if (defaultCamera.isMoving) null else buildMapViewportLoadRequest(defaultCamera)
@@ -2940,7 +3433,8 @@ fun MapScreen(navController: NavHostController) {
                 MapSearchBar(
                     searchQuery = searchQuery,
                     onQueryChanged = { searchQuery = it },
-                    onPlaceSelected = { latLng ->
+                    onPlaceSelected = { latLng, title ->
+                        searchPing = MapSearchPing(title = title, latLng = latLng)
                         defaultCamera.move(CameraUpdateFactory.newLatLngZoom(latLng, 17f))
                     }
                 )
@@ -2951,12 +3445,14 @@ fun MapScreen(navController: NavHostController) {
                     enabled = detailProgress.value < 0.01f,
                     dimFraction = detailProgress.value
                 )
-            }
+            },
+            containerColor = CoffeeLight
         ) { innerPadding ->
             Box(
                 modifier = Modifier
                     .padding(innerPadding)
                     .fillMaxSize()
+                    .background(CoffeeLight)
             ) {
                 GoogleMap(
                     modifier = Modifier.fillMaxSize(),
@@ -2990,6 +3486,18 @@ fun MapScreen(navController: NavHostController) {
                             )
                         }
                     }
+                    searchPing?.let { ping ->
+                        val markerState = remember(ping.latLng) {
+                            com.google.maps.android.compose.MarkerState(position = ping.latLng)
+                        }
+                        LaunchedEffect(ping.latLng) {
+                            markerState.position = ping.latLng
+                        }
+                        Marker(
+                            state = markerState,
+                            title = ping.title
+                        )
+                    }
                 }
 
                 when {
@@ -3003,14 +3511,15 @@ fun MapScreen(navController: NavHostController) {
                                 .align(Alignment.Center)
                                 .padding(horizontal = 24.dp),
                             shape = RoundedCornerShape(20.dp),
-                            color = Color.White.copy(alpha = 0.96f),
+                            color = CoffeeSurfaceLight.copy(alpha = 0.98f),
                             tonalElevation = 8.dp
                         ) {
                             Text(
                                 text = loadError ?: "Unable to load cafes.",
                                 modifier = Modifier.padding(horizontal = 20.dp, vertical = 18.dp),
                                 textAlign = TextAlign.Center,
-                                style = MaterialTheme.typography.bodyLarge
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = CafeDark
                             )
                         }
                     }
@@ -3132,14 +3641,6 @@ fun BookmarkScreen(navController: NavHostController) {
 
     Box(modifier = Modifier.fillMaxSize()) {
         Scaffold(
-            topBar = {
-                TopSearchBar(
-                    modifier = Modifier.graphicsLayer {
-                        alpha = 1f - detailProgress.value
-                    },
-                    enabled = detailProgress.value < 0.01f
-                )
-            },
             bottomBar = {
                 BottomNavBar(
                     navController = navController,
@@ -3176,6 +3677,10 @@ fun BookmarkScreen(navController: NavHostController) {
             StudySessionDetailOverlay(
                 session = session,
                 onDismiss = { selectedStudySession = null },
+                onDelete = {
+                    StudySessionRepository.remove(session.id)
+                    selectedStudySession = null
+                },
                 onOpenCafeDetails = {
                     selectedSavedCafeId = session.cafeId
                 },
@@ -3253,11 +3758,19 @@ fun SavedCafeRow(
     onOpen: () -> Unit,
     onRemove: () -> Unit
 ) {
+    val cardColor = CoffeeSurfaceLight
+    val primaryTextColor = CafeDark
+    val secondaryTextColor = CoffeeDark.copy(alpha = 0.78f)
     OutlinedCard(
         modifier = Modifier
             .fillMaxWidth()
             .clickable { onOpen() },
-        shape = RoundedCornerShape(12.dp)
+        shape = RoundedCornerShape(12.dp),
+        colors = CardDefaults.outlinedCardColors(
+            containerColor = cardColor,
+            contentColor = primaryTextColor
+        ),
+        border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.14f))
     ) {
         Row(
             modifier = Modifier.padding(12.dp),
@@ -3267,7 +3780,7 @@ fun SavedCafeRow(
             Surface(
                 modifier = Modifier.size(56.dp),
                 shape = RoundedCornerShape(10.dp),
-                color = Color(0xFFF0F0F0)
+                color = CoffeeLight.copy(alpha = 0.9f)
             ) {
                 AsyncImage(
                     model = cafe.primaryImageModel(),
@@ -3280,7 +3793,11 @@ fun SavedCafeRow(
             Spacer(Modifier.width(12.dp))
 
             Column(modifier = Modifier.weight(1f)) {
-                Text(cafe.name, fontWeight = FontWeight.SemiBold)
+                Text(
+                    text = cafe.name,
+                    fontWeight = FontWeight.SemiBold,
+                    color = primaryTextColor
+                )
                 val reviewCount = cafe.userRatingCount ?: 0
                 if (cafe.rating != null && reviewCount > 0) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
@@ -3289,21 +3806,29 @@ fun SavedCafeRow(
                         Text(
                             text = String.format(Locale.US, "%.1f", cafe.rating),
                             style = MaterialTheme.typography.bodySmall,
-                            color = Color.Gray
+                            color = secondaryTextColor
                         )
                     }
                 } else {
-                    Text("No ratings yet", style = MaterialTheme.typography.bodySmall, color = Color.Gray)
+                    Text(
+                        text = "No ratings yet",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = secondaryTextColor
+                    )
                 }
                 Text(
                     text = formatDistanceAway(cafe.distanceMeters) ?: "Distance unavailable",
                     style = MaterialTheme.typography.bodySmall,
-                    color = Color(0xFF4A231C)
+                    color = primaryTextColor
                 )
             }
 
             IconButton(onClick = onRemove) {
-                Icon(Icons.Filled.Bookmark, contentDescription = "Remove bookmark")
+                Icon(
+                    Icons.Filled.Bookmark,
+                    contentDescription = "Remove bookmark",
+                    tint = CoffeeDark
+                )
             }
         }
     }
@@ -3322,77 +3847,311 @@ private fun SavedSectionHeading(title: String) {
     )
 }
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun TopSearchBar(modifier: Modifier = Modifier, enabled: Boolean = true) {
-    var text by remember { mutableStateOf("") }
-    Surface(modifier = modifier.fillMaxWidth().statusBarsPadding().padding(horizontal = 16.dp, vertical = 10.dp), shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceVariant) {
-        TextField(value = text, onValueChange = { text = it }, placeholder = { Text("Search cafes...") }, leadingIcon = { Icon(Icons.Filled.Menu, null) }, trailingIcon = { Icon(Icons.Filled.Search, null) }, singleLine = true, enabled = enabled, modifier = Modifier.fillMaxWidth(), colors = TextFieldDefaults.colors(focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent, disabledContainerColor = Color.Transparent, focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent))
+private fun CardsExploreFilterBar(
+    selectedOption: CardsFilterOption,
+    onOptionSelected: (CardsFilterOption) -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true
+) {
+    val playfairDisplay = remember { FontFamily(Font(R.font.playfair_display)) }
+    var expanded by remember { mutableStateOf(false) }
+    val menuShape = RoundedCornerShape(22.dp)
+    val toolbarBubbleColor = BottomNavToolbarColor
+    val selectedLabelColor = if (selectedOption == CardsFilterOption.Nearby) {
+        Color(0xFF4B3621)
+    } else {
+        Color.White.copy(alpha = 0.96f)
+    }
+
+    LaunchedEffect(enabled) {
+        if (!enabled) expanded = false
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .statusBarsPadding()
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Box {
+            Surface(
+                shape = RoundedCornerShape(28.dp),
+                color = toolbarBubbleColor
+            ) {
+                Row(
+                    modifier = Modifier
+                        .clickable(enabled = enabled) { expanded = true }
+                        .padding(start = 26.dp, end = 18.dp, top = 14.dp, bottom = 14.dp),
+                    horizontalArrangement = Arrangement.Center,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (selectedOption == CardsFilterOption.Nearby) {
+                        Image(
+                            painter = painterResource(id = R.drawable.nearby),
+                            contentDescription = null,
+                            modifier = Modifier.size(30.dp)
+                        )
+                        Spacer(Modifier.width(8.dp))
+                    }
+                    Text(
+                        text = selectedOption.label,
+                        color = selectedLabelColor,
+                        maxLines = 1,
+                        style = MaterialTheme.typography.titleLarge.copy(
+                            fontFamily = playfairDisplay,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 28.sp,
+                            lineHeight = 28.sp
+                        )
+                    )
+                    Spacer(Modifier.width(6.dp))
+                    Icon(
+                        imageVector = Icons.Filled.ArrowDropDown,
+                        contentDescription = "Choose cards filter",
+                        tint = Color.White.copy(alpha = 0.96f),
+                        modifier = Modifier.size(28.dp)
+                    )
+                }
+            }
+
+            DropdownMenu(
+                expanded = expanded,
+                onDismissRequest = { expanded = false },
+                modifier = Modifier.widthIn(min = 196.dp),
+                shape = menuShape,
+                containerColor = toolbarBubbleColor,
+                tonalElevation = 6.dp,
+                shadowElevation = 10.dp,
+                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.14f))
+            ) {
+                CardsFilterOption.values().forEach { option ->
+                    DropdownMenuItem(
+                        text = {
+                            Text(
+                                text = option.label,
+                                color = Color.White.copy(alpha = 0.96f),
+                                style = MaterialTheme.typography.titleMedium.copy(
+                                    fontFamily = playfairDisplay,
+                                    fontWeight = if (option == selectedOption) FontWeight.SemiBold else FontWeight.Medium
+                                )
+                            )
+                        },
+                        onClick = {
+                            onOptionSelected(option)
+                            expanded = false
+                        }
+                    )
+                }
+            }
+        }
+
     }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun MapSearchBar(searchQuery: String, onQueryChanged: (String) -> Unit, onPlaceSelected: (LatLng) -> Unit) {
+fun MapSearchBar(
+    searchQuery: String,
+    onQueryChanged: (String) -> Unit,
+    onPlaceSelected: (LatLng, String) -> Unit
+) {
     var recommended by remember { mutableStateOf<List<AutocompletePrediction>> (emptyList()) }
     val context = LocalContext.current
     val placesClient = remember(context) { if (Places.isInitialized()) Places.createClient(context) else null }
+    val predictionThumbnails = remember { mutableStateMapOf<String, Bitmap?>() }
+    val searchSurfaceColor = BottomNavToolbarColor
+    val searchContentColor = Color.Black
+    val searchPlaceholderColor = Color.Black.copy(alpha = 0.62f)
+    val visiblePredictions = recommended.take(5)
+    val visiblePredictionKey = visiblePredictions.joinToString(separator = "|") { prediction ->
+        prediction.placeId
+    }
 
-    Column() {
-        Surface(modifier = Modifier.fillMaxWidth()
+    LaunchedEffect(visiblePredictionKey, placesClient) {
+        val client = placesClient ?: return@LaunchedEffect
+        val visibleIds = visiblePredictions.map { prediction -> prediction.placeId }.toSet()
+        predictionThumbnails.keys
+            .filterNot { placeId -> placeId in visibleIds }
+            .forEach { placeId -> predictionThumbnails.remove(placeId) }
+
+        visiblePredictions.forEach { prediction ->
+            if (prediction.placeId in predictionThumbnails) return@forEach
+            predictionThumbnails[prediction.placeId] = fetchPlaceSearchThumbnailBitmap(
+                placesClient = client,
+                placeId = prediction.placeId
+            )
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(CoffeeLight)
             .statusBarsPadding()
-            .padding(horizontal = 16.dp, vertical = 10.dp), shape = RoundedCornerShape(28.dp), color = MaterialTheme.colorScheme.surfaceVariant)
-        {
+            .padding(horizontal = 16.dp, vertical = 10.dp),
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(28.dp),
+            color = searchSurfaceColor
+        ) {
             TextField(
                 value = searchQuery,
-                onValueChange = { it ->
-                    onQueryChanged(it)
+                onValueChange = { query ->
+                    onQueryChanged(query)
 
-                    if(it.isNotEmpty() && placesClient != null)
-                    {
+                    if (query.isNotBlank() && placesClient != null) {
                         val request = com.google.android.libraries.places.api.net.FindAutocompletePredictionsRequest.builder()
-                            .setQuery(it)
+                            .setQuery(query)
                             .build()
                         placesClient.findAutocompletePredictions(request)
                             .addOnSuccessListener { response ->
                                 recommended = response.autocompletePredictions
                             } .addOnFailureListener { recommended = emptyList() }
-
-
-                    }else recommended = emptyList()
+                    } else {
+                        recommended = emptyList()
+                    }
                 },
-                placeholder = { Text("Search location...") },
-                leadingIcon = { Icon(Icons.Filled.Menu, null) },
-                trailingIcon = { IconButton(onClick = { searchQuery }) {Icon(Icons.Filled.Search, null) } },
+                placeholder = { Text("Search location...", color = searchPlaceholderColor) },
+                leadingIcon = { Icon(Icons.Filled.Menu, null, tint = searchContentColor) },
+                trailingIcon = { IconButton(onClick = { searchQuery }) {Icon(Icons.Filled.Search, null, tint = searchContentColor) } },
                 singleLine = true,
                 enabled = placesClient != null,
-                modifier = Modifier.fillMaxWidth(), colors = TextFieldDefaults.colors(focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent, disabledContainerColor = Color.Transparent, focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent)
+                modifier = Modifier.fillMaxWidth(),
+                colors = TextFieldDefaults.colors(
+                    focusedContainerColor = Color.Transparent,
+                    unfocusedContainerColor = Color.Transparent,
+                    disabledContainerColor = Color.Transparent,
+                    focusedIndicatorColor = Color.Transparent,
+                    unfocusedIndicatorColor = Color.Transparent,
+                    disabledIndicatorColor = Color.Transparent,
+                    cursorColor = CafeDark,
+                    focusedTextColor = searchContentColor,
+                    unfocusedTextColor = searchContentColor,
+                    disabledTextColor = searchContentColor.copy(alpha = 0.5f),
+                    focusedPlaceholderColor = searchPlaceholderColor,
+                    unfocusedPlaceholderColor = searchPlaceholderColor,
+                    disabledPlaceholderColor = searchPlaceholderColor.copy(alpha = 0.55f),
+                    focusedLeadingIconColor = searchContentColor,
+                    unfocusedLeadingIconColor = searchContentColor,
+                    disabledLeadingIconColor = searchContentColor.copy(alpha = 0.5f),
+                    focusedTrailingIconColor = searchContentColor,
+                    unfocusedTrailingIconColor = searchContentColor,
+                    disabledTrailingIconColor = searchContentColor.copy(alpha = 0.5f)
+                )
             )
-
         }
-        DropdownMenu( expanded = recommended.isNotEmpty(), onDismissRequest = {recommended = emptyList()},  properties = androidx.compose.ui.window.PopupProperties( focusable = false)) {
-            recommended.forEach { prediction -> DropdownMenuItem(text = {Text(prediction.getFullText(null).toString()) },
-                onClick = {
-                    val client = placesClient ?: return@DropdownMenuItem
-                    val request = com.google.android.libraries.places.api.net.FetchPlaceRequest
-                        .builder(
-                            prediction.placeId,
-                            listOf(Place.Field.LOCATION)
-                        )
-                        .build()
 
-                    client.fetchPlace(request)
-                        .addOnSuccessListener { response ->
-                            response.place.location?.let { latLng ->
-                                onPlaceSelected(latLng)
-                                recommended = emptyList()
+        if (recommended.isNotEmpty()) {
+            OutlinedCard(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(18.dp),
+                colors = CardDefaults.outlinedCardColors(
+                    containerColor = CoffeeSurfaceLight,
+                    contentColor = CafeDark
+                ),
+                border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.16f))
+            ) {
+                Column(
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    visiblePredictions.forEach { prediction ->
+                        MapSearchPredictionRow(
+                            prediction = prediction,
+                            thumbnail = predictionThumbnails[prediction.placeId],
+                            onClick = {
+                                val client = placesClient ?: return@MapSearchPredictionRow
+                                val placeTitle = prediction.getPrimaryText(null).toString()
+                                val request = com.google.android.libraries.places.api.net.FetchPlaceRequest
+                                    .builder(
+                                        prediction.placeId,
+                                        listOf(Place.Field.LOCATION)
+                                    )
+                                    .build()
+
+                                client.fetchPlace(request)
+                                    .addOnSuccessListener { response ->
+                                        response.place.location?.let { latLng ->
+                                            onQueryChanged(placeTitle)
+                                            onPlaceSelected(latLng, placeTitle)
+                                            recommended = emptyList()
+                                        }
+                                    }
                             }
-                        }
-                })
+                        )
+                    }
+                }
             }
         }
     }
+}
 
+@Composable
+private fun MapSearchPredictionRow(
+    prediction: AutocompletePrediction,
+    thumbnail: Bitmap?,
+    onClick: () -> Unit
+) {
+    val primaryTextColor = CafeDark
+    val secondaryTextColor = CoffeeDark.copy(alpha = 0.78f)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable { onClick() },
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Surface(
+            modifier = Modifier.size(44.dp),
+            shape = RoundedCornerShape(8.dp),
+            color = CoffeeSurfaceLight
+        ) {
+            if (thumbnail != null) {
+                Image(
+                    bitmap = thumbnail.asImageBitmap(),
+                    contentDescription = prediction.getPrimaryText(null).toString(),
+                    modifier = Modifier.fillMaxSize(),
+                    contentScale = ContentScale.Crop
+                )
+            } else {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        imageVector = Icons.Filled.LocationOn,
+                        contentDescription = null,
+                        tint = primaryTextColor.copy(alpha = 0.78f)
+                    )
+                }
+            }
+        }
+
+        Spacer(Modifier.width(12.dp))
+
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = prediction.getPrimaryText(null).toString(),
+                fontWeight = FontWeight.SemiBold,
+                color = primaryTextColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = prediction.getSecondaryText(null).toString(),
+                style = MaterialTheme.typography.bodySmall,
+                color = secondaryTextColor,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+
+        Icon(
+            Icons.Filled.LocationOn,
+            contentDescription = "Show on map",
+            tint = primaryTextColor
+        )
+    }
 }
 
 @Composable
@@ -6272,6 +7031,9 @@ fun RecentCafeRow(
     cafe: Cafe,
     onClick: () -> Unit
 ) {
+    val rowSurfaceColor = CoffeeSurfaceLight
+    val primaryTextColor = CafeDark
+    val secondaryTextColor = CoffeeDark.copy(alpha = 0.78f)
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -6281,7 +7043,7 @@ fun RecentCafeRow(
         Surface(
             modifier = Modifier.size(44.dp),
             shape = RoundedCornerShape(8.dp),
-            color = Color(0xFFF0F0F0)
+            color = rowSurfaceColor
         ) {
             AsyncImage(
                 model = cafe.heroImageBitmap ?: cafe.imageUrl ?: cafe.imageResId,
@@ -6294,18 +7056,19 @@ fun RecentCafeRow(
         Spacer(Modifier.width(12.dp))
 
         Column(modifier = Modifier.weight(1f)) {
-            Text(cafe.name, fontWeight = FontWeight.SemiBold)
+            Text(cafe.name, fontWeight = FontWeight.SemiBold, color = primaryTextColor)
             Text(
                 cafe.address,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color.Gray,
+                color = secondaryTextColor,
                 maxLines = 1
             )
         }
 
         Icon(
             Icons.Filled.ChevronRight,
-            contentDescription = "Open"
+            contentDescription = "Open",
+            tint = primaryTextColor
         )
     }
 }
@@ -6380,13 +7143,17 @@ private fun PlaceSaved(
                     OutlinedCard(
                         modifier = Modifier.fillMaxWidth(),
                         shape = RoundedCornerShape(12.dp),
+                        colors = CardDefaults.outlinedCardColors(
+                            containerColor = CoffeeSurfaceLight,
+                            contentColor = CafeDark
+                        ),
                         border = BorderStroke(1.dp, outlineColor)
                     ) {
                         Text(
                             text = "No saved places yet. Swipe right on a cafe to add it here.",
                             modifier = Modifier.padding(16.dp),
                             style = MaterialTheme.typography.bodyMedium,
-                            color = Color.Gray
+                            color = CoffeeDark.copy(alpha = 0.78f)
                         )
                     }
                 } else {
@@ -6431,7 +7198,8 @@ private fun PlaceSaved(
                     studySessions.forEach { session ->
                         StudySessionSavedCard(
                             session = session,
-                            onOpen = { onStudySessionSelected(session) }
+                            onOpen = { onStudySessionSelected(session) },
+                            onDelete = { StudySessionRepository.remove(session.id) }
                         )
                     }
                 }
@@ -6449,7 +7217,8 @@ fun SavedTile(modifier: Modifier = Modifier, plus: Boolean = false) {
 @Composable
 private fun StudySessionSavedCard(
     session: StudySession,
-    onOpen: () -> Unit
+    onOpen: () -> Unit,
+    onDelete: () -> Unit
 ) {
     val firstPhotoUri = session.photoUris.firstOrNull()
 
@@ -6460,7 +7229,7 @@ private fun StudySessionSavedCard(
         shape = RoundedCornerShape(12.dp),
         border = BorderStroke(1.dp, Color(0xFFE6E6E6)),
         colors = CardDefaults.outlinedCardColors(
-            containerColor = Color.White,
+            containerColor = Color(0xFFD9EEFF),
             contentColor = Color.Black
         )
     ) {
@@ -6514,9 +7283,16 @@ private fun StudySessionSavedCard(
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(
-                    text = "${session.className} - ${session.dateText} at ${session.timeText}",
+                    text = "${session.className} - ${session.dateText}",
                     style = MaterialTheme.typography.bodySmall,
                     color = Color.Black.copy(alpha = 0.74f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "Time: ${session.timeRangeText}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.Black.copy(alpha = 0.68f),
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
@@ -6528,6 +7304,16 @@ private fun StudySessionSavedCard(
                     overflow = TextOverflow.Ellipsis
                 )
             }
+
+            Spacer(modifier = Modifier.width(8.dp))
+
+            IconButton(onClick = onDelete) {
+                Icon(
+                    imageVector = Icons.Filled.Delete,
+                    contentDescription = "Delete study session",
+                    tint = Color.Black.copy(alpha = 0.74f)
+                )
+            }
         }
     }
 }
@@ -6536,6 +7322,7 @@ private fun StudySessionSavedCard(
 private fun StudySessionDetailOverlay(
     session: StudySession,
     onDismiss: () -> Unit,
+    onDelete: () -> Unit,
     onOpenCafeDetails: () -> Unit,
     backHandlerEnabled: Boolean = true,
     modifier: Modifier = Modifier
@@ -6659,10 +7446,8 @@ private fun StudySessionDetailOverlay(
                 StudySessionSubmittedPhotos(photoUris = session.photoUris)
 
                 StudySessionReadonlyField(label = "Class", value = session.className)
-                StudySessionReadonlyField(
-                    label = "When",
-                    value = "${session.dateText} at ${session.timeText}"
-                )
+                StudySessionReadonlyField(label = "Date", value = session.dateText)
+                StudySessionReadonlyField(label = "Time", value = session.timeRangeText)
                 StudySessionCafeDetailsButton(
                     cafeName = session.cafeName,
                     onClick = onOpenCafeDetails
@@ -6671,8 +7456,16 @@ private fun StudySessionDetailOverlay(
 
                 Row(
                     modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.End
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
+                    TextButton(
+                        onClick = onDelete,
+                        colors = ButtonDefaults.textButtonColors(
+                            contentColor = StudySessionPopupTextColor
+                        )
+                    ) {
+                        Text("Delete")
+                    }
                     Button(
                         onClick = { closeDetails() },
                         colors = ButtonDefaults.buttonColors(
@@ -7343,31 +8136,287 @@ private fun studySessionTextFieldColors() = OutlinedTextFieldDefaults.colors(
 )
 
 @Composable
+private fun StudySessionPickerTheme(
+    content: @Composable () -> Unit
+) {
+    MaterialTheme(
+        colorScheme = MaterialTheme.colorScheme.copy(
+            primary = StudySessionPopupFieldColor,
+            onPrimary = StudySessionPopupFieldTextColor,
+            primaryContainer = StudySessionPopupFieldColor,
+            onPrimaryContainer = StudySessionPopupFieldTextColor,
+            secondary = Color(0xFFD5F1FF),
+            onSecondary = Color.Black,
+            secondaryContainer = Color(0xFFD5F1FF),
+            onSecondaryContainer = Color.Black,
+            surface = StudySessionPopupSurfaceColor,
+            onSurface = StudySessionPopupTextColor,
+            surfaceVariant = StudySessionPopupFieldColor.copy(alpha = 0.72f),
+            onSurfaceVariant = StudySessionPopupTextColor
+        ),
+        typography = MaterialTheme.typography,
+        shapes = MaterialTheme.shapes,
+        content = content
+    )
+}
+
+private enum class StudySessionTimeField {
+    Start,
+    End
+}
+
+@Composable
+private fun StudySessionCompactFieldLabel(text: String) {
+    Text(
+        text = text,
+        style = MaterialTheme.typography.labelSmall.copy(
+            fontSize = 11.sp,
+            lineHeight = 11.sp
+        ),
+        maxLines = 1,
+        softWrap = false,
+        overflow = TextOverflow.Clip
+    )
+}
+
+@Composable
+private fun StudySessionPickerField(
+    value: String,
+    label: String,
+    placeholder: String,
+    icon: ImageVector,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    colors: TextFieldColors = studySessionTextFieldColors()
+) {
+    Box(modifier = modifier) {
+        OutlinedTextField(
+            value = value,
+            onValueChange = {},
+            readOnly = true,
+            singleLine = true,
+            label = { StudySessionCompactFieldLabel(label) },
+            placeholder = {
+                Text(
+                    text = placeholder,
+                    color = StudySessionPopupFieldTextColor.copy(alpha = 0.56f),
+                    maxLines = 1,
+                    softWrap = false,
+                    overflow = TextOverflow.Ellipsis
+                )
+            },
+            trailingIcon = {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = null,
+                    tint = StudySessionPopupFieldTextColor
+                )
+            },
+            modifier = Modifier.fillMaxWidth(),
+            colors = colors
+        )
+        Box(
+            modifier = Modifier
+                .matchParentSize()
+                .clickable { onClick() }
+        )
+    }
+}
+
+@Composable
+private fun StudySessionPickerDialogShell(
+    title: String,
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit,
+    confirmEnabled: Boolean = true,
+    confirmLabel: String = "Apply",
+    maxWidth: Dp = 420.dp,
+    content: @Composable ColumnScope.() -> Unit
+) {
+    val maxDialogHeight = maxOf(320.dp, LocalConfiguration.current.screenHeightDp.dp - 48.dp)
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Card(
+            modifier = Modifier
+                .padding(horizontal = 16.dp, vertical = 24.dp)
+                .fillMaxWidth()
+                .widthIn(max = maxWidth)
+                .heightIn(max = maxDialogHeight),
+            shape = RoundedCornerShape(22.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = StudySessionPopupSurfaceColor,
+                contentColor = StudySessionPopupTextColor
+            ),
+            border = BorderStroke(2.dp, Color.Black)
+        ) {
+            Column(
+                modifier = Modifier
+                    .verticalScroll(rememberScrollState())
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = StudySessionPopupTextColor
+                )
+                content()
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.End
+                ) {
+                    TextButton(
+                        onClick = onDismiss,
+                        colors = ButtonDefaults.textButtonColors(
+                            contentColor = StudySessionPopupTextColor
+                        )
+                    ) {
+                        Text("Cancel")
+                    }
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = onConfirm,
+                        enabled = confirmEnabled,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = StudySessionPopupFieldColor,
+                            contentColor = StudySessionPopupFieldTextColor,
+                            disabledContainerColor = StudySessionPopupFieldColor.copy(alpha = 0.42f),
+                            disabledContentColor = StudySessionPopupFieldTextColor.copy(alpha = 0.5f)
+                        )
+                    ) {
+                        Text(confirmLabel)
+                    }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun StudySessionDatePickerDialog(
+    initialDateUtcMillis: Long?,
+    onDismiss: () -> Unit,
+    onDateSelected: (Long) -> Unit
+) {
+    val pickerState = rememberDatePickerState(
+        initialSelectedDateMillis = initialDateUtcMillis ?: System.currentTimeMillis()
+    )
+
+    StudySessionPickerDialogShell(
+        title = "Pick a date",
+        onDismiss = onDismiss,
+        onConfirm = {
+            pickerState.selectedDateMillis?.let(onDateSelected)
+        },
+        confirmEnabled = pickerState.selectedDateMillis != null,
+        confirmLabel = "Select",
+        maxWidth = 380.dp
+    ) {
+        Surface(
+            shape = RoundedCornerShape(18.dp),
+            color = StudySessionPopupFieldColor.copy(alpha = 0.26f)
+        ) {
+            StudySessionPickerTheme {
+                DatePicker(
+                    state = pickerState,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = DatePickerDefaults.colors(
+                        containerColor = Color.Transparent
+                    ),
+                    showModeToggle = false,
+                    title = null,
+                    headline = null
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun StudySessionTimePickerDialog(
+    title: String,
+    initialHour: Int?,
+    initialMinute: Int?,
+    onDismiss: () -> Unit,
+    onTimeSelected: (Int, Int) -> Unit
+) {
+    val calendar = remember {
+        Calendar.getInstance()
+    }
+    val pickerState = rememberTimePickerState(
+        initialHour = initialHour ?: calendar.get(Calendar.HOUR_OF_DAY),
+        initialMinute = initialMinute ?: calendar.get(Calendar.MINUTE),
+        is24Hour = false
+    )
+
+    StudySessionPickerDialogShell(
+        title = title,
+        onDismiss = onDismiss,
+        onConfirm = { onTimeSelected(pickerState.hour, pickerState.minute) },
+        confirmLabel = "Select"
+    ) {
+        StudySessionPickerTheme {
+            Box(
+                modifier = Modifier.fillMaxWidth(),
+                contentAlignment = Alignment.Center
+            ) {
+                TimePicker(state = pickerState)
+            }
+        }
+    }
+}
+
+private fun persistStudySessionPhotoPermission(
+    context: Context,
+    uri: Uri
+) {
+    runCatching {
+        context.contentResolver.takePersistableUriPermission(
+            uri,
+            Intent.FLAG_GRANT_READ_URI_PERMISSION
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
 private fun StudySessionComposerOverlay(
     cafe: Cafe,
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier
 ) {
+    val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val interactionSource = remember { MutableInteractionSource() }
     var isVisible by remember { mutableStateOf(false) }
     var isClosing by remember { mutableStateOf(false) }
     var title by remember(cafe.id) { mutableStateOf("") }
     var className by remember(cafe.id) { mutableStateOf("") }
-    var dateText by remember(cafe.id) { mutableStateOf("") }
-    var timeText by remember(cafe.id) { mutableStateOf("") }
+    var selectedDateUtcMillis by remember(cafe.id) { mutableStateOf<Long?>(null) }
+    var selectedStartHour by remember(cafe.id) { mutableStateOf<Int?>(null) }
+    var selectedStartMinute by remember(cafe.id) { mutableStateOf<Int?>(null) }
+    var selectedEndHour by remember(cafe.id) { mutableStateOf<Int?>(null) }
+    var selectedEndMinute by remember(cafe.id) { mutableStateOf<Int?>(null) }
     var summary by remember(cafe.id) { mutableStateOf("") }
+    var showDatePicker by remember(cafe.id) { mutableStateOf(false) }
+    var activeTimeField by remember(cafe.id) { mutableStateOf<StudySessionTimeField?>(null) }
     val selectedPhotoUris = remember(cafe.id) { mutableStateListOf<String>() }
     val photoPicker = rememberLauncherForActivityResult(
-        contract = ActivityResultContracts.GetMultipleContents()
+        contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
-        uris
-            .map(Uri::toString)
-            .forEach { uriText ->
-                if (selectedPhotoUris.size < 5 && uriText !in selectedPhotoUris) {
-                    selectedPhotoUris.add(uriText)
-                }
+        uris.forEach { uri ->
+            persistStudySessionPhotoPermission(context, uri)
+            val uriText = uri.toString()
+            if (selectedPhotoUris.size < 5 && uriText !in selectedPhotoUris) {
+                selectedPhotoUris.add(uriText)
             }
+        }
     }
 
     LaunchedEffect(Unit) {
@@ -7401,13 +8450,51 @@ private fun StudySessionComposerOverlay(
     val draft = StudySessionDraft(
         title = title,
         className = className,
-        dateText = dateText,
-        timeText = timeText,
+        scheduledDateUtcMillis = selectedDateUtcMillis,
+        startHour = selectedStartHour,
+        startMinute = selectedStartMinute,
+        endHour = selectedEndHour,
+        endMinute = selectedEndMinute,
         summary = summary,
         photoUris = selectedPhotoUris.toList()
     )
     val canCreate = StudySessionRepository.canCreate(draft)
     val textFieldColors = studySessionTextFieldColors()
+    val dateText = selectedDateUtcMillis?.let(::formatStudySessionDate).orEmpty()
+    val startTimeText = if (selectedStartHour != null && selectedStartMinute != null) {
+        formatStudySessionTime(
+            hour = selectedStartHour ?: 0,
+            minute = selectedStartMinute ?: 0
+        )
+    } else {
+        ""
+    }
+    val endTimeText = if (selectedEndHour != null && selectedEndMinute != null) {
+        formatStudySessionTime(
+            hour = selectedEndHour ?: 0,
+            minute = selectedEndMinute ?: 0
+        )
+    } else {
+        ""
+    }
+    val showTimeRangeError = selectedStartHour != null &&
+        selectedStartMinute != null &&
+        selectedEndHour != null &&
+        selectedEndMinute != null &&
+        !isStudySessionTimeRangeValid(
+            startHour = selectedStartHour,
+            startMinute = selectedStartMinute,
+            endHour = selectedEndHour,
+            endMinute = selectedEndMinute
+        )
+    val suggestedEndTotalMinutes = if (selectedStartHour != null && selectedStartMinute != null) {
+        minOf(
+            (((selectedStartHour ?: 0) * 60) + (selectedStartMinute ?: 0) + 60),
+            (24 * 60) - 1
+        )
+    } else {
+        null
+    }
 
     Box(modifier = modifier.zIndex(10f)) {
         Box(
@@ -7505,22 +8592,40 @@ private fun StudySessionComposerOverlay(
                     singleLine = true,
                     colors = textFieldColors
                 )
+                StudySessionPickerField(
+                    value = dateText,
+                    label = "Date",
+                    placeholder = "Choose a date",
+                    icon = Icons.Filled.CalendarMonth,
+                    onClick = { showDatePicker = true },
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = textFieldColors
+                )
                 Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-                    OutlinedTextField(
-                        value = dateText,
-                        onValueChange = { dateText = it },
-                        label = { Text("Date") },
+                    StudySessionPickerField(
+                        value = startTimeText,
+                        label = "Start",
+                        placeholder = "Start time",
+                        icon = Icons.Filled.AccessTime,
+                        onClick = { activeTimeField = StudySessionTimeField.Start },
                         modifier = Modifier.weight(1f),
-                        singleLine = true,
                         colors = textFieldColors
                     )
-                    OutlinedTextField(
-                        value = timeText,
-                        onValueChange = { timeText = it },
-                        label = { Text("Time") },
+                    StudySessionPickerField(
+                        value = endTimeText,
+                        label = "End",
+                        placeholder = "End time",
+                        icon = Icons.Filled.AccessTime,
+                        onClick = { activeTimeField = StudySessionTimeField.End },
                         modifier = Modifier.weight(1f),
-                        singleLine = true,
                         colors = textFieldColors
+                    )
+                }
+                if (showTimeRangeError) {
+                    Text(
+                        text = "End time needs to be later than the start time.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = StudySessionPopupSecondaryTextColor
                     )
                 }
                 OutlinedTextField(
@@ -7546,7 +8651,7 @@ private fun StudySessionComposerOverlay(
                             color = StudySessionPopupTextColor
                         )
                         OutlinedButton(
-                            onClick = { photoPicker.launch("image/*") },
+                            onClick = { photoPicker.launch(arrayOf("image/*")) },
                             enabled = selectedPhotoUris.size < 5,
                             colors = ButtonDefaults.outlinedButtonColors(
                                 containerColor = StudySessionPopupFieldColor,
@@ -7613,6 +8718,57 @@ private fun StudySessionComposerOverlay(
                     }
                 }
             }
+        }
+
+        if (showDatePicker) {
+            StudySessionDatePickerDialog(
+                initialDateUtcMillis = selectedDateUtcMillis,
+                onDismiss = { showDatePicker = false },
+                onDateSelected = { pickedDate ->
+                    selectedDateUtcMillis = pickedDate
+                    showDatePicker = false
+                }
+            )
+        }
+
+        activeTimeField?.let { timeField ->
+            StudySessionTimePickerDialog(
+                title = if (timeField == StudySessionTimeField.Start) {
+                    "Pick a start time"
+                } else {
+                    "Pick an end time"
+                },
+                initialHour = when (timeField) {
+                    StudySessionTimeField.Start -> selectedStartHour
+                    StudySessionTimeField.End -> selectedEndHour ?: suggestedEndTotalMinutes?.div(60)
+                },
+                initialMinute = when (timeField) {
+                    StudySessionTimeField.Start -> selectedStartMinute
+                    StudySessionTimeField.End -> selectedEndMinute ?: suggestedEndTotalMinutes?.rem(60)
+                },
+                onDismiss = { activeTimeField = null },
+                onTimeSelected = { hour, minute ->
+                    when (timeField) {
+                        StudySessionTimeField.Start -> {
+                            selectedStartHour = hour
+                            selectedStartMinute = minute
+                            if (selectedEndHour == null || selectedEndMinute == null) {
+                                val defaultEndTotalMinutes = minOf(
+                                    ((hour * 60) + minute) + 60,
+                                    (24 * 60) - 1
+                                )
+                                selectedEndHour = defaultEndTotalMinutes / 60
+                                selectedEndMinute = defaultEndTotalMinutes % 60
+                            }
+                        }
+                        StudySessionTimeField.End -> {
+                            selectedEndHour = hour
+                            selectedEndMinute = minute
+                        }
+                    }
+                    activeTimeField = null
+                }
+            )
         }
     }
 }
@@ -7681,12 +8837,13 @@ private class BottomNavUiState {
 private val LocalBottomNavMotionState = staticCompositionLocalOf { BottomNavMotionState() }
 private val LocalBottomNavUiState = staticCompositionLocalOf { BottomNavUiState() }
 private val LocalUsesPersistentBottomNav = staticCompositionLocalOf { false }
+private val BottomNavToolbarColor = Color(0xFF6B5947)
 
 private val bottomNavItems = listOf(
     BottomNavItem(Screen.MainScreen.route, R.drawable.nav_cards, "Cards"),
     BottomNavItem(Screen.MapScreen.route, R.drawable.nav_map, "Map"),
     BottomNavItem(Screen.BookmarkScreen.route, R.drawable.nav_save, "Save"),
-    BottomNavItem(Screen.ProfileScreen.route, R.drawable.nav_profile, "Profile")
+    BottomNavItem(Screen.ProfileScreen.route, R.drawable.nav_profile_coffee, "Profile")
 )
 
 private val bottomNavRoutes = setOf(
@@ -7819,7 +8976,7 @@ private fun FloatingBottomNavBar(
             modifier = Modifier
                 .matchParentSize()
                 .shadow(elevation = 12.dp, shape = CircleShape, clip = false)
-                .background(Color(0xFF6B5947), CircleShape)
+                .background(BottomNavToolbarColor, CircleShape)
         )
         Box(
             modifier = Modifier
@@ -7896,12 +9053,55 @@ fun ProfileScreen(navController: NavHostController) {
 
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val placesClient = remember(context) { if (Places.isInitialized()) Places.createClient(context) else null }
+    val backgroundColor = CoffeeLight
+    val cardColor = CoffeeSurfaceLight
+    val primaryTextColor = CafeDark
+    val secondaryTextColor = CoffeeDark.copy(alpha = 0.78f)
+    val allRecentCafes = RecentRepository.cafes()
+    val recentCafes = allRecentCafes.take(3)
 
     var profile by remember { mutableStateOf<Profile?>(null) }
     var bioText by remember { mutableStateOf("") }
     var avatarUri by remember { mutableStateOf<Uri?>(null) }
 
     var isLoading by remember { mutableStateOf(true) }
+    var selectedRecentCafeId by rememberSaveable { mutableStateOf<String?>(null) }
+    var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
+    val detailProgress = remember { Animatable(0f) }
+    val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
+    val interactionSource = remember { MutableInteractionSource() }
+    val selectedRecentCafe = remember(allRecentCafes, selectedRecentCafeId) {
+        selectedRecentCafeId?.let { cafeId ->
+            allRecentCafes.firstOrNull { cafe -> cafe.id == cafeId } ?: CafeRepository.getCafe(cafeId)
+        }
+    }
+    CafeDetailDataEffect(cafe = selectedRecentCafe, placesClient = placesClient)
+
+    LaunchedEffect(selectedRecentCafe) {
+        if (selectedRecentCafe != null) {
+            overlayCafe = selectedRecentCafe
+        }
+    }
+
+    LaunchedEffect(selectedRecentCafeId) {
+        if (selectedRecentCafeId != null) {
+            detailProgress.animateTo(
+                targetValue = 1f,
+                animationSpec = tween(durationMillis = 320, easing = FastOutSlowInEasing)
+            )
+        } else if (overlayCafe != null || detailProgress.value > 0f) {
+            detailProgress.animateTo(
+                targetValue = 0f,
+                animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing)
+            )
+            overlayCafe = null
+        }
+    }
+
+    BackHandler(enabled = selectedRecentCafeId != null) {
+        selectedRecentCafeId = null
+    }
 
     // Pick image + upload to DB
     val pickImage = rememberLauncherForActivityResult(
@@ -7986,30 +9186,40 @@ fun ProfileScreen(navController: NavHostController) {
     if (isLoading) {
 
         Box(
-            modifier = Modifier.fillMaxSize(),
+            modifier = Modifier
+                .fillMaxSize()
+                .background(backgroundColor),
             contentAlignment = Alignment.Center
         ) {
             Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                CircularProgressIndicator()
+                CircularProgressIndicator(color = CafeDark)
                 Spacer(modifier = Modifier.height(12.dp))
-                Text("Loading profile...")
+                Text("Loading profile...", color = primaryTextColor)
             }
         }
 
     }
 
     else {
-        Scaffold(
-            bottomBar = { BottomNavBar(navController) },
-            containerColor = Color.White
-        ) { innerPadding ->
+        Box(modifier = Modifier.fillMaxSize()) {
+            Scaffold(
+                bottomBar = {
+                    BottomNavBar(
+                        navController = navController,
+                        enabled = detailProgress.value < 0.01f,
+                        dimFraction = detailProgress.value
+                    )
+                },
+                containerColor = backgroundColor
+            ) { innerPadding ->
 
             LazyColumn(
                 modifier = Modifier
                     .padding(innerPadding)
                     .fillMaxSize()
                     .padding(horizontal = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(14.dp)
+                verticalArrangement = Arrangement.spacedBy(14.dp),
+                contentPadding = PaddingValues(top = 12.dp, bottom = 24.dp)
             ) {
 
                 // Notifications
@@ -8021,7 +9231,8 @@ fun ProfileScreen(navController: NavHostController) {
                         IconButton(onClick = { }) {
                             Icon(
                                 Icons.Filled.Notifications,
-                                contentDescription = "Notifications"
+                                contentDescription = "Notifications",
+                                tint = primaryTextColor
                             )
                         }
                     }
@@ -8037,7 +9248,7 @@ fun ProfileScreen(navController: NavHostController) {
                         Surface(
                             shape = CircleShape,
                             modifier = Modifier.size(72.dp),
-                            color = Color(0xFFEDE7FF),
+                            color = cardColor,
                             onClick = { pickImage.launch("image/*") }
                         ) {
 
@@ -8064,7 +9275,7 @@ fun ProfileScreen(navController: NavHostController) {
                                             Icons.Filled.Person,
                                             contentDescription = "Profile picture",
                                             modifier = Modifier.size(32.dp),
-                                            tint = Color(0xFF6B4EFF)
+                                            tint = primaryTextColor
                                         )
                                     }
                                 }
@@ -8080,7 +9291,8 @@ fun ProfileScreen(navController: NavHostController) {
                                 if (first.isNotEmpty() || last.isNotEmpty()) "$first $last" else "User"
                             } ?: "User",
                             style = MaterialTheme.typography.headlineSmall,
-                            fontWeight = FontWeight.SemiBold
+                            fontWeight = FontWeight.SemiBold,
+                            color = primaryTextColor
                         )
                     }
                 }
@@ -8102,7 +9314,8 @@ fun ProfileScreen(navController: NavHostController) {
                     Text(
                         text = "Experience",
                         style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.SemiBold
+                        fontWeight = FontWeight.SemiBold,
+                        color = primaryTextColor
                     )
                 }
 
@@ -8112,7 +9325,9 @@ fun ProfileScreen(navController: NavHostController) {
                         modifier = Modifier
                             .fillMaxWidth()
                             .height(80.dp),
-                        shape = RoundedCornerShape(8.dp)
+                        shape = RoundedCornerShape(8.dp),
+                        colors = CardDefaults.outlinedCardColors(containerColor = cardColor),
+                        border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.18f))
                     ) {
 
                         TextField(
@@ -8121,10 +9336,19 @@ fun ProfileScreen(navController: NavHostController) {
                             modifier = Modifier
                                 .fillMaxSize()
                                 .padding(horizontal = 8.dp),
-                            placeholder = { Text("Tell us about yourself...") },
+                            placeholder = { Text("Tell us about yourself...", color = secondaryTextColor) },
                             colors = TextFieldDefaults.colors(
                                 focusedContainerColor = Color.Transparent,
-                                unfocusedContainerColor = Color.Transparent
+                                unfocusedContainerColor = Color.Transparent,
+                                disabledContainerColor = Color.Transparent,
+                                focusedIndicatorColor = Color.Transparent,
+                                unfocusedIndicatorColor = Color.Transparent,
+                                disabledIndicatorColor = Color.Transparent,
+                                cursorColor = primaryTextColor,
+                                focusedTextColor = primaryTextColor,
+                                unfocusedTextColor = primaryTextColor,
+                                focusedPlaceholderColor = secondaryTextColor,
+                                unfocusedPlaceholderColor = secondaryTextColor
                             )
                         )
                     }
@@ -8146,7 +9370,11 @@ fun ProfileScreen(navController: NavHostController) {
                                 }
                             }
                         },
-                        modifier = Modifier.fillMaxWidth()
+                        modifier = Modifier.fillMaxWidth(),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = CoffeeDark,
+                            contentColor = Color.White
+                        )
                     ) {
                         Text("Save")
                     }
@@ -8160,7 +9388,8 @@ fun ProfileScreen(navController: NavHostController) {
                         Text(
                             text = "Recently View",
                             style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold
+                            fontWeight = FontWeight.SemiBold,
+                            color = primaryTextColor
                         )
 
                         Spacer(Modifier.width(4.dp))
@@ -8168,23 +9397,23 @@ fun ProfileScreen(navController: NavHostController) {
                         Icon(
                             imageVector = Icons.Filled.ChevronRight,
                             contentDescription = "View more",
-                            modifier = Modifier.clickable { }
+                            modifier = Modifier.clickable { },
+                            tint = primaryTextColor
                         )
                     }
                 }
 
-                val recentCafes = RecentRepository.previewCafes()
-
                 if (recentCafes.isEmpty()) {
                     item {
-                        Text("No recently viewed cafes yet.", color = Color.Gray)
+                        Text("No recently viewed cafes yet.", color = secondaryTextColor)
                     }
                 } else {
                     items(recentCafes, key = { it.id }) { cafe ->
                         RecentCafeRow(
                             cafe = cafe,
                             onClick = {
-                                navController.navigate(Screen.CafeDetails.createRoute(cafe.id))
+                                RecentRepository.add(cafe.id)
+                                selectedRecentCafeId = cafe.id
                             }
                         )
                     }
@@ -8227,6 +9456,68 @@ fun ProfileScreen(navController: NavHostController) {
                     }
                 }
             }
+            }
+
+            if (overlayCafe != null && detailProgress.value > 0f) {
+                val scrimAlpha by animateFloatAsState(
+                    targetValue = 0.2f * detailProgress.value,
+                    animationSpec = tween(durationMillis = 120, easing = FastOutSlowInEasing),
+                    label = "profileDetailScrimAlpha"
+                )
+                val overlayScale by animateFloatAsState(
+                    targetValue = 0.94f + (0.06f * detailProgress.value),
+                    animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
+                    label = "profileDetailOverlayScale"
+                )
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .zIndex(20f)
+                        .background(Color.Black.copy(alpha = scrimAlpha))
+                        .clickable(
+                            interactionSource = interactionSource,
+                            indication = null
+                        ) {
+                            selectedRecentCafeId = null
+                        }
+                )
+
+                ExpandedCafeDetailOverlay(
+                    navController = navController,
+                    cafe = overlayCafe!!,
+                    onClose = { selectedRecentCafeId = null },
+                    cornerRadius = lerp(
+                        detailOverlayLayoutSpec.collapsedCornerRadius,
+                        detailOverlayLayoutSpec.expandedCornerRadius,
+                        detailProgress.value
+                    ),
+                    heroHeight = lerp(
+                        detailOverlayLayoutSpec.collapsedHeroHeight,
+                        detailOverlayLayoutSpec.expandedHeroHeight,
+                        detailProgress.value
+                    ),
+                    sharedHeroModel = overlayCafe!!.primaryImageModel(),
+                    transitionProgress = detailProgress.value,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .zIndex(21f)
+                        .statusBarsPadding()
+                        .navigationBarsPadding()
+                        .padding(
+                            start = detailOverlayLayoutSpec.horizontalInset,
+                            end = detailOverlayLayoutSpec.horizontalInset,
+                            top = detailOverlayLayoutSpec.topInset,
+                            bottom = detailOverlayLayoutSpec.bottomInset
+                        )
+                        .fillMaxWidth()
+                        .graphicsLayer {
+                            alpha = detailProgress.value
+                            scaleX = overlayScale
+                            scaleY = overlayScale
+                        }
+                )
+            }
         }
     }
 }
@@ -8237,9 +9528,9 @@ fun ProfileAction( // Removed private
     label: String
 ) {
     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-        Icon(icon, contentDescription = label, modifier = Modifier.size(28.dp))
+        Icon(icon, contentDescription = label, modifier = Modifier.size(28.dp), tint = CafeDark)
         Spacer(Modifier.height(4.dp))
-        Text(text = label, style = MaterialTheme.typography.bodySmall)
+        Text(text = label, style = MaterialTheme.typography.bodySmall, color = CoffeeDark)
     }
 }
 
@@ -8252,24 +9543,25 @@ fun RecentItemRow(name: String, address: String) {
         Surface(
             modifier = Modifier.size(44.dp),
             shape = RoundedCornerShape(8.dp),
-            color = Color(0xFFF0F0F0)
+            color = CoffeeSurfaceLight
         ) {}
 
         Spacer(Modifier.width(12.dp))
 
         Column(modifier = Modifier.weight(1f)) {
-            Text(name, fontWeight = FontWeight.SemiBold)
+            Text(name, fontWeight = FontWeight.SemiBold, color = CafeDark)
             Text(
                 address,
                 style = MaterialTheme.typography.bodySmall,
-                color = Color.Gray
+                color = CoffeeDark.copy(alpha = 0.78f)
             )
         }
 
         IconButton(onClick = { }) {
             Icon(
                 Icons.Filled.BookmarkBorder,
-                contentDescription = "Bookmark"
+                contentDescription = "Bookmark",
+                tint = CafeDark
             )
         }
     }
@@ -8469,7 +9761,7 @@ fun PreferencesScreen(navController: NavHostController) {
 
     // To match the theme
     val backgroundColor = CafeBrown
-    val cardColor = Color(0xFFEAD7CE)
+    val cardColor = CoffeeSurfaceLight
     val textColor = Color.Black
 
     // Load existing preferences

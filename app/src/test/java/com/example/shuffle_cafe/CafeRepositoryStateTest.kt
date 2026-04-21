@@ -194,6 +194,23 @@ class CafeRepositoryStateTest {
     }
 
     @Test
+    fun loadedHomeFeedCanBeReusedForSameCityWithoutReloadingCache() {
+        val loadedFeed = CafeFeedUiState(
+            cafes = listOf(testCafe(id = "loaded")),
+            isLoading = false,
+            isRefreshing = false,
+            cityKey = "redlands"
+        )
+
+        assertTrue(loadedFeed.hasReusableLoadedCafesForCity("redlands"))
+        assertFalse(loadedFeed.hasReusableLoadedCafesForCity("riverside"))
+        assertFalse(loadedFeed.hasReusableLoadedCafesForCity(null))
+        assertFalse(loadedFeed.copy(isLoading = true).hasReusableLoadedCafesForCity("redlands"))
+        assertFalse(loadedFeed.copy(isRefreshing = true).hasReusableLoadedCafesForCity("redlands"))
+        assertFalse(loadedFeed.copy(cafes = emptyList()).hasReusableLoadedCafesForCity("redlands"))
+    }
+
+    @Test
     fun cachedCafeEnvelopeRequiresImageDataBeforeSkippingCardRefresh() {
         val envelopeWithoutImages = CachedCafeEnvelope(
             cityKey = "missing_images",
