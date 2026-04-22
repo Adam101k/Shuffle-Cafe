@@ -73,6 +73,7 @@ import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.PointerInputChange
@@ -153,6 +154,7 @@ import com.google.maps.android.compose.MapProperties
 import com.google.maps.android.compose.MapUiSettings
 import com.google.maps.android.compose.Marker
 import com.google.maps.android.compose.rememberCameraPositionState
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.Dispatchers
@@ -364,9 +366,19 @@ private const val BOOKMARK_CACHE_PREFS_NAME = "shuffle_cafe_bookmark_cache"
 private const val BOOKMARK_CACHE_ENTRY_KEY = "saved_bookmark_cafes"
 private const val CARD_STACK_PROGRESS_PREFS_NAME = "shuffle_cafe_card_stack_progress"
 private const val CARD_STACK_TOP_CAFE_ID_KEY = "top_cafe_id"
-private const val CAFE_CACHE_MAX_CAFES_PER_ENTRY = 30
-private const val CAFE_CACHE_IMAGE_MAX_DIMENSION_PX = 640
-private const val CAFE_CACHE_IMAGE_JPEG_QUALITY = 72
+private const val CAFE_CACHE_MAX_CAFES_PER_ENTRY = 20
+private const val CAFE_CACHE_IMAGE_MAX_DIMENSION_PX = 360
+private const val CAFE_CACHE_IMAGE_JPEG_QUALITY = 62
+private const val CAFE_CACHE_IMAGE_BASE64_BUDGET_CHARS = 1_500_000
+private const val CAFE_INDEX_MAX_ENTRIES = 80
+private const val MAP_SESSION_CACHE_MAX_CAFES = 80
+private const val MAP_SESSION_CACHE_MAX_VIEWPORTS = 8
+private const val MAP_MARKER_DESCRIPTOR_CACHE_MAX_ENTRIES = 120
+private const val CAFE_DETAIL_MAX_LOADED_PHOTOS = 4
+private const val CAFE_CARD_PHOTO_MAX_WIDTH = 720
+private const val CAFE_CARD_PHOTO_MAX_HEIGHT = 560
+private const val CAFE_DETAIL_PHOTO_MAX_WIDTH = 1100
+private const val CAFE_DETAIL_PHOTO_MAX_HEIGHT = 850
 private const val UNKNOWN_CITY_CACHE_KEY = "nearby_unknown_city"
 private const val ADDRESS_UNAVAILABLE_TEXT = "Address unavailable"
 private const val PHONE_UNAVAILABLE_TEXT = "Phone unavailable"
@@ -571,7 +583,7 @@ private val cafeDetailPlaceFields = listOf(
 private fun Cafe.primaryImageModel(): Any = heroImageBitmap ?: imageUrl ?: imageResId
 
 private fun Cafe.photoPageCount(): Int = when {
-    photoMetadatas.isNotEmpty() -> photoMetadatas.size
+    photoMetadatas.isNotEmpty() -> minOf(photoMetadatas.size, CAFE_DETAIL_MAX_LOADED_PHOTOS)
     photoBitmaps.isNotEmpty() -> photoBitmaps.size
     else -> 1
 }
@@ -588,10 +600,11 @@ private fun Cafe.withLoadedPhoto(index: Int, bitmap: Bitmap): Cafe {
         return copy(heroImageBitmap = bitmap)
     }
 
-    val updatedPhotos = if (photoBitmaps.size == photoMetadatas.size) {
+    val retainedPhotoCount = minOf(photoMetadatas.size, CAFE_DETAIL_MAX_LOADED_PHOTOS)
+    val updatedPhotos = if (photoBitmaps.size == retainedPhotoCount) {
         photoBitmaps.toMutableList()
     } else {
-        MutableList(photoMetadatas.size) { photoBitmaps.getOrNull(it) }
+        MutableList(retainedPhotoCount) { photoBitmaps.getOrNull(it) }
     }
 
     if (index in updatedPhotos.indices) {
@@ -608,7 +621,7 @@ private fun Cafe.mergeLoadedMedia(existing: Cafe?): Cafe {
     val existingCafe = existing ?: return this
     val mergedPhotoMetadatas = if (photoMetadatas.isNotEmpty()) photoMetadatas else existingCafe.photoMetadatas
     val mergedPhotoBitmaps = if (mergedPhotoMetadatas.isNotEmpty()) {
-        List(mergedPhotoMetadatas.size) { index ->
+        List(minOf(mergedPhotoMetadatas.size, CAFE_DETAIL_MAX_LOADED_PHOTOS)) { index ->
             photoBitmaps.getOrNull(index) ?: existingCafe.photoBitmaps.getOrNull(index)
         }
     } else if (photoBitmaps.isNotEmpty() || existingCafe.photoBitmaps.isNotEmpty()) {
@@ -665,7 +678,9 @@ internal fun isBookmarkCacheDataIncomplete(cafe: Cafe): Boolean {
 
 private fun Cafe.nextUnloadedPhotoIndex(): Int? {
     if (photoMetadatas.isEmpty()) return null
-    return photoMetadatas.indices.firstOrNull { index -> photoBitmaps.getOrNull(index) == null }
+    return photoMetadatas.indices
+        .take(CAFE_DETAIL_MAX_LOADED_PHOTOS)
+        .firstOrNull { index -> photoBitmaps.getOrNull(index) == null }
 }
 
 internal fun mergeCafeDetailData(existingCafe: Cafe, detailCafe: Cafe): Cafe {
@@ -675,7 +690,7 @@ internal fun mergeCafeDetailData(existingCafe: Cafe, detailCafe: Cafe): Cafe {
         existingCafe.photoMetadatas
     }
     val mergedPhotoBitmaps = if (mergedPhotoMetadatas.isNotEmpty()) {
-        List(mergedPhotoMetadatas.size) { index ->
+        List(minOf(mergedPhotoMetadatas.size, CAFE_DETAIL_MAX_LOADED_PHOTOS)) { index ->
             detailCafe.photoBitmaps.getOrNull(index) ?: existingCafe.photoBitmaps.getOrNull(index)
         }
     } else if (detailCafe.photoBitmaps.isNotEmpty() || existingCafe.photoBitmaps.isNotEmpty()) {
@@ -725,6 +740,8 @@ private data class MapSessionCafeCacheEntry(
 
 internal class MapSessionCafeCache(
     private val ttlMillis: Long = MAP_SESSION_CACHE_TTL_MILLIS,
+    private val maxCafeEntries: Int = MAP_SESSION_CACHE_MAX_CAFES,
+    private val maxViewportEntries: Int = MAP_SESSION_CACHE_MAX_VIEWPORTS,
     private val nowMillis: () -> Long = { System.currentTimeMillis() }
 ) {
     private val cafesById = linkedMapOf<String, MapSessionCafeCacheEntry>()
@@ -741,12 +758,13 @@ internal class MapSessionCafeCache(
         prune(now)
         viewportLoadedAtMillis[viewportKey] = savedAtEpochMillis
         cafes.distinctBy { cafe -> cafe.id }.forEach { cafe ->
-            val existingCafe = cafesById[cafe.id]?.cafe
+            val existingCafe = cafesById.remove(cafe.id)?.cafe
             cafesById[cafe.id] = MapSessionCafeCacheEntry(
                 cafe = cafe.mergeLoadedMedia(existingCafe),
                 savedAtEpochMillis = savedAtEpochMillis
             )
         }
+        trimToSize()
     }
 
     fun isViewportFresh(viewportKey: String): Boolean {
@@ -788,6 +806,22 @@ internal class MapSessionCafeCache(
     private fun prune(now: Long) {
         cafesById.entries.removeAll { (_, entry) -> !isFresh(entry.savedAtEpochMillis, now) }
         viewportLoadedAtMillis.entries.removeAll { (_, loadedAt) -> !isFresh(loadedAt, now) }
+    }
+
+    private fun trimToSize() {
+        val maxCafes = maxCafeEntries.coerceAtLeast(1)
+        while (cafesById.size > maxCafes) {
+            val oldestCafeId = cafesById.entries.firstOrNull()?.key ?: break
+            cafesById.remove(oldestCafeId)
+        }
+
+        val maxViewports = maxViewportEntries.coerceAtLeast(1)
+        if (viewportLoadedAtMillis.size > maxViewports) {
+            viewportLoadedAtMillis.entries
+                .sortedBy { (_, loadedAt) -> loadedAt }
+                .take(viewportLoadedAtMillis.size - maxViewports)
+                .forEach { (viewportKey, _) -> viewportLoadedAtMillis.remove(viewportKey) }
+        }
     }
 
     private fun isFresh(savedAt: Long, now: Long): Boolean {
@@ -884,6 +918,33 @@ private fun Cafe.toCachedDto(): CachedCafeDto {
     )
 }
 
+private fun List<Cafe>.toCachedDtosForStorage(
+    maxCafes: Int,
+    imageBase64BudgetChars: Int = CAFE_CACHE_IMAGE_BASE64_BUDGET_CHARS
+): List<CachedCafeDto> {
+    var remainingImageBudget = imageBase64BudgetChars
+    return take(maxCafes).map { cafe ->
+        val dto = cafe.toCachedDto()
+        val imageCharCount = dto.cachedImageBase64CharCount()
+        if (imageCharCount <= 0) {
+            dto
+        } else if (imageCharCount <= remainingImageBudget) {
+            remainingImageBudget -= imageCharCount
+            dto
+        } else {
+            dto.withoutCachedImages()
+        }
+    }
+}
+
+private fun CachedCafeDto.cachedImageBase64CharCount(): Int {
+    return (heroImageBase64?.length ?: 0) + photoImageBase64s.sumOf { encoded -> encoded?.length ?: 0 }
+}
+
+private fun CachedCafeDto.withoutCachedImages(): CachedCafeDto {
+    return copy(heroImageBase64 = null, photoImageBase64s = emptyList())
+}
+
 internal fun CachedCafeDto.toCafe(
     distanceReference: LatLng? = null,
     imageDecodeMode: CacheImageDecodeMode = CacheImageDecodeMode.All
@@ -945,7 +1006,17 @@ internal fun CachedCafeEnvelope.isFresh(nowMillis: Long = System.currentTimeMill
 }
 
 private object MapMarkerDescriptorCache {
-    private val descriptors = mutableMapOf<MarkerDescriptorRequestKey, BitmapDescriptor>()
+    private val descriptors = object : java.util.LinkedHashMap<MarkerDescriptorRequestKey, BitmapDescriptor>(
+        MAP_MARKER_DESCRIPTOR_CACHE_MAX_ENTRIES,
+        0.75f,
+        true
+    ) {
+        override fun removeEldestEntry(
+            eldest: MutableMap.MutableEntry<MarkerDescriptorRequestKey, BitmapDescriptor>?
+        ): Boolean {
+            return size > MAP_MARKER_DESCRIPTOR_CACHE_MAX_ENTRIES
+        }
+    }
 
     fun get(key: MarkerDescriptorRequestKey): BitmapDescriptor? = synchronized(this) {
         descriptors[key]
@@ -969,23 +1040,43 @@ private object CafeCacheStore {
     private fun cacheEntryKey(cityKey: String): String = "$CAFE_CACHE_ENTRY_PREFIX$cityKey"
 
     fun load(context: Context, cityKey: String): CachedCafeEnvelope? {
-        val encoded = prefs(context).getString(cacheEntryKey(cityKey), null) ?: return null
-        return runCatching { json.decodeFromString<CachedCafeEnvelope>(encoded) }.getOrNull()
+        return runCatching {
+            prefs(context)
+                .getString(cacheEntryKey(cityKey), null)
+                ?.let { encoded -> json.decodeFromString<CachedCafeEnvelope>(encoded) }
+        }.getOrNull()
     }
 
     fun save(context: Context, cityKey: String, cafes: List<Cafe>) {
         val envelope = CachedCafeEnvelope(
             cityKey = cityKey,
             savedAtEpochMillis = System.currentTimeMillis(),
-            cafes = cafes
-                .take(CAFE_CACHE_MAX_CAFES_PER_ENTRY)
-                .map { it.toCachedDto() }
+            cafes = cafes.toCachedDtosForStorage(maxCafes = CAFE_CACHE_MAX_CAFES_PER_ENTRY)
         )
 
         prefs(context)
             .edit()
             .putString(cacheEntryKey(cityKey), json.encodeToString(envelope))
             .apply()
+    }
+
+    fun pruneToCurrentMetadata(context: Context, extraCityKeysToKeep: Set<String> = emptySet()) {
+        val preferences = prefs(context)
+        val metadata = CafeCacheMetadataStore.load(context)
+        val cityKeysToKeep = buildSet {
+            addAll(extraCityKeysToKeep.filter { cityKey -> cityKey.isNotBlank() })
+            metadata.homeCityKey?.takeIf { it.isNotBlank() }?.let(::add)
+            metadata.mapViewportKey?.takeIf { it.isNotBlank() }?.let(::add)
+        }
+        val cacheEntryKeysToKeep = cityKeysToKeep.map(::cacheEntryKey).toSet()
+        val staleEntryKeys = preferences.all.keys.filter { key ->
+            key.startsWith(CAFE_CACHE_ENTRY_PREFIX) && key !in cacheEntryKeysToKeep
+        }
+        if (staleEntryKeys.isEmpty()) return
+
+        preferences.edit().apply {
+            staleEntryKeys.forEach { key -> remove(key) }
+        }.apply()
     }
 }
 
@@ -995,12 +1086,21 @@ private object CafeCacheMetadataStore {
     }
 
     fun load(context: Context): CafeCacheMetadata {
-        val preferences = prefs(context)
-        return CafeCacheMetadata(
-            homeCityKey = preferences.getString(CAFE_CACHE_METADATA_HOME_CITY_KEY, null),
-            homeCityName = preferences.getString(CAFE_CACHE_METADATA_HOME_CITY_NAME, null),
-            mapViewportKey = preferences.getString(CAFE_CACHE_METADATA_MAP_VIEWPORT_KEY, null),
-            mapCityName = preferences.getString(CAFE_CACHE_METADATA_MAP_CITY_NAME, null)
+        return runCatching {
+            val preferences = prefs(context)
+            CafeCacheMetadata(
+                homeCityKey = preferences.getString(CAFE_CACHE_METADATA_HOME_CITY_KEY, null),
+                homeCityName = preferences.getString(CAFE_CACHE_METADATA_HOME_CITY_NAME, null),
+                mapViewportKey = preferences.getString(CAFE_CACHE_METADATA_MAP_VIEWPORT_KEY, null),
+                mapCityName = preferences.getString(CAFE_CACHE_METADATA_MAP_CITY_NAME, null)
+            )
+        }.getOrDefault(
+            CafeCacheMetadata(
+                homeCityKey = null,
+                homeCityName = null,
+                mapViewportKey = null,
+                mapCityName = null
+            )
         )
     }
 
@@ -1065,6 +1165,7 @@ private suspend fun saveCafeCacheOffMain(
                 CafeCacheMetadataTarget.Map -> CafeCacheMetadataStore.saveMap(context, cityKey, cityName)
                 null -> Unit
             }
+            CafeCacheStore.pruneToCurrentMetadata(context, extraCityKeysToKeep = setOf(cityKey))
         }.onFailure { error ->
             error.printStackTrace()
         }
@@ -1082,14 +1183,15 @@ private object BookmarkCacheStore {
     }
 
     fun load(context: Context): List<Cafe> {
-        val encoded = prefs(context).getString(BOOKMARK_CACHE_ENTRY_KEY, null) ?: return emptyList()
-        val envelope = runCatching {
-            json.decodeFromString<CachedBookmarkEnvelope>(encoded)
-        }.getOrNull() ?: return emptyList()
+        return runCatching {
+            val encoded = prefs(context).getString(BOOKMARK_CACHE_ENTRY_KEY, null)
+                ?: return@runCatching emptyList()
+            val envelope = json.decodeFromString<CachedBookmarkEnvelope>(encoded)
 
-        return envelope.cafes
-            .distinctBy { dto -> dto.id }
-            .map { dto -> dto.toCafe(distanceReference = null) }
+            envelope.cafes
+                .distinctBy { dto -> dto.id }
+                .map { dto -> dto.toCafe(distanceReference = null) }
+        }.getOrDefault(emptyList())
     }
 
     fun save(context: Context, cafes: List<Cafe>) {
@@ -1100,7 +1202,7 @@ private object BookmarkCacheStore {
 
         val envelope = CachedBookmarkEnvelope(
             savedAtEpochMillis = System.currentTimeMillis(),
-            cafes = cafes.map { it.toCachedDto() }
+            cafes = cafes.toCachedDtosForStorage(maxCafes = cafes.size)
         )
 
         prefs(context)
@@ -1282,6 +1384,9 @@ object CafeRepository {
     }
 
     private suspend fun restoreFreshCachedFeeds(context: Context) {
+        withContext(Dispatchers.IO) {
+            CafeCacheStore.pruneToCurrentMetadata(context)
+        }
         val metadata = withContext(Dispatchers.IO) {
             CafeCacheMetadataStore.load(context)
         }
@@ -1351,8 +1456,28 @@ object CafeRepository {
             updatedCatalog[cafe.id] = mergedCafe
             mergedCafe
         }
-        cafeIndexById = updatedCatalog
+        cafeIndexById = updatedCatalog.trimCafeIndex(retainedCafeIds(cafes.map { cafe -> cafe.id }))
         return indexedCafes
+    }
+
+    private fun retainedCafeIds(additionalCafeIds: Iterable<String> = emptyList()): Set<String> {
+        return buildSet {
+            addAll(additionalCafeIds)
+            addAll(homeFeedState.cafes.map { cafe -> cafe.id })
+            addAll(mapFeedState.cafes.map { cafe -> cafe.id })
+            addAll(BookmarkRepository.ids())
+            addAll(RecentRepository.ids())
+        }
+    }
+
+    private fun Map<String, Cafe>.trimCafeIndex(protectedCafeIds: Set<String>): Map<String, Cafe> {
+        if (size <= CAFE_INDEX_MAX_ENTRIES) return this
+
+        val trimmedCatalog = LinkedHashMap(this)
+        val removableCafeIds = trimmedCatalog.keys.filterNot { cafeId -> cafeId in protectedCafeIds }
+        val removeCount = (trimmedCatalog.size - CAFE_INDEX_MAX_ENTRIES).coerceAtMost(removableCafeIds.size)
+        removableCafeIds.take(removeCount).forEach { cafeId -> trimmedCatalog.remove(cafeId) }
+        return trimmedCatalog
     }
 
     private fun replaceHomeFeed(
@@ -1502,7 +1627,9 @@ object CafeRepository {
 
     private fun applyCafeUpdate(cafeId: String, transform: (Cafe) -> Cafe) {
         cafeIndexById[cafeId]?.let { existingCafe ->
-            cafeIndexById = cafeIndexById + (cafeId to transform(existingCafe))
+            val updatedCatalog = cafeIndexById.toMutableMap()
+            updatedCatalog[cafeId] = transform(existingCafe)
+            cafeIndexById = updatedCatalog.trimCafeIndex(retainedCafeIds(listOf(cafeId)))
         }
 
         val updatedHomeCafes = updateFeedCafe(homeFeedState.cafes, cafeId, transform)
@@ -1528,7 +1655,7 @@ object CafeRepository {
             val mergedCafe = cafe.mergeLoadedMedia(updatedCatalog[cafe.id])
             updatedCatalog[cafe.id] = mergedCafe
         }
-        cafeIndexById = updatedCatalog
+        cafeIndexById = updatedCatalog.trimCafeIndex(retainedCafeIds(cafes.map { cafe -> cafe.id }))
     }
 
     fun getCafe(id: String): Cafe? = cafeIndexById[id] ?: fallbackCafes.firstOrNull { it.id == id }
@@ -2062,9 +2189,15 @@ object BookmarkRepository {
 
         persistJob?.cancel()
         persistJob = persistenceScope.launch {
-            delay(BOOKMARK_CACHE_WRITE_DEBOUNCE_MILLIS)
-            if (generation != persistGeneration) return@launch
-            BookmarkCacheStore.save(context, cafesSnapshot)
+            try {
+                delay(BOOKMARK_CACHE_WRITE_DEBOUNCE_MILLIS)
+                if (generation != persistGeneration) return@launch
+                BookmarkCacheStore.save(context, cafesSnapshot)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                error.printStackTrace()
+            }
         }
     }
 
@@ -2100,6 +2233,8 @@ object RecentRepository {
             recentIds.removeAt(recentIds.lastIndex)
         }
     }
+
+    fun ids(): List<String> = recentIds.toList()
 
     fun cafes(): List<Cafe> {
         return recentIds.mapNotNull { id -> CafeRepository.getCafe(id) }
@@ -2825,8 +2960,8 @@ private fun fetchCafePhoto(
     onSuccess: (String, Int, Bitmap) -> Unit
 ) {
     val request = FetchPhotoRequest.builder(photoMetadata)
-        .setMaxWidth(1200)
-        .setMaxHeight(900)
+        .setMaxWidth(CAFE_CARD_PHOTO_MAX_WIDTH)
+        .setMaxHeight(CAFE_CARD_PHOTO_MAX_HEIGHT)
         .build()
 
     placesClient.fetchPhoto(request)
@@ -2841,8 +2976,8 @@ private suspend fun fetchCafePhotoBitmap(
 ): Bitmap? {
     return runCatching {
         val request = FetchPhotoRequest.builder(photoMetadata)
-            .setMaxWidth(1400)
-            .setMaxHeight(1100)
+            .setMaxWidth(CAFE_DETAIL_PHOTO_MAX_WIDTH)
+            .setMaxHeight(CAFE_DETAIL_PHOTO_MAX_HEIGHT)
             .build()
         placesClient.fetchPhoto(request).await().bitmap
     }.getOrNull()
@@ -2854,8 +2989,8 @@ private suspend fun fetchCafeCardPhotoBitmap(
 ): Bitmap? {
     return runCatching {
         val request = FetchPhotoRequest.builder(photoMetadata)
-            .setMaxWidth(900)
-            .setMaxHeight(700)
+            .setMaxWidth(CAFE_CARD_PHOTO_MAX_WIDTH)
+            .setMaxHeight(CAFE_CARD_PHOTO_MAX_HEIGHT)
             .build()
         placesClient.fetchPhoto(request).await().bitmap
     }.getOrNull()
@@ -2913,6 +3048,16 @@ private suspend fun loadCompleteCafeImages(
         updatedCafe = updatedCafe.withLoadedPhoto(index = index, bitmap = bitmap)
     }
     return updatedCafe
+}
+
+private suspend fun loadCafeCacheHeroImage(
+    placesClient: PlacesClient,
+    cafe: Cafe
+): Cafe {
+    if (cafe.heroImageBitmap != null || cafe.photoBitmaps.firstOrNull() != null) return cafe
+    val metadata = cafe.photoMetadatas.firstOrNull() ?: return cafe
+    val bitmap = fetchCafeCardPhotoBitmap(placesClient, metadata) ?: return cafe
+    return cafe.withLoadedPhoto(index = 0, bitmap = bitmap)
 }
 
 private suspend fun fetchCafeDetails(
@@ -3597,22 +3742,67 @@ fun MapScreen(navController: NavHostController) {
 fun BookmarkScreen(navController: NavHostController) {
     val context = LocalContext.current
     val placesClient = remember(context) { if (Places.isInitialized()) Places.createClient(context) else null }
+    val scope = rememberCoroutineScope()
     val savedCafes = BookmarkRepository.cafes()
     var showAllSaved by rememberSaveable { mutableStateOf(false) }
     var selectedSavedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedStudySession by remember { mutableStateOf<StudySession?>(null) }
+    var studySessionCafe by remember { mutableStateOf<Cafe?>(null) }
+    var loadingStudySessionCafeId by remember { mutableStateOf<String?>(null) }
     var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
     val detailProgress = remember { Animatable(0f) }
     ReportBottomNavOverlayCoverage(isActive = selectedStudySession != null)
     val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
     val interactionSource = remember { MutableInteractionSource() }
-    val selectedSavedCafe = remember(savedCafes, selectedSavedCafeId) {
+    val selectedSavedCafe = remember(savedCafes, selectedSavedCafeId, studySessionCafe) {
         selectedSavedCafeId?.let { cafeId ->
-            savedCafes.firstOrNull { it.id == cafeId } ?: CafeRepository.getCafe(cafeId)
+            savedCafes.firstOrNull { it.id == cafeId }
+                ?: studySessionCafe?.takeIf { cafe -> cafe.id == cafeId }
+                ?: CafeRepository.getCafe(cafeId)
         }
     }
     SavedCafeCacheEffect(savedCafes = savedCafes, placesClient = placesClient)
-    CafeDetailDataEffect(cafe = selectedSavedCafe, placesClient = placesClient)
+    CafeDetailDataEffect(
+        cafe = selectedSavedCafe?.takeUnless { cafe -> cafe.id == loadingStudySessionCafeId },
+        placesClient = placesClient
+    )
+
+    fun openStudySessionCafeDetails(session: StudySession) {
+        val cafeId = session.cafeId
+        val existingCafe = savedCafes.firstOrNull { cafe -> cafe.id == cafeId }
+            ?: CafeRepository.getCafe(cafeId)
+            ?: studySessionCafe?.takeIf { cafe -> cafe.id == cafeId }
+        val startingCafe = existingCafe ?: session.toCafePlaceholder()
+        studySessionCafe = startingCafe
+        CafeRepository.cacheCafes(listOf(startingCafe))
+        selectedSavedCafeId = cafeId
+
+        val client = placesClient ?: return
+        if (loadingStudySessionCafeId == cafeId || !isCafeDetailDataIncomplete(startingCafe)) return
+
+        loadingStudySessionCafeId = cafeId
+        scope.launch {
+            val detailCafe = runCatching {
+                fetchCafeDetails(client, cafeId)
+            }.getOrNull()
+
+            if (detailCafe != null) {
+                val mergedCafe = mergeCafeDetailData(
+                    existingCafe = CafeRepository.getCafe(cafeId) ?: startingCafe,
+                    detailCafe = detailCafe
+                )
+                CafeRepository.cacheCafes(listOf(mergedCafe))
+                if (selectedSavedCafeId == cafeId) {
+                    studySessionCafe = mergedCafe
+                    overlayCafe = mergedCafe
+                }
+            }
+
+            if (loadingStudySessionCafeId == cafeId) {
+                loadingStudySessionCafeId = null
+            }
+        }
+    }
 
     LaunchedEffect(selectedSavedCafe) {
         if (selectedSavedCafe != null) {
@@ -3682,8 +3872,9 @@ fun BookmarkScreen(navController: NavHostController) {
                     selectedStudySession = null
                 },
                 onOpenCafeDetails = {
-                    selectedSavedCafeId = session.cafeId
+                    openStudySessionCafeDetails(session)
                 },
+                isOpeningCafeDetails = loadingStudySessionCafeId == session.cafeId,
                 backHandlerEnabled = selectedSavedCafeId == null,
                 modifier = Modifier.matchParentSize()
             )
@@ -4197,7 +4388,7 @@ private suspend fun fetchCompleteCafeForBookmarkCache(
         null
     }
     val enrichedCafe = detailCafe?.let { detail -> mergeCafeDetailData(cafe, detail) } ?: cafe
-    return loadCompleteCafeImages(placesClient, enrichedCafe)
+    return loadCafeCacheHeroImage(placesClient, enrichedCafe)
 }
 
 @Composable
@@ -7324,12 +7515,26 @@ private fun StudySessionSavedCard(
     }
 }
 
+private fun StudySession.toCafePlaceholder(): Cafe {
+    return Cafe(
+        id = cafeId,
+        name = cafeName,
+        address = cafeAddress.takeUnless(::isCafeAddressUnavailable) ?: ADDRESS_UNAVAILABLE_TEXT,
+        phone = PHONE_UNAVAILABLE_TEXT,
+        status = NO_RATINGS_TEXT,
+        hours = linkedMapOf("Hours" to HOURS_UNAVAILABLE_TEXT),
+        features = listOf("Coffee house"),
+        ambience = listOf("Study session")
+    )
+}
+
 @Composable
 private fun StudySessionDetailOverlay(
     session: StudySession,
     onDismiss: () -> Unit,
     onDelete: () -> Unit,
     onOpenCafeDetails: () -> Unit,
+    isOpeningCafeDetails: Boolean = false,
     backHandlerEnabled: Boolean = true,
     modifier: Modifier = Modifier
 ) {
@@ -7456,7 +7661,8 @@ private fun StudySessionDetailOverlay(
                 StudySessionReadonlyField(label = "Time", value = session.timeRangeText)
                 StudySessionCafeDetailsButton(
                     cafeName = session.cafeName,
-                    onClick = onOpenCafeDetails
+                    onClick = onOpenCafeDetails,
+                    isLoading = isOpeningCafeDetails
                 )
                 StudySessionReadonlyField(label = "Summary", value = session.summary)
 
@@ -7520,7 +7726,8 @@ private fun StudySessionReadonlyField(
 @Composable
 private fun StudySessionCafeDetailsButton(
     cafeName: String,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    isLoading: Boolean = false
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
         Text(
@@ -7530,20 +7737,31 @@ private fun StudySessionCafeDetailsButton(
         )
         Button(
             onClick = onClick,
+            enabled = !isLoading,
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(
                 containerColor = StudySessionCafeButtonColor,
-                contentColor = Color.White
+                contentColor = Color.White,
+                disabledContainerColor = StudySessionCafeButtonColor.copy(alpha = 0.72f),
+                disabledContentColor = Color.White.copy(alpha = 0.78f)
             ),
             shape = RoundedCornerShape(8.dp),
             border = BorderStroke(1.dp, Color.Black)
         ) {
-            Icon(
-                painter = painterResource(id = R.drawable.address),
-                contentDescription = null,
-                modifier = Modifier.size(20.dp),
-                tint = Color.Unspecified
-            )
+            if (isLoading) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(18.dp),
+                    strokeWidth = 2.dp,
+                    color = Color.White
+                )
+            } else {
+                Icon(
+                    painter = painterResource(id = R.drawable.address),
+                    contentDescription = null,
+                    modifier = Modifier.size(20.dp),
+                    tint = Color.Unspecified
+                )
+            }
             Spacer(modifier = Modifier.width(8.dp))
             Text(
                 text = cafeName,
@@ -8312,6 +8530,9 @@ private fun StudySessionDatePickerDialog(
     val pickerState = rememberDatePickerState(
         initialSelectedDateMillis = initialDateUtcMillis ?: System.currentTimeMillis()
     )
+    val calendarScale = 0.86f
+    val calendarBaseWidth = 360.dp
+    val calendarBaseHeight = 500.dp
 
     StudySessionPickerDialogShell(
         title = "Pick a date",
@@ -8321,23 +8542,37 @@ private fun StudySessionDatePickerDialog(
         },
         confirmEnabled = pickerState.selectedDateMillis != null,
         confirmLabel = "Select",
-        maxWidth = 380.dp
+        maxWidth = 420.dp
     ) {
         Surface(
             shape = RoundedCornerShape(18.dp),
             color = StudySessionPopupFieldColor.copy(alpha = 0.26f)
         ) {
             StudySessionPickerTheme {
-                DatePicker(
-                    state = pickerState,
-                    modifier = Modifier.fillMaxWidth(),
-                    colors = DatePickerDefaults.colors(
-                        containerColor = Color.Transparent
-                    ),
-                    showModeToggle = false,
-                    title = null,
-                    headline = null
-                )
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(calendarBaseHeight * calendarScale),
+                    contentAlignment = Alignment.TopCenter
+                ) {
+                    DatePicker(
+                        state = pickerState,
+                        modifier = Modifier
+                            .requiredWidth(calendarBaseWidth)
+                            .requiredHeight(calendarBaseHeight)
+                            .graphicsLayer {
+                                scaleX = calendarScale
+                                scaleY = calendarScale
+                                transformOrigin = TransformOrigin(0.5f, 0f)
+                            },
+                        colors = DatePickerDefaults.colors(
+                            containerColor = Color.Transparent
+                        ),
+                        showModeToggle = false,
+                        title = null,
+                        headline = null
+                    )
+                }
             }
         }
     }

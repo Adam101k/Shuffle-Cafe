@@ -87,6 +87,26 @@ class MapSessionCafeCacheTest {
     }
 
     @Test
+    fun snapshotPrunesOldestCafesWhenMaxEntriesIsReached() {
+        val cache = MapSessionCafeCache(
+            ttlMillis = 10_000L,
+            maxCafeEntries = 2,
+            nowMillis = { 1_000L }
+        )
+
+        cache.recordViewport(
+            viewportKey = "viewport_a",
+            cafes = listOf(testCafe(id = "alpha"), testCafe(id = "beta"))
+        )
+        cache.recordViewport(
+            viewportKey = "viewport_b",
+            cafes = listOf(testCafe(id = "charlie"))
+        )
+
+        assertEquals(listOf("beta", "charlie"), cache.snapshot().map { cafe -> cafe.id })
+    }
+
+    @Test
     fun snapshotRecomputesDistancesFromReferenceLocation() {
         val cache = MapSessionCafeCache(ttlMillis = 10_000L, nowMillis = { 1_000L })
         cache.recordViewport(

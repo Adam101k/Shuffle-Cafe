@@ -3,6 +3,7 @@ package com.example.shuffle_cafe
 import android.content.Context
 import android.content.SharedPreferences
 import androidx.compose.runtime.mutableStateListOf
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -192,9 +193,15 @@ internal object StudySessionRepository {
 
         persistJob?.cancel()
         persistJob = persistenceScope.launch {
-            delay(STUDY_SESSION_CACHE_WRITE_DEBOUNCE_MILLIS)
-            if (generation != persistGeneration) return@launch
-            StudySessionCacheStore.save(context, sessionsSnapshot)
+            try {
+                delay(STUDY_SESSION_CACHE_WRITE_DEBOUNCE_MILLIS)
+                if (generation != persistGeneration) return@launch
+                StudySessionCacheStore.save(context, sessionsSnapshot)
+            } catch (error: CancellationException) {
+                throw error
+            } catch (error: Throwable) {
+                error.printStackTrace()
+            }
         }
     }
 
@@ -224,8 +231,11 @@ private object StudySessionCacheStore {
     }
 
     fun load(context: Context): List<StudySession> {
-        val encoded = prefs(context).getString(STUDY_SESSION_CACHE_ENTRY_KEY, null) ?: return emptyList()
-        return runCatching { json.decodeFromString<List<StudySession>>(encoded) }.getOrDefault(emptyList())
+        return runCatching {
+            val encoded = prefs(context).getString(STUDY_SESSION_CACHE_ENTRY_KEY, null)
+                ?: return@runCatching emptyList()
+            json.decodeFromString<List<StudySession>>(encoded)
+        }.getOrDefault(emptyList())
     }
 
     fun save(context: Context, sessions: List<StudySession>) {
