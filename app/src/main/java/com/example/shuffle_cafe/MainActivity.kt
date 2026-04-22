@@ -339,11 +339,6 @@ private enum class CardsFilterOption(val label: String) {
     Preferences("Preferences")
 }
 
-private data class MapSearchPing(
-    val title: String,
-    val latLng: LatLng
-)
-
 internal enum class CacheImageDecodeMode {
     HeroOnly,
     All
@@ -3354,7 +3349,6 @@ fun MapScreen(navController: NavHostController) {
     val hasLocationPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
     val defaultCamera = rememberCameraPositionState()
     var searchQuery by remember { mutableStateOf("") }
-    var searchPing by remember { mutableStateOf<MapSearchPing?>(null) }
     val cafeFeedState = CafeRepository.mapUiState
     val allCafes = cafeFeedState.cafes
     val isLoading = cafeFeedState.isLoading && allCafes.isEmpty()
@@ -3578,8 +3572,7 @@ fun MapScreen(navController: NavHostController) {
                 MapSearchBar(
                     searchQuery = searchQuery,
                     onQueryChanged = { searchQuery = it },
-                    onPlaceSelected = { latLng, title ->
-                        searchPing = MapSearchPing(title = title, latLng = latLng)
+                    onPlaceSelected = { latLng, _ ->
                         defaultCamera.move(CameraUpdateFactory.newLatLngZoom(latLng, 17f))
                     }
                 )
@@ -3630,18 +3623,6 @@ fun MapScreen(navController: NavHostController) {
                                 }
                             )
                         }
-                    }
-                    searchPing?.let { ping ->
-                        val markerState = remember(ping.latLng) {
-                            com.google.maps.android.compose.MarkerState(position = ping.latLng)
-                        }
-                        LaunchedEffect(ping.latLng) {
-                            markerState.position = ping.latLng
-                        }
-                        Marker(
-                            state = markerState,
-                            title = ping.title
-                        )
                     }
                 }
 
