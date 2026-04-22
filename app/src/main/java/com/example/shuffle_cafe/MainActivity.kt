@@ -2415,6 +2415,7 @@ private fun ShuffleCafeLoadingAnimation(modifier: Modifier = Modifier) {
     }
 }
 
+@SuppressLint("UnusedBoxWithConstraintsScope")
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(navController: NavHostController) {
@@ -3495,7 +3496,7 @@ fun MapScreen(navController: NavHostController) {
                     defaultCamera.move(
                         CameraUpdateFactory.newLatLngZoom(
                             LatLng(location.latitude, location.longitude),
-                            17f
+                            14f
                         )
                     )
                 }
@@ -4420,6 +4421,7 @@ private fun CafeDetailDataEffect(
     }
 }
 
+@SuppressLint("UnusedBoxWithConstraintsScope")
 @Composable
 private fun DetailInfoBubble(
     iconRes: Int,
@@ -4707,6 +4709,7 @@ private fun CardInfoBubble(
     )
 }
 
+@SuppressLint("UnusedBoxWithConstraintsScope")
 @Composable
 private fun CardTodayHoursBubble(
     hours: LinkedHashMap<String, String>,
@@ -4930,6 +4933,7 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
     }
 }
 
+@SuppressLint("UnusedBoxWithConstraintsScope")
 @Composable
 fun HoursDropdown(hours: LinkedHashMap<String, String>) {
     val displayHours = remember(hours) {
@@ -5111,6 +5115,7 @@ private fun String.shortCafeId(): String {
     return if (length <= 14) this else "${take(14)}..."
 }
 
+@SuppressLint("UnusedBoxWithConstraintsScope")
 @Composable
 private fun CafeCrowdAttributesPanel(
     cafe: Cafe,
@@ -9129,6 +9134,7 @@ fun BottomNavBar(navController: NavHostController, enabled: Boolean = true, dimF
     )
 }
 
+@SuppressLint("UnusedBoxWithConstraintsScope")
 @Composable
 private fun FloatingBottomNavBar(
     navController: NavHostController,
