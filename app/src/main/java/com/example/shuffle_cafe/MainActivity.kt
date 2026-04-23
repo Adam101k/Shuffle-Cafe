@@ -2489,6 +2489,8 @@ fun MainScreen(navController: NavHostController) {
     var overlayHostBounds by remember { mutableStateOf<Rect?>(null) }
     var isPreparingDetailTransition by remember { mutableStateOf(false) }
     var selectedFilterOption by remember { mutableStateOf(CardsFilterOption.Nearby) }
+    var cardAttributeFilters by remember { mutableStateOf(CafeAttributeFilters()) }
+    var isCardFilterSheetVisible by remember { mutableStateOf(false) }
     val detailProgress = remember { Animatable(0f) }
     val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
 
@@ -2498,6 +2500,17 @@ fun MainScreen(navController: NavHostController) {
         }
     }
     val isDetailExpanded = expandedCafe != null
+    val filteredCardCafes by remember(allCafes, cardAttributeFilters) {
+        derivedStateOf {
+            allCafes.filter { cafe ->
+                cafeMatchesAttributeFilters(
+                    cafe = cafe,
+                    attributes = CrowdAttributeRepository.attributesFor(cafe.id),
+                    filters = cardAttributeFilters
+                )
+            }
+        }
+    }
     CafeDetailDataEffect(cafe = expandedCafe, placesClient = placesClient)
 
     LaunchedEffect(hasLocationPermission, placesClient, inspectionMode) {
@@ -2550,32 +2563,36 @@ fun MainScreen(navController: NavHostController) {
         }
     }
 
-    LaunchedEffect(allCafes) {
-        val restoredTopCafeId = currentVisibleCafes.firstOrNull()?.id ?: CardStackProgressStore.load(context)
+    LaunchedEffect(filteredCardCafes) {
+        val currentTopCafeId = currentVisibleCafes.firstOrNull()?.id
+            ?.takeIf { cafeId -> filteredCardCafes.any { cafe -> cafe.id == cafeId } }
+        val savedTopCafeId = CardStackProgressStore.load(context)
+            ?.takeIf { cafeId -> filteredCardCafes.any { cafe -> cafe.id == cafeId } }
+        val restoredTopCafeId = currentTopCafeId ?: savedTopCafeId
 
-        if (allCafes.isEmpty()) {
+        if (filteredCardCafes.isEmpty()) {
             setVisibleStack(emptyList(), null)
             return@LaunchedEffect
         }
 
-        if (currentVisibleCafes.isEmpty() || nextCafeIndex >= allCafes.size) {
-            setVisibleStack(allCafes, restoredTopCafeId)
+        if (currentVisibleCafes.isEmpty() || nextCafeIndex >= filteredCardCafes.size) {
+            setVisibleStack(filteredCardCafes, restoredTopCafeId)
             return@LaunchedEffect
         }
 
         val updatedVisibleCafes = currentVisibleCafes.mapNotNull { visibleCafe ->
-            allCafes.firstOrNull { it.id == visibleCafe.id }
+            filteredCardCafes.firstOrNull { it.id == visibleCafe.id }
         }
-        val expectedVisibleCount = minOf(3, allCafes.size)
+        val expectedVisibleCount = minOf(3, filteredCardCafes.size)
 
         if (updatedVisibleCafes.isEmpty() || updatedVisibleCafes.size != currentVisibleCafes.size) {
-            setVisibleStack(allCafes, restoredTopCafeId)
+            setVisibleStack(filteredCardCafes, restoredTopCafeId)
             return@LaunchedEffect
         }
 
         currentVisibleCafes = if (updatedVisibleCafes.size < expectedVisibleCount) {
             val visibleIds = updatedVisibleCafes.map { it.id }.toSet()
-            updatedVisibleCafes + allCafes
+            updatedVisibleCafes + filteredCardCafes
                 .filterNot { it.id in visibleIds }
                 .take(expectedVisibleCount - updatedVisibleCafes.size)
         } else {
@@ -2672,6 +2689,12 @@ fun MainScreen(navController: NavHostController) {
                         allCafes.isEmpty() -> {
                             ShuffleCafeLoadingAnimation()
                         }
+                        filteredCardCafes.isEmpty() -> {
+                            ShuffleCafeLoadingAnimation()
+                        }
+                        currentVisibleCafes.isEmpty() -> {
+                            ShuffleCafeLoadingAnimation()
+                        }
                         else -> {
                             val renderTopCardOnly = isPreparingDetailTransition ||
                                     transitionState != null ||
@@ -2684,7 +2707,7 @@ fun MainScreen(navController: NavHostController) {
                                 val visibleStack = advanceVisibleCafeStack(
                                     visibleCafes = currentVisibleCafes,
                                     swipedCafe = swipedCafe,
-                                    allCafes = allCafes,
+                                    allCafes = filteredCardCafes,
                                     nextCafeIndex = nextCafeIndex
                                 )
                                 currentVisibleCafes = visibleStack.cafes
@@ -2728,6 +2751,41 @@ fun MainScreen(navController: NavHostController) {
             }
         }
 
+        val showCardFilterBubble = expandedCafeId == null &&
+            detailProgress.value < 0.01f &&
+            !isPreparingDetailTransition
+        if (showCardFilterBubble) {
+            CardAttributeFilterBubble(
+                activeFilterCount = cardAttributeFilters.activeCount,
+                onClick = { isCardFilterSheetVisible = true },
+                enabled = true,
+                modifier = Modifier
+                    .align(Alignment.TopStart)
+                    .zIndex(4f)
+                    .statusBarsPadding()
+                    .padding(
+                        start = CardTopControlHorizontalPadding,
+                        top = CardTopControlVerticalPadding
+                    )
+            )
+        }
+
+        if (isCardFilterSheetVisible) {
+            CafeAttributeFilterBottomSheet(
+                title = "Card filters",
+                filters = cardAttributeFilters,
+                onApplyFilters = { updatedFilters ->
+                    cardAttributeFilters = updatedFilters
+                    isCardFilterSheetVisible = false
+                },
+                onClearFilters = {
+                    cardAttributeFilters = CafeAttributeFilters()
+                    isCardFilterSheetVisible = false
+                },
+                onDismiss = { isCardFilterSheetVisible = false }
+            )
+        }
+
         if (overlayCafe != null && transitionState != null && (expandedCafeId != null || detailProgress.value > 0f)) {
             val scrimAlpha by animateFloatAsState(
                 targetValue = 0.18f * detailProgress.value,
@@ -2738,6 +2796,7 @@ fun MainScreen(navController: NavHostController) {
             Box(
                 modifier = Modifier
                     .matchParentSize()
+                    .zIndex(20f)
                     .background(Color.Black.copy(alpha = scrimAlpha))
             ) {
                 BoxWithConstraints(
@@ -3400,7 +3459,7 @@ fun MapScreen(navController: NavHostController) {
     val hasLocationPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
     val defaultCamera = rememberCameraPositionState()
     var searchQuery by remember { mutableStateOf("") }
-    var mapCafeFilters by remember { mutableStateOf(MapCafeFilters()) }
+    var mapCafeFilters by remember { mutableStateOf(CafeAttributeFilters()) }
     var isMapFilterSheetVisible by remember { mutableStateOf(false) }
     val cafeFeedState = CafeRepository.mapUiState
     val allCafes = cafeFeedState.cafes
@@ -3473,7 +3532,7 @@ fun MapScreen(navController: NavHostController) {
     val filteredMapCafes by remember(renderedMapCafes, mapCafeFilters) {
         derivedStateOf {
             renderedMapCafes.filter { cafe ->
-                cafeMatchesMapFilters(
+                cafeMatchesAttributeFilters(
                     cafe = cafe,
                     attributes = CrowdAttributeRepository.attributesFor(cafe.id),
                     filters = mapCafeFilters
@@ -3734,7 +3793,7 @@ fun MapScreen(navController: NavHostController) {
 
                 if (hasFilteredOutAllMapCafes) {
                     MapFilterEmptyMessage(
-                        onClearFilters = { mapCafeFilters = MapCafeFilters() },
+                        onClearFilters = { mapCafeFilters = CafeAttributeFilters() },
                         modifier = Modifier
                             .align(Alignment.TopCenter)
                             .padding(horizontal = 20.dp, vertical = 16.dp)
@@ -3744,14 +3803,15 @@ fun MapScreen(navController: NavHostController) {
         }
 
         if (isMapFilterSheetVisible) {
-            MapFilterBottomSheet(
+            CafeAttributeFilterBottomSheet(
+                title = "Map filters",
                 filters = mapCafeFilters,
                 onApplyFilters = { updatedFilters ->
                     mapCafeFilters = updatedFilters
                     isMapFilterSheetVisible = false
                 },
                 onClearFilters = {
-                    mapCafeFilters = MapCafeFilters()
+                    mapCafeFilters = CafeAttributeFilters()
                     isMapFilterSheetVisible = false
                 },
                 onDismiss = { isMapFilterSheetVisible = false }
@@ -4120,6 +4180,13 @@ private fun SavedSectionHeading(title: String) {
     )
 }
 
+private val CardTopControlHorizontalPadding = 16.dp
+private val CardTopControlVerticalPadding = 10.dp
+private val CardFilterBubbleSize = 55.1.dp
+private val CardTopControlGap = 12.dp
+private val CardFilterIconSize = 21.12.dp
+private val CardToolbarOutlineColor = Color.White.copy(alpha = 0.14f)
+
 @Composable
 private fun CardsExploreFilterBar(
     selectedOption: CardsFilterOption,
@@ -4141,22 +4208,43 @@ private fun CardsExploreFilterBar(
         if (!enabled) expanded = false
     }
 
-    Box(
+    BoxWithConstraints(
         modifier = modifier
             .fillMaxWidth()
             .statusBarsPadding()
-            .padding(horizontal = 16.dp, vertical = 10.dp),
+            .padding(
+                horizontal = CardTopControlHorizontalPadding,
+                vertical = CardTopControlVerticalPadding
+            )
+            .heightIn(min = CardFilterBubbleSize),
         contentAlignment = Alignment.Center
     ) {
-        Box {
+        val reservedSideWidth = CardFilterBubbleSize + CardTopControlGap
+        val availableToolbarWidth = (maxWidth - reservedSideWidth * 2f).coerceAtLeast(112.dp)
+        val preferredToolbarWidth = when (selectedOption) {
+            CardsFilterOption.Nearby -> 212.dp
+            CardsFilterOption.Trending -> 214.dp
+            CardsFilterOption.Preferences -> 252.dp
+        }
+        val toolbarScale = (availableToolbarWidth.value / preferredToolbarWidth.value).coerceAtMost(1f)
+        val dropdownWidth = if (availableToolbarWidth < 196.dp) availableToolbarWidth else 196.dp
+
+        Box(modifier = Modifier.widthIn(max = availableToolbarWidth)) {
             Surface(
+                modifier = Modifier.widthIn(max = availableToolbarWidth),
                 shape = RoundedCornerShape(28.dp),
-                color = toolbarBubbleColor
+                color = toolbarBubbleColor,
+                border = BorderStroke(1.dp, CardToolbarOutlineColor)
             ) {
                 Row(
                     modifier = Modifier
                         .clickable(enabled = enabled) { expanded = true }
-                        .padding(start = 26.dp, end = 18.dp, top = 14.dp, bottom = 14.dp),
+                        .padding(
+                            start = (26f * toolbarScale).dp,
+                            end = (18f * toolbarScale).dp,
+                            top = (14f * toolbarScale).dp,
+                            bottom = (14f * toolbarScale).dp
+                        ),
                     horizontalArrangement = Arrangement.Center,
                     verticalAlignment = Alignment.CenterVertically
                 ) {
@@ -4164,28 +4252,29 @@ private fun CardsExploreFilterBar(
                         Image(
                             painter = painterResource(id = R.drawable.nearby),
                             contentDescription = null,
-                            modifier = Modifier.size(30.dp),
+                            modifier = Modifier.size((30f * toolbarScale).dp),
                             colorFilter = null
                         )
-                        Spacer(Modifier.width(8.dp))
+                        Spacer(Modifier.width((8f * toolbarScale).dp))
                     }
                     Text(
                         text = selectedOption.label,
                         color = selectedLabelColor,
                         maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
                         style = MaterialTheme.typography.titleLarge.copy(
                             fontFamily = playfairDisplay,
                             fontWeight = FontWeight.SemiBold,
-                            fontSize = 28.sp,
-                            lineHeight = 28.sp
+                            fontSize = (28f * toolbarScale).sp,
+                            lineHeight = (28f * toolbarScale).sp
                         )
                     )
-                    Spacer(Modifier.width(6.dp))
+                    Spacer(Modifier.width((6f * toolbarScale).dp))
                     Icon(
                         imageVector = Icons.Filled.ArrowDropDown,
                         contentDescription = "Choose cards filter",
                         tint = Color.White.copy(alpha = 0.96f),
-                        modifier = Modifier.size(28.dp)
+                        modifier = Modifier.size((28f * toolbarScale).dp)
                     )
                 }
             }
@@ -4193,12 +4282,12 @@ private fun CardsExploreFilterBar(
             DropdownMenu(
                 expanded = expanded,
                 onDismissRequest = { expanded = false },
-                modifier = Modifier.widthIn(min = 196.dp),
+                modifier = Modifier.widthIn(min = dropdownWidth, max = availableToolbarWidth),
                 shape = menuShape,
                 containerColor = toolbarBubbleColor,
                 tonalElevation = 6.dp,
                 shadowElevation = 10.dp,
-                border = BorderStroke(1.dp, Color.White.copy(alpha = 0.14f))
+                border = BorderStroke(1.dp, CardToolbarOutlineColor)
             ) {
                 CardsFilterOption.values().forEach { option ->
                     DropdownMenuItem(
@@ -4221,6 +4310,47 @@ private fun CardsExploreFilterBar(
             }
         }
 
+    }
+}
+
+@Composable
+private fun CardAttributeFilterBubble(
+    activeFilterCount: Int,
+    onClick: () -> Unit,
+    enabled: Boolean,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier
+            .size(CardFilterBubbleSize)
+            .clickable(enabled = enabled) { onClick() },
+        shape = CircleShape,
+        color = BottomNavToolbarColor,
+        contentColor = Color.Black,
+        shadowElevation = 8.dp,
+        border = BorderStroke(1.dp, CardToolbarOutlineColor)
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            BadgedBox(
+                badge = {
+                    if (activeFilterCount > 0) {
+                        Badge(
+                            containerColor = CafeDark,
+                            contentColor = Color.White
+                        ) {
+                            Text(activeFilterCount.toString())
+                        }
+                    }
+                }
+            ) {
+                Image(
+                    painter = painterResource(id = R.drawable.filter),
+                    contentDescription = "Filter cards",
+                    modifier = Modifier.size(CardFilterIconSize),
+                    colorFilter = null
+                )
+            }
+        }
     }
 }
 
@@ -4309,7 +4439,7 @@ fun MapSearchBar(
                             Image(
                                 painter = painterResource(id = R.drawable.filter),
                                 contentDescription = "Filter map cafes",
-                                modifier = Modifier.size(19.2.dp),
+                                modifier = Modifier.size(21.12.dp),
                                 colorFilter = null
                             )
                         }
@@ -4390,9 +4520,10 @@ fun MapSearchBar(
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-private fun MapFilterBottomSheet(
-    filters: MapCafeFilters,
-    onApplyFilters: (MapCafeFilters) -> Unit,
+private fun CafeAttributeFilterBottomSheet(
+    title: String,
+    filters: CafeAttributeFilters,
+    onApplyFilters: (CafeAttributeFilters) -> Unit,
     onClearFilters: () -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -4421,7 +4552,7 @@ private fun MapFilterBottomSheet(
             ) {
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
-                        text = "Map filters",
+                        text = title,
                         style = MaterialTheme.typography.titleLarge,
                         fontWeight = FontWeight.SemiBold,
                         color = CafeDark
@@ -4449,7 +4580,7 @@ private fun MapFilterBottomSheet(
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 item {
-                    MapFilterChipGroup(
+                    CafeAttributeFilterChipGroup(
                         label = "Open now",
                         selected = draftFilters.openNow.takeUnless { it == OpenNowFilter.ANY },
                         options = listOf(OpenNowFilter.YES, OpenNowFilter.NO),
@@ -4460,7 +4591,7 @@ private fun MapFilterBottomSheet(
                     )
                 }
                 item {
-                    MapFilterChipGroup(
+                    CafeAttributeFilterChipGroup(
                         label = "WiFi speed",
                         selected = draftFilters.wifiSpeed,
                         options = listOf(WifiSpeed.FAST, WifiSpeed.DECENT, WifiSpeed.SLOW),
@@ -4469,7 +4600,7 @@ private fun MapFilterBottomSheet(
                     )
                 }
                 item {
-                    MapFilterChipGroup(
+                    CafeAttributeFilterChipGroup(
                         label = "Bathroom",
                         selected = draftFilters.bathroomAvailability,
                         options = listOf(BathroomAvailability.AVAILABLE, BathroomAvailability.NONE),
@@ -4478,7 +4609,7 @@ private fun MapFilterBottomSheet(
                     )
                 }
                 item {
-                    MapFilterChipGroup(
+                    CafeAttributeFilterChipGroup(
                         label = "Seating",
                         selected = draftFilters.seatingAvailability,
                         options = listOf(
@@ -4491,7 +4622,7 @@ private fun MapFilterBottomSheet(
                     )
                 }
                 item {
-                    MapFilterChipGroup(
+                    CafeAttributeFilterChipGroup(
                         label = "Seating comfort",
                         selected = draftFilters.seatingComfort,
                         options = listOf(
@@ -4505,7 +4636,7 @@ private fun MapFilterBottomSheet(
                     )
                 }
                 item {
-                    MapFilterChipGroup(
+                    CafeAttributeFilterChipGroup(
                         label = "Crowd level",
                         selected = draftFilters.crowdLevel,
                         options = listOf(
@@ -4520,7 +4651,7 @@ private fun MapFilterBottomSheet(
                     )
                 }
                 item {
-                    MapFilterChipGroup(
+                    CafeAttributeFilterChipGroup(
                         label = "Noise level",
                         selected = draftFilters.noiseLevel,
                         options = listOf(
@@ -4535,7 +4666,7 @@ private fun MapFilterBottomSheet(
                     )
                 }
                 item {
-                    MapFilterChipGroup(
+                    CafeAttributeFilterChipGroup(
                         label = "Pet friendly",
                         selected = draftFilters.petFriendly,
                         options = listOf(
@@ -4548,7 +4679,7 @@ private fun MapFilterBottomSheet(
                     )
                 }
                 item {
-                    MapFilterChipGroup(
+                    CafeAttributeFilterChipGroup(
                         label = "Cleanliness",
                         selected = draftFilters.cleanlinessRating,
                         options = listOf(
@@ -4596,7 +4727,7 @@ private fun MapFilterBottomSheet(
 }
 
 @Composable
-private fun <T> MapFilterChipGroup(
+private fun <T> CafeAttributeFilterChipGroup(
     label: String,
     selected: T?,
     options: List<T>,
@@ -4625,7 +4756,7 @@ private fun <T> MapFilterChipGroup(
             horizontalSpacing = 8.dp,
             verticalSpacing = 8.dp
         ) {
-            MapFilterChip(
+            CafeAttributeFilterChip(
                 text = "Any",
                 selected = selected == null,
                 colors = chipColors,
@@ -4633,7 +4764,7 @@ private fun <T> MapFilterChipGroup(
             )
             options.forEach { option ->
                 val isSelected = selected == option
-                MapFilterChip(
+                CafeAttributeFilterChip(
                     text = optionLabel(option),
                     selected = isSelected,
                     colors = chipColors,
@@ -4645,7 +4776,7 @@ private fun <T> MapFilterChipGroup(
 }
 
 @Composable
-private fun MapFilterChip(
+private fun CafeAttributeFilterChip(
     text: String,
     selected: Boolean,
     colors: SelectableChipColors,

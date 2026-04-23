@@ -15,7 +15,7 @@ internal enum class CafeOpenState {
     UNKNOWN
 }
 
-internal data class MapCafeFilters(
+internal data class CafeAttributeFilters(
     val openNow: OpenNowFilter = OpenNowFilter.ANY,
     val wifiSpeed: WifiSpeed? = null,
     val bathroomAvailability: BathroomAvailability? = null,
@@ -43,10 +43,10 @@ internal data class MapCafeFilters(
         get() = activeCount > 0
 }
 
-internal fun cafeMatchesMapFilters(
+internal fun cafeMatchesAttributeFilters(
     cafe: Cafe,
     attributes: CafeCrowdAttributes,
-    filters: MapCafeFilters,
+    filters: CafeAttributeFilters,
     now: Calendar = Calendar.getInstance(Locale.US)
 ): Boolean {
     if (!matchesOpenNowFilter(cafe, filters.openNow, now)) return false

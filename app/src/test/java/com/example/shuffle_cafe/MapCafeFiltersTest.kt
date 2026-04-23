@@ -9,11 +9,11 @@ import java.util.GregorianCalendar
 import java.util.Locale
 import java.util.TimeZone
 
-class MapCafeFiltersTest {
+class CafeAttributeFiltersTest {
 
     @Test
     fun cleanlinessPoorIncludesAllKnownCleanlinessValues() {
-        val filter = MapCafeFilters(cleanlinessRating = CleanlinessRating.POOR)
+        val filter = CafeAttributeFilters(cleanlinessRating = CleanlinessRating.POOR)
 
         assertTrue(testCafe().matches(filter, CafeCrowdAttributes(cleanlinessRating = CleanlinessRating.POOR)))
         assertTrue(testCafe().matches(filter, CafeCrowdAttributes(cleanlinessRating = CleanlinessRating.OKAY)))
@@ -24,7 +24,7 @@ class MapCafeFiltersTest {
 
     @Test
     fun studyFriendlyCrowdOrderingTreatsLighterCrowdsAsHigher() {
-        val moderateOrBetter = MapCafeFilters(crowdLevel = CrowdLevel.MODERATE)
+        val moderateOrBetter = CafeAttributeFilters(crowdLevel = CrowdLevel.MODERATE)
 
         assertTrue(testCafe().matches(moderateOrBetter, CafeCrowdAttributes(crowdLevel = CrowdLevel.EMPTY)))
         assertTrue(testCafe().matches(moderateOrBetter, CafeCrowdAttributes(crowdLevel = CrowdLevel.LIGHT)))
@@ -35,7 +35,7 @@ class MapCafeFiltersTest {
 
     @Test
     fun studyFriendlyNoiseOrderingTreatsQuieterNoiseAsHigher() {
-        val quietOrBetter = MapCafeFilters(noiseLevel = NoiseLevel.QUIET)
+        val quietOrBetter = CafeAttributeFilters(noiseLevel = NoiseLevel.QUIET)
 
         assertTrue(testCafe().matches(quietOrBetter, CafeCrowdAttributes(noiseLevel = NoiseLevel.SILENT)))
         assertTrue(testCafe().matches(quietOrBetter, CafeCrowdAttributes(noiseLevel = NoiseLevel.QUIET)))
@@ -46,7 +46,7 @@ class MapCafeFiltersTest {
 
     @Test
     fun bathroomAndPetFiltersMatchExactValues() {
-        val exactFilters = MapCafeFilters(
+        val exactFilters = CafeAttributeFilters(
             bathroomAvailability = BathroomAvailability.AVAILABLE,
             petFriendly = PetFriendly.PATIO_ONLY
         )
@@ -85,24 +85,24 @@ class MapCafeFiltersTest {
         val cafe = testCafe()
 
         assertTrue(
-            cafeMatchesMapFilters(
+            cafeMatchesAttributeFilters(
                 cafe = cafe,
                 attributes = CafeCrowdAttributes(),
-                filters = MapCafeFilters()
+                filters = CafeAttributeFilters()
             )
         )
         assertFalse(
-            cafeMatchesMapFilters(
+            cafeMatchesAttributeFilters(
                 cafe = cafe,
                 attributes = CafeCrowdAttributes(),
-                filters = MapCafeFilters(wifiSpeed = WifiSpeed.SLOW)
+                filters = CafeAttributeFilters(wifiSpeed = WifiSpeed.SLOW)
             )
         )
         assertTrue(
-            cafeMatchesMapFilters(
+            cafeMatchesAttributeFilters(
                 cafe = cafe,
                 attributes = CafeCrowdAttributes(bathroomAvailability = BathroomAvailability.AVAILABLE),
-                filters = MapCafeFilters(bathroomAvailability = BathroomAvailability.AVAILABLE)
+                filters = CafeAttributeFilters(bathroomAvailability = BathroomAvailability.AVAILABLE)
             )
         )
     }
@@ -146,33 +146,33 @@ class MapCafeFiltersTest {
         )
 
         assertTrue(
-            cafeMatchesMapFilters(
+            cafeMatchesAttributeFilters(
                 cafe = testCafe(hours = linkedMapOf("Wednesday" to "8:00 AM - 5:00 PM")),
                 attributes = CafeCrowdAttributes(),
-                filters = MapCafeFilters(openNow = OpenNowFilter.YES),
+                filters = CafeAttributeFilters(openNow = OpenNowFilter.YES),
                 now = wednesdayMorning
             )
         )
         assertTrue(
-            cafeMatchesMapFilters(
+            cafeMatchesAttributeFilters(
                 cafe = testCafe(hours = linkedMapOf("Wednesday" to "4:00 PM - 9:00 PM")),
                 attributes = CafeCrowdAttributes(),
-                filters = MapCafeFilters(openNow = OpenNowFilter.NO),
+                filters = CafeAttributeFilters(openNow = OpenNowFilter.NO),
                 now = wednesdayMorning
             )
         )
         assertFalse(
-            cafeMatchesMapFilters(
+            cafeMatchesAttributeFilters(
                 cafe = testCafe(hours = linkedMapOf("Wednesday" to "Hours unavailable")),
                 attributes = CafeCrowdAttributes(),
-                filters = MapCafeFilters(openNow = OpenNowFilter.YES),
+                filters = CafeAttributeFilters(openNow = OpenNowFilter.YES),
                 now = wednesdayMorning
             )
         )
     }
 
-    private fun Cafe.matches(filters: MapCafeFilters, attributes: CafeCrowdAttributes): Boolean {
-        return cafeMatchesMapFilters(
+    private fun Cafe.matches(filters: CafeAttributeFilters, attributes: CafeCrowdAttributes): Boolean {
+        return cafeMatchesAttributeFilters(
             cafe = this,
             attributes = attributes,
             filters = filters,
