@@ -2253,6 +2253,19 @@ data class Review(
 object ReviewRepository {
     private val reviewsByCafe = mutableStateMapOf<String, SnapshotStateList<Review>>()
 
+    private val myReviewsList = mutableStateListOf<Review>()
+
+    fun myReviews(): List<Review> = myReviewsList.toList()
+
+    suspend fun loadMyReviews() {
+        val user = supabase.auth.currentUserOrNull() ?: return
+        val fetched = supabase.from("reviews")
+            .select { filter { eq("user_id", user.id) } }
+            .decodeList<Review>()
+        myReviewsList.clear()
+        myReviewsList.addAll(fetched)
+    }
+
     fun reviewsFor(cafeId: String): SnapshotStateList<Review> =
         reviewsByCafe.getOrPut(cafeId) { mutableStateListOf() }
 
@@ -9400,16 +9413,16 @@ fun ProfileScreen(navController: NavHostController) {
 
     val savedCafes = BookmarkRepository.cafes()
 
-    LaunchedEffect(savedCafes) {
-        savedCafes.forEach { cafe ->
-            runCatching { ReviewRepository.loadReviews(cafe.id) }
-        }
+    val myReviews = ReviewRepository.myReviews()
+
+    LaunchedEffect(Unit) {
+        runCatching { ReviewRepository.loadMyReviews() }
     }
 
     val studySessions = StudySessionRepository.sessions()
     val savedCount = savedCafes.size
     val studySessionCount = studySessions.size
-    val reviewCount = savedCafes.sumOf { ReviewRepository.reviewsFor(it.id).size }
+    val reviewCount = myReviews.size
     val selectedRecentCafe = selectedRecentCafeId?.let { cafeId -> CafeRepository.getCafe(cafeId) }
     CafeDetailDataEffect(cafe = selectedRecentCafe, placesClient = placesClient)
 
@@ -9679,6 +9692,7 @@ fun ProfileScreen(navController: NavHostController) {
                         activeStat = activeStat!!,
                         savedCafes = savedCafes,
                         studySessions = studySessions,
+                        myReviews = myReviews,
                         navController = navController,
                         onClose = { activeStat = null },
                         modifier = Modifier
@@ -10253,6 +10267,7 @@ private fun ProfileStatPanel(
     activeStat: String,
     savedCafes: List<Cafe>,
     studySessions: List<StudySession>,
+    myReviews: List<Review>,
     navController: NavHostController,
     onClose: () -> Unit,
     modifier: Modifier = Modifier
@@ -10494,12 +10509,7 @@ private fun ProfileStatPanel(
                     }
 
                     "reviews" -> {
-                        val allReviews = savedCafes.flatMap { cafe ->
-                            ReviewRepository.reviewsFor(cafe.id).map { review ->
-                                Pair(cafe, review)
-                            }
-                        }
-                        if (allReviews.isEmpty()) {
+                        if (myReviews.isEmpty()) {
                             Text(
                                 "No reviews yet. Open a cafe and tap \"Write review\" to add one.",
                                 style = MaterialTheme.typography.bodySmall,
@@ -10507,15 +10517,14 @@ private fun ProfileStatPanel(
                                 modifier = Modifier.padding(vertical = 8.dp)
                             )
                         } else {
-                            allReviews.take(5).forEachIndexed { index, (cafe, review) ->
+                            myReviews.take(5).forEachIndexed { index, review ->
+                                val cafe = CafeRepository.getCafe(review.cafe_id)
                                 val deleteScope = rememberCoroutineScope()
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clickable {
-                                            navController.navigate(
-                                                Screen.CafeDetails.createRoute(cafe.id)
-                                            )
+                                            navController.navigate(Screen.CafeDetails.createRoute(review.cafe_id))
                                         }
                                         .padding(vertical = 7.dp),
                                     verticalAlignment = Alignment.Top
@@ -10525,18 +10534,19 @@ private fun ProfileStatPanel(
                                         shape = RoundedCornerShape(7.dp),
                                         color = lightBrown
                                     ) {
-                                        AsyncImage(
-                                            model = cafe.heroImageBitmap ?: cafe.imageUrl
-                                            ?: cafe.imageResId,
-                                            contentDescription = cafe.name,
-                                            modifier = Modifier.fillMaxSize(),
-                                            contentScale = ContentScale.Crop
-                                        )
+                                        if (cafe != null) {
+                                            AsyncImage(
+                                                model = cafe.heroImageBitmap ?: cafe.imageUrl ?: cafe.imageResId,
+                                                contentDescription = cafe.name,
+                                                modifier = Modifier.fillMaxSize(),
+                                                contentScale = ContentScale.Crop
+                                            )
+                                        }
                                     }
                                     Spacer(Modifier.width(10.dp))
                                     Column(modifier = Modifier.weight(1f)) {
                                         Text(
-                                            cafe.name,
+                                            cafe?.name ?: review.cafe_id,
                                             fontWeight = FontWeight.SemiBold,
                                             color = darkBrown,
                                             style = MaterialTheme.typography.bodySmall,
@@ -10569,7 +10579,7 @@ private fun ProfileStatPanel(
                                         )
                                     }
                                 }
-                                if (index < minOf(allReviews.size, 5) - 1) {
+                                if (index < minOf(myReviews.size, 5) - 1) {
                                     HorizontalDivider(color = lightBrown)
                                 }
                             }
