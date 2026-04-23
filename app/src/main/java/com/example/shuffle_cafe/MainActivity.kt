@@ -2488,7 +2488,7 @@ fun MainScreen(navController: NavHostController) {
     val showLoadError = loadError != null && !isNoCoffeeHousesMessage(loadError)
     var currentVisibleCafes by remember { mutableStateOf<List<Cafe>>(emptyList()) }
     var nextCafeIndex by rememberSaveable { mutableIntStateOf(0) }
-    var expandedCafeId by remember { mutableStateOf<String?>(null) }
+    var expandedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
     var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
     var transitionState by remember { mutableStateOf<SelectedCafeTransitionState?>(null) }
     var overlayHostBounds by remember { mutableStateOf<Rect?>(null) }
@@ -3471,7 +3471,7 @@ fun MapScreen(navController: NavHostController) {
     val isLoading = cafeFeedState.isLoading && allCafes.isEmpty()
     val loadError = cafeFeedState.loadError.takeIf { allCafes.isEmpty() }
     val showLoadError = loadError != null && !isNoCoffeeHousesMessage(loadError)
-    var selectedCafeId by remember { mutableStateOf<String?>(null) }
+    var selectedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
     var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
     val detailProgress = remember { Animatable(0f) }
     val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
@@ -3892,7 +3892,7 @@ fun BookmarkScreen(navController: NavHostController) {
     val scope = rememberCoroutineScope()
     val savedCafes = BookmarkRepository.cafes()
     var showAllSaved by rememberSaveable { mutableStateOf(false) }
-    var selectedSavedCafeId by remember { mutableStateOf<String?>(null) }
+    var selectedSavedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedStudySession by remember { mutableStateOf<StudySession?>(null) }
     var studySessionCafe by remember { mutableStateOf<Cafe?>(null) }
     var loadingStudySessionCafeId by remember { mutableStateOf<String?>(null) }
@@ -8616,7 +8616,7 @@ fun ExpandedCafeDetailOverlay(
     val overlayAlpha = sCurve(((transitionProgress - 0.04f) / 0.34f).coerceIn(0f, 1f))
     val detailTextColor = Color.White
     val detailSecondaryTextColor = Color.White.copy(alpha = 0.78f)
-    var showStudyComposer by remember(cafe.id) { mutableStateOf(false) }
+    var showStudyComposer by rememberSaveable(cafe.id) { mutableStateOf(false) }
     var showSuggestionOverlay by remember(cafe.id) { mutableStateOf(false) }
 
     LaunchedEffect(cafe.id) {
@@ -9270,27 +9270,29 @@ private fun StudySessionComposerOverlay(
     val interactionSource = remember { MutableInteractionSource() }
     var isVisible by remember { mutableStateOf(false) }
     var isClosing by remember { mutableStateOf(false) }
-    var title by remember(cafe.id) { mutableStateOf("") }
-    var className by remember(cafe.id) { mutableStateOf("") }
-    var selectedDateUtcMillis by remember(cafe.id) { mutableStateOf<Long?>(null) }
-    var selectedStartHour by remember(cafe.id) { mutableStateOf<Int?>(null) }
-    var selectedStartMinute by remember(cafe.id) { mutableStateOf<Int?>(null) }
-    var selectedEndHour by remember(cafe.id) { mutableStateOf<Int?>(null) }
-    var selectedEndMinute by remember(cafe.id) { mutableStateOf<Int?>(null) }
-    var summary by remember(cafe.id) { mutableStateOf("") }
-    var showDatePicker by remember(cafe.id) { mutableStateOf(false) }
+    var title by rememberSaveable(cafe.id) { mutableStateOf("") }
+    var className by rememberSaveable(cafe.id) { mutableStateOf("") }
+    var selectedDateUtcMillis by rememberSaveable(cafe.id) { mutableStateOf<Long?>(null) }
+    var selectedStartHour by rememberSaveable(cafe.id) { mutableStateOf<Int?>(null) }
+    var selectedStartMinute by rememberSaveable(cafe.id) { mutableStateOf<Int?>(null) }
+    var selectedEndHour by rememberSaveable(cafe.id) { mutableStateOf<Int?>(null) }
+    var selectedEndMinute by rememberSaveable(cafe.id) { mutableStateOf<Int?>(null) }
+    var summary by rememberSaveable(cafe.id) { mutableStateOf("") }
+    var showDatePicker by rememberSaveable(cafe.id) { mutableStateOf(false) }
     var activeTimeField by remember(cafe.id) { mutableStateOf<StudySessionTimeField?>(null) }
-    val selectedPhotoUris = remember(cafe.id) { mutableStateListOf<String>() }
+    var selectedPhotoUris by rememberSaveable(cafe.id) { mutableStateOf(emptyList<String>()) }
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
+        val updatedPhotoUris = selectedPhotoUris.toMutableList()
         uris.forEach { uri ->
             persistStudySessionPhotoPermission(context, uri)
             val uriText = uri.toString()
-            if (selectedPhotoUris.size < 5 && uriText !in selectedPhotoUris) {
-                selectedPhotoUris.add(uriText)
+            if (updatedPhotoUris.size < 5 && uriText !in updatedPhotoUris) {
+                updatedPhotoUris.add(uriText)
             }
         }
+        selectedPhotoUris = updatedPhotoUris
     }
 
     LaunchedEffect(Unit) {
@@ -9330,7 +9332,7 @@ private fun StudySessionComposerOverlay(
         endHour = selectedEndHour,
         endMinute = selectedEndMinute,
         summary = summary,
-        photoUris = selectedPhotoUris.toList()
+        photoUris = selectedPhotoUris
     )
     val canCreate = StudySessionRepository.canCreate(draft)
     val textFieldColors = studySessionTextFieldColors()
@@ -9556,7 +9558,7 @@ private fun StudySessionComposerOverlay(
                             selectedPhotoUris.forEach { uri ->
                                 StudySessionPhotoPreview(
                                     uri = uri,
-                                    onRemove = { selectedPhotoUris.remove(uri) }
+                                    onRemove = { selectedPhotoUris = selectedPhotoUris - uri }
                                 )
                             }
                         }
