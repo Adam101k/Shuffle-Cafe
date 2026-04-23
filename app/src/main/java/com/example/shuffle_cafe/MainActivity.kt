@@ -2240,10 +2240,47 @@ object RecentRepository {
     }
 }
 
+@Serializable
+data class Review(
+    val id: String = "",
+    val cafe_id: String,
+    val user_id: String = "",
+    val display_name: String? = null,
+    val body: String,
+    val created_at: String = ""
+)
+
 object ReviewRepository {
-    private val reviewsByCafe = mutableStateMapOf<String, SnapshotStateList<String>>()
-    fun reviewsFor(cafeId: String): SnapshotStateList<String> = reviewsByCafe.getOrPut(cafeId) { mutableStateListOf() }
-    fun addReview(cafeId: String, review: String) { reviewsFor(cafeId).add(review) }
+    private val reviewsByCafe = mutableStateMapOf<String, SnapshotStateList<Review>>()
+
+    fun reviewsFor(cafeId: String): SnapshotStateList<Review> =
+        reviewsByCafe.getOrPut(cafeId) { mutableStateListOf() }
+
+    suspend fun loadReviews(cafeId: String) {
+        val fetched = supabase.from("reviews")
+            .select { filter { eq("cafe_id", cafeId) } }
+            .decodeList<Review>()
+        val list = reviewsByCafe.getOrPut(cafeId) { mutableStateListOf() }
+        list.clear()
+        list.addAll(fetched)
+    }
+
+    suspend fun addReview(cafeId: String, body: String, displayName: String?) {
+        val user = supabase.auth.currentUserOrNull() ?: return
+        val review = Review(
+            cafe_id = cafeId,
+            user_id = user.id,
+            display_name = displayName,
+            body = body
+        )
+        supabase.from("reviews").insert(review)
+        loadReviews(cafeId) // refresh after posting
+    }
+
+    suspend fun deleteReview(review: Review) {
+        supabase.from("reviews").delete { filter { eq("id", review.id) } }
+        reviewsByCafe[review.cafe_id]?.remove(review)
+    }
 }
 
 class MainActivity : ComponentActivity() {
@@ -2432,7 +2469,7 @@ fun MainScreen(navController: NavHostController) {
     val showLoadError = loadError != null && !isNoCoffeeHousesMessage(loadError)
     var currentVisibleCafes by remember { mutableStateOf<List<Cafe>>(emptyList()) }
     var nextCafeIndex by rememberSaveable { mutableIntStateOf(0) }
-    var expandedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
+    var expandedCafeId by remember { mutableStateOf<String?>(null) }
     var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
     var transitionState by remember { mutableStateOf<SelectedCafeTransitionState?>(null) }
     var overlayHostBounds by remember { mutableStateOf<Rect?>(null) }
@@ -3354,7 +3391,7 @@ fun MapScreen(navController: NavHostController) {
     val isLoading = cafeFeedState.isLoading && allCafes.isEmpty()
     val loadError = cafeFeedState.loadError.takeIf { allCafes.isEmpty() }
     val showLoadError = loadError != null && !isNoCoffeeHousesMessage(loadError)
-    var selectedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedCafeId by remember { mutableStateOf<String?>(null) }
     var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
     val detailProgress = remember { Animatable(0f) }
     val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
@@ -3726,7 +3763,7 @@ fun BookmarkScreen(navController: NavHostController) {
     val scope = rememberCoroutineScope()
     val savedCafes = BookmarkRepository.cafes()
     var showAllSaved by rememberSaveable { mutableStateOf(false) }
-    var selectedSavedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedSavedCafeId by remember { mutableStateOf<String?>(null) }
     var selectedStudySession by remember { mutableStateOf<StudySession?>(null) }
     var studySessionCafe by remember { mutableStateOf<Cafe?>(null) }
     var loadingStudySessionCafeId by remember { mutableStateOf<String?>(null) }
@@ -4746,6 +4783,7 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
 
     LaunchedEffect(cafeId) {
         RecentRepository.add(cafeId)
+        runCatching { ReviewRepository.loadReviews(cafeId)}
     }
 
     val reviews = ReviewRepository.reviewsFor(cafeId)
@@ -4895,16 +4933,24 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
             if (reviews.isEmpty()) {
                 item { Text("No reviews yet.", color = detailSecondaryTextColor) }
             } else {
-                items(reviews) {
+                items(reviews) { review ->
                     OutlinedCard(
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 20.dp),
                         border = BorderStroke(1.dp, Color.Black),
                         colors = CardDefaults.outlinedCardColors(
                             containerColor = SelectedCafeSurfaceColor,
                             contentColor = detailTextColor
                         )
                     ) {
-                        Text(it, modifier = Modifier.padding(12.dp), color = detailTextColor)
+                        Column(modifier = Modifier.padding(12.dp)) {
+                            review.display_name?.let { name ->
+                                Text(name, fontWeight = FontWeight.SemiBold,
+                                    style = MaterialTheme.typography.labelSmall, color = detailTextColor)
+                            }
+                            Text(review.body, color = detailTextColor)
+                        }
                     }
                 }
             }
@@ -7254,12 +7300,51 @@ fun RecentCafeRow(
 @Composable
 fun WriteReviewScreen(navController: NavHostController, cafeId: String) {
     var text by rememberSaveable { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+    var isPosting by remember { mutableStateOf(false) }
+    var authorDisplayName by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(Unit) {
+        val user = supabase.auth.currentUserOrNull() ?: return@LaunchedEffect
+        runCatching {
+            val profile = supabase.from("profiles")
+                .select { filter { eq("id", user.id) } }
+                .decodeSingle<Profile>()
+            authorDisplayName = profile.first_name.trim().ifBlank { null }
+        }.onFailure {
+            authorDisplayName = user.email
+        }
+    }
+
     Scaffold(bottomBar = { BottomNavBar(navController) }, containerColor = Color(0xFFC79A87)) { innerPadding ->
         Column(modifier = Modifier.padding(innerPadding).fillMaxSize().padding(16.dp)) {
-            OutlinedTextField(text, { text = it }, placeholder = { Text("Write a review...") }, modifier = Modifier.fillMaxWidth().weight(1f))
+            OutlinedTextField(
+                text, { text = it },
+                placeholder = { Text("Write a review...") },
+                modifier = Modifier.fillMaxWidth().weight(1f)
+            )
             Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
                 TextButton(onClick = { navController.popBackStack() }) { Text("Cancel") }
-                Button(onClick = { ReviewRepository.addReview(cafeId, text); navController.popBackStack() }, enabled = text.isNotBlank()) { Text("Post") }
+                Button(
+                    onClick = {
+                        isPosting = true
+                        scope.launch {
+                            runCatching {
+                                ReviewRepository.addReview(
+                                    cafeId = cafeId,
+                                    body = text,
+                                    displayName = authorDisplayName
+                                )
+                            }
+                            isPosting = false
+                            navController.popBackStack()
+                        }
+                    },
+                    enabled = text.isNotBlank() && !isPosting
+                ) {
+                    if (isPosting) CircularProgressIndicator(modifier = Modifier.size(18.dp), strokeWidth = 2.dp)
+                    else Text("Post")
+                }
             }
         }
     }
@@ -7977,6 +8062,10 @@ fun ExpandedCafeDetailOverlay(
     var showStudyComposer by remember(cafe.id) { mutableStateOf(false) }
     var showSuggestionOverlay by remember(cafe.id) { mutableStateOf(false) }
 
+    LaunchedEffect(cafe.id) {
+        runCatching { ReviewRepository.loadReviews(cafe.id) }
+    }
+
     BackHandler(enabled = showStudyComposer) {
         showStudyComposer = false
     }
@@ -8247,7 +8336,13 @@ fun ExpandedCafeDetailOverlay(
                                 contentColor = detailTextColor
                             )
                         ) {
-                            Text(review, modifier = Modifier.padding(12.dp), color = detailTextColor)
+                            Column(modifier = Modifier.padding(12.dp)) {
+                                review.display_name?.let { name ->
+                                    Text(name, fontWeight = FontWeight.SemiBold,
+                                        style = MaterialTheme.typography.labelSmall, color = detailTextColor)
+                                }
+                                Text(review.body, color = detailTextColor)
+                            }
                         }
                     }
                 }
@@ -9280,6 +9375,9 @@ fun ProfileScreen(navController: NavHostController) {
     var avatarUri by remember { mutableStateOf<Uri?>(null) }
     var isLoading by remember { mutableStateOf(true) }
     var isEditingBio by remember { mutableStateOf(false) }
+    var isEditingName by remember { mutableStateOf(false) }
+    var editFirstName by remember { mutableStateOf("") }
+    var editLastName by remember { mutableStateOf("") }
     var noise by remember { mutableIntStateOf(3) }
     var outlet by remember { mutableIntStateOf(3) }
     var seating by remember { mutableIntStateOf(3) }
@@ -9289,6 +9387,13 @@ fun ProfileScreen(navController: NavHostController) {
     var activeStat by remember { mutableStateOf<String?>(null) }
 
     val savedCafes = BookmarkRepository.cafes()
+
+    LaunchedEffect(savedCafes) {
+        savedCafes.forEach { cafe ->
+            runCatching { ReviewRepository.loadReviews(cafe.id) }
+        }
+    }
+
     val studySessions = StudySessionRepository.sessions()
     val savedCount = savedCafes.size
     val studySessionCount = studySessions.size
@@ -9335,6 +9440,8 @@ fun ProfileScreen(navController: NavHostController) {
                     .decodeSingle<Profile>()
                 profile = result
                 bioText = result.bio ?: ""
+                editFirstName = result.first_name
+                editLastName = result.last_name
             } catch (e: Exception) {
                 e.printStackTrace()
             }
@@ -9419,13 +9526,18 @@ fun ProfileScreen(navController: NavHostController) {
                                             modifier = Modifier.fillMaxSize(),
                                             contentScale = ContentScale.Crop
                                         )
-                                    profile?.avatar_url != null ->
+                                    profile?.avatar_url != null -> {
+                                        val avatarUrl = profile!!.avatar_url!!
+                                        val bustedUrl = remember(avatarUrl) {
+                                            "$avatarUrl?t=${System.currentTimeMillis()}"
+                                        }
                                         AsyncImage(
-                                            model = "${profile?.avatar_url}?t=${System.currentTimeMillis()}",
+                                            model = bustedUrl,
                                             contentDescription = "Profile picture",
                                             modifier = Modifier.fillMaxSize(),
                                             contentScale = ContentScale.Crop
                                         )
+                                    }
                                     else ->
                                         Box(contentAlignment = Alignment.Center) {
                                             Text(
@@ -9442,14 +9554,36 @@ fun ProfileScreen(navController: NavHostController) {
                             }
                         }
 
-                        Text(
-                            text = profile?.let {
-                                "${it.first_name.trim()} ${it.last_name.trim()}".trim().ifBlank { "User" }
-                            } ?: "User",
-                            style = MaterialTheme.typography.titleMedium,
-                            fontWeight = FontWeight.SemiBold,
-                            color = cream
-                        )
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Text(
+                                text = profile?.let {
+                                    "${it.first_name.trim()} ${it.last_name.trim()}".trim().ifBlank { "User" }
+                                } ?: "User",
+                                style = MaterialTheme.typography.titleMedium,
+                                fontWeight = FontWeight.SemiBold,
+                                color = cream
+                            )
+                            Surface(
+                                modifier = Modifier.clickable {
+                                    editFirstName = profile?.first_name ?: ""
+                                    editLastName = profile?.last_name ?: ""
+                                    isEditingName = true
+                                },
+                                shape = RoundedCornerShape(20.dp),
+                                color = caramel.copy(alpha = 0.18f),
+                                border = BorderStroke(1.dp, caramel.copy(alpha = 0.38f))
+                            ) {
+                                Icon(
+                                    imageVector = Icons.Filled.Edit,
+                                    contentDescription = "Edit name",
+                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 4.dp).size(12.dp),
+                                    tint = caramel
+                                )
+                            }
+                        }
 
                         Surface(
                             shape = CircleShape,
@@ -9768,10 +9902,197 @@ fun ProfileScreen(navController: NavHostController) {
             }
         }
     }
+    if (isEditingName) {
+        NameEditDialog(
+            firstName = editFirstName,
+            lastName = editLastName,
+            onFirstNameChange = { editFirstName = it },
+            onLastNameChange = { editLastName = it },
+            onDismiss = { isEditingName = false },
+            onSave = {
+                isEditingName = false
+                profile = profile?.copy(
+                    first_name = editFirstName.trim(),
+                    last_name = editLastName.trim()
+                )
+                scope.launch {
+                    val user = supabase.auth.currentUserOrNull() ?: return@launch
+                    runCatching {
+                        supabase.from("profiles")
+                            .update(mapOf(
+                                "first_name" to editFirstName.trim(),
+                                "last_name" to editLastName.trim()
+                            )) {
+                                filter { eq("id", user.id) }
+                            }
+                    }
+                }
+            }
+        )
+    }
+}
+@Composable
+private fun NameEditDialog(
+    firstName: String,
+    lastName: String,
+    onFirstNameChange: (String) -> Unit,
+    onLastNameChange: (String) -> Unit,
+    onDismiss: () -> Unit,
+    onSave: () -> Unit
+) {
+    val cream = Color(0xFFF6E9D8)
+    val caramel = Color(0xFFC5A07D)
+    val darkBrown = Color(0xFF4A231C)
+    val lightBrown = Color(0xFFEAD7CE)
+    val playfairDisplay = remember { FontFamily(Font(R.font.playfair_display)) }
+    val isSaveEnabled = firstName.trim().isNotBlank() || lastName.trim().isNotBlank()
+
+    val fieldColors = OutlinedTextFieldDefaults.colors(
+        focusedTextColor = darkBrown,
+        unfocusedTextColor = darkBrown,
+        focusedContainerColor = lightBrown,
+        unfocusedContainerColor = lightBrown,
+        focusedBorderColor = caramel,
+        unfocusedBorderColor = caramel.copy(alpha = 0.45f),
+        focusedLabelColor = darkBrown,
+        unfocusedLabelColor = darkBrown.copy(alpha = 0.6f),
+        cursorColor = darkBrown
+    )
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        Card(
+            modifier = Modifier
+                .padding(horizontal = 28.dp)
+                .fillMaxWidth()
+                .widthIn(max = 400.dp),
+            shape = RoundedCornerShape(24.dp),
+            colors = CardDefaults.cardColors(
+                containerColor = cream,
+                contentColor = darkBrown
+            ),
+            elevation = CardDefaults.cardElevation(defaultElevation = 16.dp),
+            border = BorderStroke(1.dp, caramel.copy(alpha = 0.38f))
+        ) {
+            Column(
+                modifier = Modifier.padding(24.dp),
+                verticalArrangement = Arrangement.spacedBy(18.dp)
+            ) {
+                // Header
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Surface(
+                        modifier = Modifier.size(38.dp),
+                        shape = CircleShape,
+                        color = caramel.copy(alpha = 0.22f)
+                    ) {
+                        Box(contentAlignment = Alignment.Center) {
+                            Icon(
+                                imageVector = Icons.Filled.Person,
+                                contentDescription = null,
+                                modifier = Modifier.size(20.dp),
+                                tint = caramel
+                            )
+                        }
+                    }
+                    Spacer(Modifier.width(12.dp))
+                    Text(
+                        text = "Edit name",
+                        style = MaterialTheme.typography.titleLarge.copy(
+                            fontFamily = playfairDisplay,
+                            fontWeight = FontWeight.SemiBold
+                        ),
+                        color = darkBrown,
+                        modifier = Modifier.weight(1f)
+                    )
+                    IconButton(onClick = onDismiss) {
+                        Icon(
+                            Icons.Filled.Close,
+                            contentDescription = "Cancel",
+                            tint = darkBrown.copy(alpha = 0.5f)
+                        )
+                    }
+                }
+
+                HorizontalDivider(color = caramel.copy(alpha = 0.22f))
+
+                // Fields
+                OutlinedTextField(
+                    value = firstName,
+                    onValueChange = onFirstNameChange,
+                    label = {
+                        Text(
+                            "First name",
+                            style = MaterialTheme.typography.labelMedium.copy(fontFamily = playfairDisplay),
+                            color = darkBrown
+                        )
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = fieldColors,
+                    shape = RoundedCornerShape(14.dp)
+                )
+                OutlinedTextField(
+                    value = lastName,
+                    onValueChange = onLastNameChange,
+                    label = {
+                        Text(
+                            "Last name",
+                            style = MaterialTheme.typography.labelMedium.copy(fontFamily = playfairDisplay),
+                            color = darkBrown
+                        )
+                    },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = fieldColors,
+                    shape = RoundedCornerShape(14.dp)
+                )
+
+                // Buttons
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp, Alignment.End),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    TextButton(
+                        onClick = onDismiss,
+                        colors = ButtonDefaults.textButtonColors(
+                            contentColor = darkBrown.copy(alpha = 0.6f)
+                        )
+                    ) {
+                        Text(
+                            "Cancel",
+                            style = MaterialTheme.typography.bodyMedium.copy(fontFamily = playfairDisplay)
+                        )
+                    }
+                    Button(
+                        onClick = onSave,
+                        enabled = isSaveEnabled,
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = caramel,
+                            contentColor = darkBrown,
+                            disabledContainerColor = caramel.copy(alpha = 0.32f),
+                            disabledContentColor = darkBrown.copy(alpha = 0.4f)
+                        ),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Text(
+                            "Save",
+                            fontWeight = FontWeight.SemiBold,
+                            style = MaterialTheme.typography.bodyMedium.copy(fontFamily = playfairDisplay)
+                        )
+                    }
+                }
+            }
+        }
+    }
 }
 
 // Stat Pill
-
 @Composable
 private fun ProfileStatPill(
     count: Int,
@@ -10078,6 +10399,7 @@ private fun ProfileStatPanel(
                             )
                         } else {
                             allReviews.take(5).forEachIndexed { index, (cafe, review) ->
+                                val deleteScope = rememberCoroutineScope()
                                 Row(
                                     modifier = Modifier
                                         .fillMaxWidth()
@@ -10114,12 +10436,27 @@ private fun ProfileStatPanel(
                                         )
                                         Spacer(Modifier.height(2.dp))
                                         Text(
-                                            review,
+                                            review.body,
                                             style = MaterialTheme.typography.labelSmall,
                                             color = darkBrown.copy(alpha = 0.75f),
                                             maxLines = 2,
                                             overflow = TextOverflow.Ellipsis,
                                             lineHeight = 16.sp
+                                        )
+                                    }
+                                    IconButton(
+                                        onClick = {
+                                            deleteScope.launch {
+                                                runCatching { ReviewRepository.deleteReview(review) }
+                                            }
+                                        },
+                                        modifier = Modifier.size(32.dp)
+                                    ) {
+                                        Icon(
+                                            Icons.Filled.Delete,
+                                            contentDescription = "Delete review",
+                                            tint = caramel.copy(alpha = 0.72f),
+                                            modifier = Modifier.size(16.dp)
                                         )
                                     }
                                 }
@@ -10601,7 +10938,7 @@ fun PreferenceSlider(
 
         Slider(
             value = value.toFloat(),
-            onValueChange = { onChange(it.toInt()) },
+            onValueChange = { onChange(it.roundToInt()) },
             valueRange = 1f..5f,
             steps = 3,
             colors = SliderDefaults.colors(
