@@ -3350,6 +3350,8 @@ fun MapScreen(navController: NavHostController) {
     val hasLocationPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
     val defaultCamera = rememberCameraPositionState()
     var searchQuery by remember { mutableStateOf("") }
+    var mapCafeFilters by remember { mutableStateOf(MapCafeFilters()) }
+    var isMapFilterSheetVisible by remember { mutableStateOf(false) }
     val cafeFeedState = CafeRepository.mapUiState
     val allCafes = cafeFeedState.cafes
     val isLoading = cafeFeedState.isLoading && allCafes.isEmpty()
@@ -3418,6 +3420,17 @@ fun MapScreen(navController: NavHostController) {
     val renderedMapCafes = remember(renderedMapCafeEntries) {
         renderedMapCafeEntries.map { entry -> entry.cafe }
     }
+    val filteredMapCafes by remember(renderedMapCafes, mapCafeFilters) {
+        derivedStateOf {
+            renderedMapCafes.filter { cafe ->
+                cafeMatchesMapFilters(
+                    cafe = cafe,
+                    attributes = CrowdAttributeRepository.attributesFor(cafe.id),
+                    filters = mapCafeFilters
+                )
+            }
+        }
+    }
     val selectedCafe = remember(allCafes, renderedMapCafes, selectedCafeId) {
         selectedCafeId?.let { cafeId ->
             allCafes.firstOrNull { it.id == cafeId }
@@ -3425,12 +3438,23 @@ fun MapScreen(navController: NavHostController) {
                 ?: CafeRepository.getCafe(cafeId)
         }
     }
-    val cafesWithCoordinates = remember(renderedMapCafes) { renderedMapCafes.filter { it.latLng != null } }
+    val cafesWithCoordinates = remember(filteredMapCafes) { filteredMapCafes.filter { it.latLng != null } }
+    val hasFilteredOutAllMapCafes = mapCafeFilters.hasActiveFilters &&
+        renderedMapCafes.isNotEmpty() &&
+        filteredMapCafes.isEmpty() &&
+        !isViewportLoadInFlight
     CafeDetailDataEffect(cafe = selectedCafe, placesClient = placesClient)
 
     LaunchedEffect(selectedCafe) {
         if (selectedCafe != null) {
             overlayCafe = selectedCafe
+        }
+    }
+
+    LaunchedEffect(selectedCafeId, filteredMapCafes, mapCafeFilters) {
+        val selectedId = selectedCafeId ?: return@LaunchedEffect
+        if (mapCafeFilters.hasActiveFilters && filteredMapCafes.none { cafe -> cafe.id == selectedId }) {
+            selectedCafeId = null
         }
     }
 
@@ -3573,6 +3597,8 @@ fun MapScreen(navController: NavHostController) {
                 MapSearchBar(
                     searchQuery = searchQuery,
                     onQueryChanged = { searchQuery = it },
+                    activeFilterCount = mapCafeFilters.activeCount,
+                    onFilterClick = { isMapFilterSheetVisible = true },
                     onPlaceSelected = { latLng, _ ->
                         defaultCamera.move(CameraUpdateFactory.newLatLngZoom(latLng, 17f))
                     }
@@ -3655,7 +3681,31 @@ fun MapScreen(navController: NavHostController) {
                         ShuffleCafeLoadingAnimation(modifier = Modifier.align(Alignment.Center))
                     }
                 }
+
+                if (hasFilteredOutAllMapCafes) {
+                    MapFilterEmptyMessage(
+                        onClearFilters = { mapCafeFilters = MapCafeFilters() },
+                        modifier = Modifier
+                            .align(Alignment.TopCenter)
+                            .padding(horizontal = 20.dp, vertical = 16.dp)
+                    )
+                }
             }
+        }
+
+        if (isMapFilterSheetVisible) {
+            MapFilterBottomSheet(
+                filters = mapCafeFilters,
+                onApplyFilters = { updatedFilters ->
+                    mapCafeFilters = updatedFilters
+                    isMapFilterSheetVisible = false
+                },
+                onClearFilters = {
+                    mapCafeFilters = MapCafeFilters()
+                    isMapFilterSheetVisible = false
+                },
+                onDismiss = { isMapFilterSheetVisible = false }
+            )
         }
 
         if (overlayCafe != null && detailProgress.value > 0f) {
@@ -4064,7 +4114,8 @@ private fun CardsExploreFilterBar(
                         Image(
                             painter = painterResource(id = R.drawable.nearby),
                             contentDescription = null,
-                            modifier = Modifier.size(30.dp)
+                            modifier = Modifier.size(30.dp),
+                            colorFilter = null
                         )
                         Spacer(Modifier.width(8.dp))
                     }
@@ -4128,6 +4179,8 @@ private fun CardsExploreFilterBar(
 fun MapSearchBar(
     searchQuery: String,
     onQueryChanged: (String) -> Unit,
+    activeFilterCount: Int,
+    onFilterClick: () -> Unit,
     onPlaceSelected: (LatLng, String) -> Unit
 ) {
     var recommended by remember { mutableStateOf<List<AutocompletePrediction>> (emptyList()) }
@@ -4189,7 +4242,29 @@ fun MapSearchBar(
                     }
                 },
                 placeholder = { Text("Search location...", color = searchPlaceholderColor) },
-                leadingIcon = { Icon(Icons.Filled.Menu, null, tint = searchContentColor) },
+                leadingIcon = {
+                    IconButton(onClick = onFilterClick) {
+                        BadgedBox(
+                            badge = {
+                                if (activeFilterCount > 0) {
+                                    Badge(
+                                        containerColor = CafeDark,
+                                        contentColor = Color.White
+                                    ) {
+                                        Text(activeFilterCount.toString())
+                                    }
+                                }
+                            }
+                        ) {
+                            Image(
+                                painter = painterResource(id = R.drawable.filter),
+                                contentDescription = "Filter map cafes",
+                                modifier = Modifier.size(19.2.dp),
+                                colorFilter = null
+                            )
+                        }
+                    }
+                },
                 trailingIcon = { IconButton(onClick = { searchQuery }) {Icon(Icons.Filled.Search, null, tint = searchContentColor) } },
                 singleLine = true,
                 enabled = placesClient != null,
@@ -4258,6 +4333,327 @@ fun MapSearchBar(
                         )
                     }
                 }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun MapFilterBottomSheet(
+    filters: MapCafeFilters,
+    onApplyFilters: (MapCafeFilters) -> Unit,
+    onClearFilters: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var draftFilters by remember(filters) { mutableStateOf(filters) }
+    val maxListHeight = (LocalConfiguration.current.screenHeightDp.dp * 0.68f).coerceAtLeast(320.dp)
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        sheetState = sheetState,
+        containerColor = CoffeeSurfaceLight,
+        contentColor = CafeDark,
+        dragHandle = { BottomSheetDefaults.DragHandle(color = CoffeeDark.copy(alpha = 0.42f)) }
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .navigationBarsPadding()
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 18.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = "Map filters",
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.SemiBold,
+                        color = CafeDark
+                    )
+                    Text(
+                        text = if (draftFilters.activeCount == 1) "1 active filter" else "${draftFilters.activeCount} active filters",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = CoffeeDark.copy(alpha = 0.72f)
+                    )
+                }
+                IconButton(onClick = onDismiss) {
+                    Icon(
+                        Icons.Filled.Close,
+                        contentDescription = "Close filters",
+                        tint = CafeDark
+                    )
+                }
+            }
+
+            LazyColumn(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(max = maxListHeight),
+                contentPadding = PaddingValues(bottom = 4.dp),
+                verticalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                item {
+                    MapFilterChipGroup(
+                        label = "Open now",
+                        selected = draftFilters.openNow.takeUnless { it == OpenNowFilter.ANY },
+                        options = listOf(OpenNowFilter.YES, OpenNowFilter.NO),
+                        optionLabel = { it.label },
+                        onSelected = { selected ->
+                            draftFilters = draftFilters.copy(openNow = selected ?: OpenNowFilter.ANY)
+                        }
+                    )
+                }
+                item {
+                    MapFilterChipGroup(
+                        label = "WiFi speed",
+                        selected = draftFilters.wifiSpeed,
+                        options = listOf(WifiSpeed.FAST, WifiSpeed.DECENT, WifiSpeed.SLOW),
+                        optionLabel = { it.label },
+                        onSelected = { selected -> draftFilters = draftFilters.copy(wifiSpeed = selected) }
+                    )
+                }
+                item {
+                    MapFilterChipGroup(
+                        label = "Bathroom",
+                        selected = draftFilters.bathroomAvailability,
+                        options = listOf(BathroomAvailability.AVAILABLE, BathroomAvailability.NONE),
+                        optionLabel = { it.label },
+                        onSelected = { selected -> draftFilters = draftFilters.copy(bathroomAvailability = selected) }
+                    )
+                }
+                item {
+                    MapFilterChipGroup(
+                        label = "Seating",
+                        selected = draftFilters.seatingAvailability,
+                        options = listOf(
+                            SeatingAvailability.PLENTY,
+                            SeatingAvailability.FAIR,
+                            SeatingAvailability.SCARCE
+                        ),
+                        optionLabel = { it.label },
+                        onSelected = { selected -> draftFilters = draftFilters.copy(seatingAvailability = selected) }
+                    )
+                }
+                item {
+                    MapFilterChipGroup(
+                        label = "Seating comfort",
+                        selected = draftFilters.seatingComfort,
+                        options = listOf(
+                            SeatingComfort.VERY_COMFORTABLE,
+                            SeatingComfort.COMFORTABLE,
+                            SeatingComfort.OKAY,
+                            SeatingComfort.UNCOMFORTABLE
+                        ),
+                        optionLabel = { it.label },
+                        onSelected = { selected -> draftFilters = draftFilters.copy(seatingComfort = selected) }
+                    )
+                }
+                item {
+                    MapFilterChipGroup(
+                        label = "Crowd level",
+                        selected = draftFilters.crowdLevel,
+                        options = listOf(
+                            CrowdLevel.EMPTY,
+                            CrowdLevel.LIGHT,
+                            CrowdLevel.MODERATE,
+                            CrowdLevel.BUSY,
+                            CrowdLevel.PACKED
+                        ),
+                        optionLabel = { it.label },
+                        onSelected = { selected -> draftFilters = draftFilters.copy(crowdLevel = selected) }
+                    )
+                }
+                item {
+                    MapFilterChipGroup(
+                        label = "Noise level",
+                        selected = draftFilters.noiseLevel,
+                        options = listOf(
+                            NoiseLevel.SILENT,
+                            NoiseLevel.QUIET,
+                            NoiseLevel.MODERATE,
+                            NoiseLevel.LOUD,
+                            NoiseLevel.VERY_LOUD
+                        ),
+                        optionLabel = { it.label },
+                        onSelected = { selected -> draftFilters = draftFilters.copy(noiseLevel = selected) }
+                    )
+                }
+                item {
+                    MapFilterChipGroup(
+                        label = "Pet friendly",
+                        selected = draftFilters.petFriendly,
+                        options = listOf(
+                            PetFriendly.INDOOR_ALLOWED,
+                            PetFriendly.PATIO_ONLY,
+                            PetFriendly.NOT_ALLOWED
+                        ),
+                        optionLabel = { it.label },
+                        onSelected = { selected -> draftFilters = draftFilters.copy(petFriendly = selected) }
+                    )
+                }
+                item {
+                    MapFilterChipGroup(
+                        label = "Cleanliness",
+                        selected = draftFilters.cleanlinessRating,
+                        options = listOf(
+                            CleanlinessRating.GREAT,
+                            CleanlinessRating.GOOD,
+                            CleanlinessRating.OKAY,
+                            CleanlinessRating.POOR
+                        ),
+                        optionLabel = { it.label },
+                        onSelected = { selected -> draftFilters = draftFilters.copy(cleanlinessRating = selected) }
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                OutlinedButton(
+                    onClick = onClearFilters,
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.outlinedButtonColors(contentColor = CafeDark),
+                    border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.38f))
+                ) {
+                    Icon(Icons.Filled.Clear, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Clear")
+                }
+                Button(
+                    onClick = { onApplyFilters(draftFilters) },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = CafeDark,
+                        contentColor = Color.White
+                    )
+                ) {
+                    Icon(Icons.Filled.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text("Apply")
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun <T> MapFilterChipGroup(
+    label: String,
+    selected: T?,
+    options: List<T>,
+    optionLabel: (T) -> String,
+    onSelected: (T?) -> Unit
+) {
+    val chipColors = FilterChipDefaults.filterChipColors(
+        containerColor = CoffeeLight,
+        labelColor = CafeDark,
+        selectedContainerColor = BottomNavToolbarColor,
+        selectedLabelColor = Color.Black
+    )
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.titleSmall,
+            fontWeight = FontWeight.SemiBold,
+            color = CafeDark
+        )
+        WrappingBubbleRow(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalSpacing = 8.dp,
+            verticalSpacing = 8.dp
+        ) {
+            MapFilterChip(
+                text = "Any",
+                selected = selected == null,
+                colors = chipColors,
+                onClick = { onSelected(null) }
+            )
+            options.forEach { option ->
+                val isSelected = selected == option
+                MapFilterChip(
+                    text = optionLabel(option),
+                    selected = isSelected,
+                    colors = chipColors,
+                    onClick = { onSelected(if (isSelected) null else option) }
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun MapFilterChip(
+    text: String,
+    selected: Boolean,
+    colors: SelectableChipColors,
+    onClick: () -> Unit
+) {
+    FilterChip(
+        selected = selected,
+        onClick = onClick,
+        label = {
+            Text(
+                text = text,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        },
+        shape = RoundedCornerShape(8.dp),
+        colors = colors,
+        border = FilterChipDefaults.filterChipBorder(
+            enabled = true,
+            selected = selected,
+            borderColor = CoffeeDark.copy(alpha = 0.24f),
+            selectedBorderColor = CafeDark,
+            borderWidth = 1.dp,
+            selectedBorderWidth = 1.dp
+        )
+    )
+}
+
+@Composable
+private fun MapFilterEmptyMessage(
+    onClearFilters: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(18.dp),
+        color = CoffeeSurfaceLight.copy(alpha = 0.98f),
+        contentColor = CafeDark,
+        tonalElevation = 8.dp,
+        shadowElevation = 8.dp,
+        border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.14f))
+    ) {
+        Row(
+            modifier = Modifier.padding(start = 14.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Text(
+                text = "No cafes match these filters",
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = CafeDark
+            )
+            TextButton(
+                onClick = onClearFilters,
+                colors = ButtonDefaults.textButtonColors(contentColor = CafeDark)
+            ) {
+                Text("Clear")
             }
         }
     }
