@@ -2293,7 +2293,12 @@ object ReviewRepository {
     suspend fun deleteReview(review: Review) {
         supabase.from("reviews").delete { filter { eq("id", review.id) } }
         reviewsByCafe[review.cafe_id]?.remove(review)
+        myReviewsList.removeAll { it.id == review.id }
     }
+}
+
+object BookmarkNavState {
+    var requestShowAll by mutableStateOf(false)
 }
 
 class MainActivity : ComponentActivity() {
@@ -3943,6 +3948,13 @@ fun BookmarkScreen(navController: NavHostController) {
             if (loadingStudySessionCafeId == cafeId) {
                 loadingStudySessionCafeId = null
             }
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        if (BookmarkNavState.requestShowAll) {
+            showAllSaved = true
+            BookmarkNavState.requestShowAll = false
         }
     }
 
@@ -10804,6 +10816,8 @@ private fun ProfileStatPanel(
     val cream = Color(0xFFF6E9D8)
     val lightBrown = Color(0xFFEAD7CE)
     val darkBrown = Color(0xFF694B2E)
+    var reviewPendingDelete by remember { mutableStateOf<Review?>(null) }
+    val deleteReviewScope = rememberCoroutineScope()
 
     val title = when (activeStat) {
         "saved" -> "SAVED CAFES"
@@ -10931,15 +10945,19 @@ private fun ProfileStatPanel(
                             if (savedCafes.size > 5) {
                                 TextButton(
                                     onClick = {
-                                        navController.navigate(Screen.BookmarkScreen.route)
+                                        BookmarkNavState.requestShowAll = true
+                                        navController.navigate(Screen.BookmarkScreen.route) {
+                                            popUpTo(navController.graph.findStartDestination().id) {
+                                                saveState = true
+                                            }
+                                            launchSingleTop = true
+                                            restoreState = true
+                                        }
                                     },
                                     colors = ButtonDefaults.textButtonColors(contentColor = caramel),
                                     modifier = Modifier.align(Alignment.End)
                                 ) {
-                                    Text(
-                                        "View all ${savedCafes.size}",
-                                        style = MaterialTheme.typography.labelSmall
-                                    )
+                                    Text("View all ${savedCafes.size}", style = MaterialTheme.typography.labelSmall)
                                 }
                             }
                         }
@@ -11021,7 +11039,13 @@ private fun ProfileStatPanel(
                             if (studySessions.size > 5) {
                                 TextButton(
                                     onClick = {
-                                        navController.navigate(Screen.BookmarkScreen.route)
+                                        navController.navigate(Screen.BookmarkScreen.route) {
+                                            popUpTo(navController.graph.findStartDestination().id) {
+                                                saveState = true
+                                            }
+                                            launchSingleTop = true
+                                            restoreState = true
+                                        }
                                     },
                                     colors = ButtonDefaults.textButtonColors(contentColor = caramel),
                                     modifier = Modifier.align(Alignment.End)
@@ -11091,11 +11115,7 @@ private fun ProfileStatPanel(
                                         )
                                     }
                                     IconButton(
-                                        onClick = {
-                                            deleteScope.launch {
-                                                runCatching { ReviewRepository.deleteReview(review) }
-                                            }
-                                        },
+                                        onClick = { reviewPendingDelete = review },
                                         modifier = Modifier.size(32.dp)
                                     ) {
                                         Icon(
@@ -11116,7 +11136,46 @@ private fun ProfileStatPanel(
             }
         }
     }
+
+    reviewPendingDelete?.let { pendingReview ->
+        AlertDialog(
+            onDismissRequest = { reviewPendingDelete = null },
+            title = { Text("Delete review?", color = darkBrown) },
+            text = {
+                Text(
+                    "This will permanently remove your review. This cannot be undone.",
+                    color = darkBrown.copy(alpha = 0.95f),
+                    style = MaterialTheme.typography.bodySmall
+                )
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val reviewToDelete = pendingReview
+                        reviewPendingDelete = null
+                        deleteReviewScope.launch {
+                            runCatching { ReviewRepository.deleteReview(reviewToDelete) }
+                        }
+                    },
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = Color.Red.copy(alpha = 0.82f),
+                        contentColor = Color.White
+                    )
+                ) {
+                    Text("Delete")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { reviewPendingDelete = null }) {
+                    Text("Cancel", color = caramel)
+                }
+            },
+            containerColor = Color(0xFFF6E9D8),
+            shape = RoundedCornerShape(16.dp)
+        )
+    }
 }
+
 
 
 @Composable
@@ -11387,9 +11446,12 @@ data class UserPreferences(
     val wifi_importance: Int
 )
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun PreferencesScreen(navController: NavHostController) {
     val scope = rememberCoroutineScope()
+    val previousRoute = navController.previousBackStackEntry?.destination?.route
+    val isEditingFromProfile = previousRoute == Screen.ProfileScreen.route
 
     var noise by remember { mutableIntStateOf(3) }
     var outlet by remember { mutableIntStateOf(3) }
@@ -11445,6 +11507,25 @@ fun PreferencesScreen(navController: NavHostController) {
 
     Scaffold(
         containerColor = backgroundColor,
+        topBar = {
+            if (isEditingFromProfile) {
+                TopAppBar(
+                    title = {},
+                    navigationIcon = {
+                        IconButton(onClick = { navController.popBackStack() }) {
+                            Icon(
+                                Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "Back",
+                                tint = Color.Black
+                            )
+                        }
+                    },
+                    colors = TopAppBarDefaults.topAppBarColors(
+                        containerColor = backgroundColor
+                    )
+                )
+            }
+        },
         bottomBar = { BottomNavBar(navController) }
     ) { padding ->
 
@@ -11523,8 +11604,11 @@ fun PreferencesScreen(navController: NavHostController) {
                                     supabase.from("user_preferences").insert(prefs)
                                 }
 
-                                navController.navigate(Screen.MainScreen.route) { popUpTo(0) }
-                            } catch (e: Exception) {
+                                if (isEditingFromProfile) {
+                                    navController.popBackStack()
+                                } else {
+                                    navController.navigate(Screen.MainScreen.route) { popUpTo(0) }
+                                }} catch (e: Exception) {
                                 e.printStackTrace()
                             }
                         }
