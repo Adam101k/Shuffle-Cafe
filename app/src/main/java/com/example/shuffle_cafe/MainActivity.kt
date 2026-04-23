@@ -2452,6 +2452,7 @@ private fun ShuffleCafeLoadingAnimation(modifier: Modifier = Modifier) {
     }
 }
 
+@SuppressLint("UnusedBoxWithConstraintsScope")
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen(navController: NavHostController) {
@@ -3532,7 +3533,7 @@ fun MapScreen(navController: NavHostController) {
                     defaultCamera.move(
                         CameraUpdateFactory.newLatLngZoom(
                             LatLng(location.latitude, location.longitude),
-                            17f
+                            14f
                         )
                     )
                 }
@@ -4457,6 +4458,7 @@ private fun CafeDetailDataEffect(
     }
 }
 
+@SuppressLint("UnusedBoxWithConstraintsScope")
 @Composable
 private fun DetailInfoBubble(
     iconRes: Int,
@@ -4744,6 +4746,7 @@ private fun CardInfoBubble(
     )
 }
 
+@SuppressLint("UnusedBoxWithConstraintsScope")
 @Composable
 private fun CardTodayHoursBubble(
     hours: LinkedHashMap<String, String>,
@@ -4976,6 +4979,7 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
     }
 }
 
+@SuppressLint("UnusedBoxWithConstraintsScope")
 @Composable
 fun HoursDropdown(hours: LinkedHashMap<String, String>) {
     val displayHours = remember(hours) {
@@ -5157,6 +5161,7 @@ private fun String.shortCafeId(): String {
     return if (length <= 14) this else "${take(14)}..."
 }
 
+@SuppressLint("UnusedBoxWithConstraintsScope")
 @Composable
 private fun CafeCrowdAttributesPanel(
     cafe: Cafe,
@@ -9224,6 +9229,7 @@ fun BottomNavBar(navController: NavHostController, enabled: Boolean = true, dimF
     )
 }
 
+@SuppressLint("UnusedBoxWithConstraintsScope")
 @Composable
 private fun FloatingBottomNavBar(
     navController: NavHostController,
@@ -9369,6 +9375,7 @@ data class Profile(
 fun ProfileScreen(navController: NavHostController) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val placesClient = remember(context) { if (Places.isInitialized()) Places.createClient(context) else null }
 
     var profile by remember { mutableStateOf<Profile?>(null) }
     var bioText by remember { mutableStateOf("") }
@@ -9385,6 +9392,11 @@ fun ProfileScreen(navController: NavHostController) {
 
     // "saved" | "sessions" | "reviews" | null
     var activeStat by remember { mutableStateOf<String?>(null) }
+    var selectedRecentCafeId by rememberSaveable { mutableStateOf<String?>(null) }
+    var recentOverlayCafe by remember { mutableStateOf<Cafe?>(null) }
+    val detailProgress = remember { Animatable(0f) }
+    val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
+    val detailScrimInteractionSource = remember { MutableInteractionSource() }
 
     val savedCafes = BookmarkRepository.cafes()
 
@@ -9398,6 +9410,33 @@ fun ProfileScreen(navController: NavHostController) {
     val savedCount = savedCafes.size
     val studySessionCount = studySessions.size
     val reviewCount = savedCafes.sumOf { ReviewRepository.reviewsFor(it.id).size }
+    val selectedRecentCafe = selectedRecentCafeId?.let { cafeId -> CafeRepository.getCafe(cafeId) }
+    CafeDetailDataEffect(cafe = selectedRecentCafe, placesClient = placesClient)
+
+    LaunchedEffect(selectedRecentCafe) {
+        if (selectedRecentCafe != null) {
+            recentOverlayCafe = selectedRecentCafe
+        }
+    }
+
+    LaunchedEffect(selectedRecentCafeId) {
+        if (selectedRecentCafeId != null) {
+            detailProgress.animateTo(
+                targetValue = 1f,
+                animationSpec = tween(durationMillis = 320, easing = FastOutSlowInEasing)
+            )
+        } else if (recentOverlayCafe != null || detailProgress.value > 0f) {
+            detailProgress.animateTo(
+                targetValue = 0f,
+                animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing)
+            )
+            recentOverlayCafe = null
+        }
+    }
+
+    BackHandler(enabled = selectedRecentCafeId != null) {
+        selectedRecentCafeId = null
+    }
 
     val heroBg = Color(0xFF4A231C)
     val caramel = Color(0xFFC5A07D)
@@ -9476,16 +9515,23 @@ fun ProfileScreen(navController: NavHostController) {
         return
     }
 
-    Scaffold(
-        bottomBar = { BottomNavBar(navController) },
-        containerColor = cream
-    ) { innerPadding ->
-        LazyColumn(
-            modifier = Modifier
-                .padding(innerPadding)
-                .fillMaxSize(),
-            contentPadding = PaddingValues(bottom = 28.dp)
-        ) {
+    Box(modifier = Modifier.fillMaxSize()) {
+        Scaffold(
+            bottomBar = {
+                BottomNavBar(
+                    navController = navController,
+                    enabled = detailProgress.value < 0.01f,
+                    dimFraction = detailProgress.value
+                )
+            },
+            containerColor = cream
+        ) { innerPadding ->
+            LazyColumn(
+                modifier = Modifier
+                    .padding(innerPadding)
+                    .fillMaxSize(),
+                contentPadding = PaddingValues(bottom = 28.dp)
+            ) {
             item {
                 Box(
                     modifier = Modifier
@@ -9816,9 +9862,9 @@ fun ProfileScreen(navController: NavHostController) {
                                 modifier = Modifier
                                     .fillMaxWidth()
                                     .clickable {
-                                        navController.navigate(
-                                            Screen.CafeDetails.createRoute(cafe.id)
-                                        )
+                                        RecentRepository.add(cafe.id)
+                                        recentOverlayCafe = cafe
+                                        selectedRecentCafeId = cafe.id
                                     }
                                     .padding(vertical = 9.dp),
                                 verticalAlignment = Alignment.CenterVertically
@@ -9900,6 +9946,69 @@ fun ProfileScreen(navController: NavHostController) {
                     )
                 }
             }
+            }
+        }
+
+        val detailCafe = recentOverlayCafe
+        if (detailCafe != null && detailProgress.value > 0f) {
+            val scrimAlpha by animateFloatAsState(
+                targetValue = 0.2f * detailProgress.value,
+                animationSpec = tween(durationMillis = 120, easing = FastOutSlowInEasing),
+                label = "profileRecentDetailScrimAlpha"
+            )
+            val overlayScale by animateFloatAsState(
+                targetValue = 0.94f + (0.06f * detailProgress.value),
+                animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
+                label = "profileRecentDetailOverlayScale"
+            )
+
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .zIndex(20f)
+                    .background(Color.Black.copy(alpha = scrimAlpha))
+                    .clickable(
+                        interactionSource = detailScrimInteractionSource,
+                        indication = null
+                    ) {
+                        selectedRecentCafeId = null
+                    }
+            )
+
+            ExpandedCafeDetailOverlay(
+                navController = navController,
+                cafe = detailCafe,
+                onClose = { selectedRecentCafeId = null },
+                cornerRadius = lerp(
+                    detailOverlayLayoutSpec.collapsedCornerRadius,
+                    detailOverlayLayoutSpec.expandedCornerRadius,
+                    detailProgress.value
+                ),
+                heroHeight = lerp(
+                    detailOverlayLayoutSpec.collapsedHeroHeight,
+                    detailOverlayLayoutSpec.expandedHeroHeight,
+                    detailProgress.value
+                ),
+                sharedHeroModel = detailCafe.primaryImageModel(),
+                transitionProgress = detailProgress.value,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .zIndex(21f)
+                    .statusBarsPadding()
+                    .navigationBarsPadding()
+                    .padding(
+                        start = detailOverlayLayoutSpec.horizontalInset,
+                        end = detailOverlayLayoutSpec.horizontalInset,
+                        top = detailOverlayLayoutSpec.topInset,
+                        bottom = detailOverlayLayoutSpec.bottomInset
+                    )
+                    .fillMaxWidth()
+                    .graphicsLayer {
+                        alpha = detailProgress.value
+                        scaleX = overlayScale
+                        scaleY = overlayScale
+                    }
+            )
         }
     }
     if (isEditingName) {
