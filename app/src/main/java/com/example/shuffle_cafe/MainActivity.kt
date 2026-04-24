@@ -42,29 +42,37 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.CardDefaults
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -98,6 +106,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
@@ -3887,6 +3896,7 @@ fun MapScreen(navController: NavHostController) {
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun BookmarkScreen(navController: NavHostController) {
+    val cream = Color(0xFFF6E9D8)
     val context = LocalContext.current
     val placesClient = remember(context) { if (Places.isInitialized()) Places.createClient(context) else null }
     val scope = rememberCoroutineScope()
@@ -3992,7 +4002,7 @@ fun BookmarkScreen(navController: NavHostController) {
                     dimFraction = detailProgress.value
                 )
             },
-            containerColor = CoffeeLight
+            containerColor = cream
         ) { innerPadding ->
             LazyColumn(
                 modifier = Modifier
@@ -4181,15 +4191,28 @@ fun SavedCafeRow(
 
 @Composable
 private fun SavedSectionHeading(title: String) {
-    val outlineColor = Color(0xFFE6E6E6)
-    Text(title, fontWeight = FontWeight.SemiBold)
-    Spacer(Modifier.height(4.dp))
+    val caramel = Color(0xFFC5A07D)
+    val lightBrown = Color(0xFFEAD7CE)
     Box(
-        Modifier
-            .width(80.dp)
-            .height(1.dp)
-            .background(outlineColor)
-    )
+        modifier = Modifier
+            .wrapContentWidth()
+            .shadow(
+                elevation = 6.dp,
+                shape = RoundedCornerShape(16.dp),
+                clip = false
+            )
+            .background(
+                color = caramel,
+                shape = RoundedCornerShape(10.dp)
+            )
+            .padding(horizontal = 12.dp, vertical = 6.dp)
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleMedium,
+            color = lightBrown
+        )
+    }
 }
 
 private val CardTopControlHorizontalPadding = 16.dp
@@ -7915,123 +7938,326 @@ private fun PlaceSaved(
     onSavedCafeSelected: (Cafe) -> Unit,
     onStudySessionSelected: (StudySession) -> Unit
 ) {
-    val outlineColor = Color(0xFFE6E6E6)
+    var showDialog by remember { mutableStateOf(false) }
+    var showDialog2 by remember { mutableStateOf(false) }
+    val rowState = rememberLazyListState()
+    val columnState = rememberLazyListState()
+
+    val heroBg = Color(0xFF4A231C)
+    val lightBrown = Color(0xFFEAD7CE)
+    val darkBrown = Color(0xFF694B2E)
     val studySessions = StudySessionRepository.sessions()
-    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(22.dp)) {
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(20.dp)
+    ) {
         Column {
-            SavedSectionHeading("Saved")
-            Spacer(Modifier.height(10.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (savedCafes.isEmpty()) {
-                    SavedTile(Modifier.weight(1f))
-                    SavedTile(Modifier.weight(1f))
-                    SavedTile(Modifier.weight(1f), true)
-                } else {
-                    savedCafes.take(3).forEach { cafe ->
-                        SavedCafeTile(
-                            cafe = cafe,
-                            onOpen = { onSavedCafeSelected(cafe) },
-                            modifier = Modifier.weight(1f)
-                        )
+            Row (
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row {
+                    SavedSectionHeading("Saved")
+
+                    Spacer(Modifier.width(6.dp))
+
+                    Text(
+                        text = "(${savedCafes.size})",
+                        fontSize = 15.sp,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 6.dp)
+                    )
+                }
+                Text(
+                    text = "View All",
+                    textDecoration = TextDecoration.Underline,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.clickable {
+                        showDialog = true
                     }
-                    if (savedCafes.size < 3) {
-                        repeat(3 - savedCafes.size) { index ->
-                            if (savedCafes.size + index == 2) {
-                                SavedTile(Modifier.weight(1f), true)
-                            } else {
-                                SavedTile(Modifier.weight(1f))
+                )
+                if (showDialog) {
+                    Dialog(onDismissRequest = { showDialog = false }) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(1f)
+                                .fillMaxHeight(1f)
+                                .wrapContentHeight()
+                                .background(Color.White, RoundedCornerShape(16.dp))
+                                .padding(16.dp)
+                        ) {
+                            Column {
+                                Text(
+                                    text = "Saved Cafes",
+                                    textAlign = TextAlign.Center,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = darkBrown
+                                )
+
+                                Spacer(Modifier.height(12.dp))
+
+                                if (savedCafes.isEmpty()) {
+                                    Text("No saved places yet.")
+                                } else {
+                                    Column(
+                                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                                        modifier = Modifier.heightIn(max = 200.dp)
+                                    ) {
+                                        savedCafes.forEach { cafe ->
+                                            SavedCafeRow(
+                                                cafe = cafe,
+                                                onOpen = { onSavedCafeSelected(cafe) },
+                                                onRemove = { BookmarkRepository.remove(cafe.id) },
+                                            )
+                                        }
+                                    }
+                                }
+                                Spacer(Modifier.height(20.dp))
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Button(
+                                        onClick = { },
+                                        shape = CircleShape,
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = darkBrown
+                                        ),
+                                        contentPadding = PaddingValues(0.dp),
+                                        modifier = Modifier.size(40.dp)
+                                    ) {
+                                        Text(
+                                            text = "+",
+                                            color = Color.White,
+                                            fontSize = 20.sp
+                                        )
+                                    }
+                                    TextButton(onClick = { showDialog = false }) {
+                                        Text("Close")
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+            }
+
+            Spacer(Modifier.height(10.dp))
+
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .shadow(
+                        elevation = 6.dp,
+                        shape = RoundedCornerShape(16.dp),
+                        clip = false
+                    )
+                    .border(
+                        width = 1.dp,
+                        color = heroBg,
+                        shape = RoundedCornerShape(12.dp)
+                    )
+                    .background(
+                        color = lightBrown,
+                        shape = RoundedCornerShape(16.dp)
+                    )
+                    .padding(12.dp)
+            ) {
+                LazyRow(
+                    state = rowState,
+                    flingBehavior = rememberSnapFlingBehavior(lazyListState = rowState),
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    items (1) {index ->
+                        SavedTile(
+                            modifier = Modifier.width(120.dp),
+                            true
+                        )
+
+                    }
+                    if (savedCafes.isEmpty()) {
+                        items(2) { index ->
+                            SavedTile(
+                                modifier = Modifier.width(120.dp),
+                            )
+                        }
+                    } else {
+                        items(savedCafes.reversed().take(10)) { cafe ->
+                            SavedCafeTile(
+                                cafe = cafe,
+                                onOpen = { onSavedCafeSelected(cafe) },
+                                modifier = Modifier.width(120.dp)
+                            )
+                        }
+
+                    }
+                }
+            }
+        }
+            Spacer(Modifier.height(12.dp))
+        }
+        Column {
+            Row (
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Row {
+                    SavedSectionHeading("Study Plan")
+
+                    Spacer(Modifier.width(6.dp))
+
+                    Text(
+                        text = "(${studySessions.size})",
+                        fontSize = 15.sp,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(top = 6.dp)
+                    )
+                }
+                Text(
+                    text = "View All",
+                    textDecoration = TextDecoration.Underline,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.clickable {
+                        showDialog2 = true
+                    }
+                )
+                if (showDialog2) {
+                    Dialog(onDismissRequest = { showDialog2 = false }) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth(1f)
+                                .fillMaxHeight(1f)
+                                .wrapContentHeight()
+                                .background(Color.White, RoundedCornerShape(16.dp))
+                                .padding(16.dp)
+                        ) {
+                            Column {
+                                Text(
+                                    text = "Study Plans",
+                                    textAlign = TextAlign.Center,
+                                    style = MaterialTheme.typography.titleMedium,
+                                    color = darkBrown
+                                )
+
+                                Spacer(Modifier.height(12.dp))
+
+                                if (studySessions.isEmpty()) {
+                                    Text("No saved sessions yet.")
+                                } else {
+                                    Column(
+                                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                                        modifier = Modifier.heightIn(max = 200.dp)
+                                    ) {
+                                        studySessions.forEach { session ->
+                                            StudySessionSavedCard(
+                                                session = session,
+                                                onOpen = { onStudySessionSelected(session) },
+                                                onDelete = { StudySessionRepository.remove(session.id) }
+                                            )
+                                        }
+                                    }
+                                }
+                                Spacer(Modifier.height(20.dp))
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.SpaceBetween
+                                ) {
+                                    Button(
+                                        onClick = { },
+                                        shape = CircleShape,
+                                        colors = ButtonDefaults.buttonColors(
+                                            containerColor = darkBrown
+                                        ),
+                                        contentPadding = PaddingValues(0.dp),
+                                        modifier = Modifier.size(40.dp)
+                                    ) {
+                                        Text(
+                                            text = "+",
+                                            color = Color.White,
+                                            fontSize = 20.sp
+                                        )
+                                    }
+                                    TextButton(onClick = { showDialog2 = false }) {
+                                        Text("Close")
+                                    }
+                                }
                             }
                         }
                     }
                 }
             }
-            Spacer(Modifier.height(12.dp))
-            OutlinedButton(
-                onClick = onToggleShowAllSaved,
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.outlinedButtonColors(
-                    containerColor = CoffeeDark,
-                    contentColor = Color.White
-                ),
-                border = BorderStroke(1.dp, CoffeeDark)
-            ) {
-                Text(if (showAllSaved) "Hide saved" else "Show all saved")
-            }
-            if (showAllSaved) {
-                Spacer(Modifier.height(12.dp))
-                if (savedCafes.isEmpty()) {
-                    OutlinedCard(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = CardDefaults.outlinedCardColors(
-                            containerColor = CoffeeSurfaceLight,
-                            contentColor = CafeDark
-                        ),
-                        border = BorderStroke(1.dp, outlineColor)
-                    ) {
-                        Text(
-                            text = "No saved places yet. Swipe right on a cafe to add it here.",
-                            modifier = Modifier.padding(16.dp),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = CoffeeDark.copy(alpha = 0.78f)
+                Spacer(Modifier.height(10.dp))
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .shadow(
+                            elevation = 6.dp,
+                            shape = RoundedCornerShape(16.dp),
+                            clip = false
                         )
-                    }
-                } else {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        savedCafes.forEach { cafe ->
-                            SavedCafeRow(
-                                cafe = cafe,
-                                onOpen = { onSavedCafeSelected(cafe) },
-                                onRemove = { BookmarkRepository.remove(cafe.id) }
-                            )
+                        .border(
+                            width = 1.dp,
+                            color = heroBg,
+                            shape = RoundedCornerShape(12.dp)
+                        )
+                        .background(
+                            color = lightBrown,
+                            shape = RoundedCornerShape(16.dp)
+                        )
+                        .padding(12.dp)
+                ) {
+                    LazyColumn(
+                        state = columnState,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .heightIn(max = 120.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        if (studySessions.isEmpty()) {
+                            items(3) { index ->
+                                SavedTile(
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                            }
+                        } else {
+                            items(studySessions.reversed().take(10)) { session ->
+                                StudySessionSavedCard (
+                                    session = session,
+                                    onOpen = { onStudySessionSelected(session) },
+                                    onDelete = { StudySessionRepository.remove(session.id) }
+                                )
+                            }
+
                         }
                     }
                 }
-            }
         }
-        Column {
-            SavedSectionHeading("Collection")
-            Spacer(Modifier.height(10.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Column(Modifier.weight(1f)) {
-                    SavedTile()
-                    Text("Good Coffee", style = MaterialTheme.typography.bodySmall)
-                }
-                Column(Modifier.weight(1f)) {
-                    SavedTile()
-                    Text("Quiet Area", style = MaterialTheme.typography.bodySmall)
-                }
-                SavedTile(Modifier.weight(1f), true)
-            }
-        }
-        Column {
-            SavedSectionHeading("Study Plan")
-            Spacer(Modifier.height(10.dp))
-            if (studySessions.isEmpty()) {
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    SavedTile(Modifier.weight(1f))
-                    SavedTile(Modifier.weight(1f))
-                    SavedTile(Modifier.weight(1f), true)
-                }
-            } else {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    studySessions.forEach { session ->
-                        StudySessionSavedCard(
-                            session = session,
-                            onOpen = { onStudySessionSelected(session) },
-                            onDelete = { StudySessionRepository.remove(session.id) }
-                        )
-                    }
-                }
-            }
-        }
-    }
+
 }
+
 
 @Composable
 fun SavedTile(modifier: Modifier = Modifier, plus: Boolean = false) {
     val outlineColor = Color(0xFFE6E6E6)
-    OutlinedCard(modifier.aspectRatio(1f), shape = RoundedCornerShape(4.dp), border = BorderStroke(1.dp, outlineColor)) { Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { if (plus) Text("+", style = MaterialTheme.typography.headlineLarge) } }
+    OutlinedCard(
+        modifier = modifier.aspectRatio(1f),
+        shape = RoundedCornerShape(12.dp),
+        border = BorderStroke(1.dp, outlineColor)
+    ) {
+        Box(
+        modifier = Modifier
+            .fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        if (plus) Text("+", style = MaterialTheme.typography.headlineLarge) } }
 }
 
 @Composable
@@ -8464,11 +8690,13 @@ fun SavedCafeTile(cafe: Cafe, onOpen: () -> Unit, modifier: Modifier = Modifier)
     val outlineColor = Color(0xFFE6E6E6)
     OutlinedCard(
         modifier = modifier.aspectRatio(1f),
-        shape = RoundedCornerShape(4.dp),
+        shape = RoundedCornerShape(12.dp),
         border = BorderStroke(1.dp, outlineColor)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            Box(modifier = Modifier.fillMaxSize().clickable { onOpen() }) {
+            Box(modifier = Modifier
+                .fillMaxSize()
+                .clickable { onOpen() }) {
                 AsyncImage(
                     model = cafe.primaryImageModel(),
                     contentDescription = cafe.name,
@@ -8482,6 +8710,7 @@ fun SavedCafeTile(cafe: Cafe, onOpen: () -> Unit, modifier: Modifier = Modifier)
             ) {
                 Icon(Icons.Filled.Bookmark, contentDescription = "Remove", tint = Color.White)
             }
+
         }
     }
 }
