@@ -9299,6 +9299,20 @@ private fun StudySessionComposerOverlay(
         isVisible = true
     }
 
+    fun resetDraft() {
+        title = ""
+        className = ""
+        selectedDateUtcMillis = null
+        selectedStartHour = null
+        selectedStartMinute = null
+        selectedEndHour = null
+        selectedEndMinute = null
+        summary = ""
+        showDatePicker = false
+        activeTimeField = null
+        selectedPhotoUris = emptyList()
+    }
+
     fun closeComposer() {
         if (isClosing) return
         isClosing = true
@@ -9579,6 +9593,7 @@ private fun StudySessionComposerOverlay(
                     Button(
                         onClick = {
                             StudySessionRepository.add(cafe, draft)?.let {
+                                resetDraft()
                                 closeComposer()
                             }
                         },
