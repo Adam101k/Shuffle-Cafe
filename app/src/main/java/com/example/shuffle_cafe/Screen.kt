@@ -16,4 +16,6 @@ sealed class Screen(val route: String) {
         fun createRoute(cafeId: String) = "write_review/$cafeId"
     }
     object LoginScreen: Screen("login_screen")
+
+    object MyReviews : Screen("my_reviews")
 }

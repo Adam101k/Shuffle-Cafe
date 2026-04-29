@@ -2307,7 +2307,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
         if (!Places.isInitialized()) {
-            Places.initializeWithNewPlacesApiEnabled(applicationContext, "AIzaSyC7QTmdJE2fnRXMiKWrMZftkXIG20gNWrA")
+            Places.initializeWithNewPlacesApiEnabled(applicationContext, "AIzaSyBLhYB1SLfj7E9addvptf4iCWO_XNtsQZA")
         }
         CafeRepository.initialize(applicationContext)
         BookmarkRepository.initialize(applicationContext)
