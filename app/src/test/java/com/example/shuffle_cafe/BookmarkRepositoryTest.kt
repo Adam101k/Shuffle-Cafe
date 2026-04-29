@@ -113,6 +113,61 @@ class BookmarkRepositoryTest {
         assertFalse(isBookmarkCacheDataIncomplete(snapshot.single()))
     }
 
+    @Test
+    fun savedCafeNoteCanBeSavedAndUpdated() {
+        SavedCafeNotesRepository.save("note-cafe", "Quiet corner table")
+
+        assertEquals("Quiet corner table", SavedCafeNotesRepository.noteFor("note-cafe"))
+
+        SavedCafeNotesRepository.save("note-cafe", "Best outlets by the window")
+
+        assertEquals("Best outlets by the window", SavedCafeNotesRepository.noteFor("note-cafe"))
+    }
+
+    @Test
+    fun blankSavedCafeNoteRemovesExistingNote() {
+        SavedCafeNotesRepository.save("blank-note", "Try the seasonal latte")
+
+        SavedCafeNotesRepository.save("blank-note", "   ")
+
+        assertNull(SavedCafeNotesRepository.noteFor("blank-note"))
+    }
+
+    @Test
+    fun removingBookmarkClearsSavedCafeNote() {
+        val savedCafe = testCafe(id = "remove-note")
+        CafeRepository.cacheCafes(listOf(savedCafe))
+        BookmarkRepository.add(savedCafe.id)
+        SavedCafeNotesRepository.save(savedCafe.id, "Good for afternoon study")
+
+        BookmarkRepository.remove(savedCafe.id)
+
+        assertNull(SavedCafeNotesRepository.noteFor(savedCafe.id))
+    }
+
+    @Test
+    fun togglingBookmarkOffClearsSavedCafeNote() {
+        val savedCafe = testCafe(id = "toggle-note")
+        CafeRepository.cacheCafes(listOf(savedCafe))
+        BookmarkRepository.add(savedCafe.id)
+        SavedCafeNotesRepository.save(savedCafe.id, "Crowded after lunch")
+
+        BookmarkRepository.toggle(savedCafe.id)
+
+        assertFalse(BookmarkRepository.isBookmarked(savedCafe.id))
+        assertNull(SavedCafeNotesRepository.noteFor(savedCafe.id))
+    }
+
+    @Test
+    fun savedCafeNotesResetClearsState() {
+        SavedCafeNotesRepository.save("reset-note", "Keep this until reset")
+
+        SavedCafeNotesRepository.resetForTest()
+
+        assertNull(SavedCafeNotesRepository.noteFor("reset-note"))
+        assertTrue(SavedCafeNotesRepository.notesSnapshotForTest().isEmpty())
+    }
+
     private fun testCafe(
         id: String,
         phone: String = "555-0100",

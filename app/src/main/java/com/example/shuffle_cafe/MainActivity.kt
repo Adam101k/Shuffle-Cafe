@@ -42,29 +42,36 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.ArrowForward
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
+import androidx.compose.material3.CardDefaults
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -98,6 +105,7 @@ import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.Density
 import androidx.compose.ui.unit.IntOffset
@@ -183,6 +191,7 @@ import kotlin.math.cos
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
+import kotlin.random.Random
 
 import io.github.jan.supabase.auth.Auth
 import io.github.jan.supabase.createSupabaseClient
@@ -359,6 +368,9 @@ private const val CAFE_CACHE_METADATA_MAP_VIEWPORT_KEY = "metadata_map_viewport_
 private const val CAFE_CACHE_METADATA_MAP_CITY_NAME = "metadata_map_city_name"
 private const val BOOKMARK_CACHE_PREFS_NAME = "shuffle_cafe_bookmark_cache"
 private const val BOOKMARK_CACHE_ENTRY_KEY = "saved_bookmark_cafes"
+private const val SAVED_CAFE_NOTES_PREFS_NAME = "shuffle_cafe_saved_cafe_notes"
+private const val SAVED_CAFE_NOTES_ENTRY_KEY = "saved_cafe_notes"
+private const val SAVED_CAFE_NOTE_MAX_CHARS = 140
 private const val CARD_STACK_PROGRESS_PREFS_NAME = "shuffle_cafe_card_stack_progress"
 private const val CARD_STACK_TOP_CAFE_ID_KEY = "top_cafe_id"
 private const val CAFE_CACHE_MAX_CAFES_PER_ENTRY = 20
@@ -1214,6 +1226,45 @@ private object BookmarkCacheStore {
     }
 }
 
+private object SavedCafeNotesStore {
+    private val json = Json {
+        ignoreUnknownKeys = true
+        encodeDefaults = true
+    }
+
+    private fun prefs(context: Context): SharedPreferences {
+        return context.applicationContext.getSharedPreferences(SAVED_CAFE_NOTES_PREFS_NAME, Context.MODE_PRIVATE)
+    }
+
+    fun load(context: Context): Map<String, String> {
+        return runCatching {
+            val encoded = prefs(context).getString(SAVED_CAFE_NOTES_ENTRY_KEY, null)
+                ?: return@runCatching emptyMap()
+            json.decodeFromString<Map<String, String>>(encoded)
+                .filterValues { note -> note.isNotBlank() }
+        }.getOrDefault(emptyMap())
+    }
+
+    fun save(context: Context, notes: Map<String, String>) {
+        if (notes.isEmpty()) {
+            clear(context)
+            return
+        }
+
+        prefs(context)
+            .edit()
+            .putString(SAVED_CAFE_NOTES_ENTRY_KEY, json.encodeToString(notes))
+            .apply()
+    }
+
+    fun clear(context: Context) {
+        prefs(context)
+            .edit()
+            .remove(SAVED_CAFE_NOTES_ENTRY_KEY)
+            .apply()
+    }
+}
+
 private object CardStackProgressStore {
     private fun prefs(context: Context): SharedPreferences {
         return context.applicationContext.getSharedPreferences(
@@ -1263,6 +1314,19 @@ private fun transitionRevealAlpha(progress: Float): Float {
 
 private fun transitionDetailSurfaceAlpha(progress: Float): Float {
     return sCurve(((progress - 0.16f) / 0.24f).coerceIn(0f, 1f))
+}
+
+private fun randomSavedNotePastelColor(): Color {
+    val palette = listOf(
+        Color(0xFFFFD6E8),
+        Color(0xFFFFE3B3),
+        Color(0xFFDDF6C9),
+        Color(0xFFCDEFFF),
+        Color(0xFFE9D8FF),
+        Color(0xFFFFD2C7),
+        Color(0xFFD7F4EC)
+    )
+    return palette[Random.nextInt(palette.size)]
 }
 
 private data class DetailOverlayLayoutSpec(
@@ -2055,6 +2119,56 @@ object CafeRepository {
     }
 }
 
+object SavedCafeNotesRepository {
+    private val notesByCafeId = mutableStateMapOf<String, String>()
+    private var appContext: Context? = null
+    private var isInitialized = false
+
+    fun initialize(context: Context) {
+        val applicationContext = context.applicationContext
+        appContext = applicationContext
+        if (isInitialized) return
+
+        notesByCafeId.clear()
+        notesByCafeId.putAll(SavedCafeNotesStore.load(applicationContext))
+        isInitialized = true
+    }
+
+    fun noteFor(cafeId: String): String? {
+        return notesByCafeId[cafeId]?.takeIf { note -> note.isNotBlank() }
+    }
+
+    fun save(cafeId: String, text: String) {
+        val trimmedNote = text.take(SAVED_CAFE_NOTE_MAX_CHARS).trim()
+        if (trimmedNote.isBlank()) {
+            remove(cafeId)
+            return
+        }
+
+        notesByCafeId[cafeId] = trimmedNote
+        persistNotes()
+    }
+
+    fun remove(cafeId: String) {
+        if (notesByCafeId.remove(cafeId) != null) {
+            persistNotes()
+        }
+    }
+
+    private fun persistNotes() {
+        val context = appContext ?: return
+        SavedCafeNotesStore.save(context, notesByCafeId.toMap())
+    }
+
+    internal fun notesSnapshotForTest(): Map<String, String> = notesByCafeId.toMap()
+
+    internal fun resetForTest() {
+        notesByCafeId.clear()
+        appContext = null
+        isInitialized = false
+    }
+}
+
 object BookmarkRepository {
     // store just IDs
     private val bookmarkedIds = mutableStateListOf<String>()
@@ -2101,15 +2215,14 @@ object BookmarkRepository {
 
     fun toggle(cafeId: String) {
         if (bookmarkedIds.contains(cafeId)) {
-            bookmarkedIds.remove(cafeId)
-            clearSavedCafeCacheState(cafeId)
-            persistBookmarks()
+            remove(cafeId)
         }
         else add(cafeId)
     }
 
     fun remove(cafeId: String) {
         bookmarkedIds.remove(cafeId)
+        SavedCafeNotesRepository.remove(cafeId)
         clearSavedCafeCacheState(cafeId)
         persistBookmarks()
     }
@@ -2213,6 +2326,7 @@ object BookmarkRepository {
         bookmarkedIds.clear()
         completedSavedCacheIds.clear()
         savedCacheAttemptedAtMillisById.clear()
+        SavedCafeNotesRepository.resetForTest()
         appContext = null
         isInitialized = false
     }
@@ -2310,6 +2424,7 @@ class MainActivity : ComponentActivity() {
             Places.initializeWithNewPlacesApiEnabled(applicationContext, "AIzaSyBLhYB1SLfj7E9addvptf4iCWO_XNtsQZA")
         }
         CafeRepository.initialize(applicationContext)
+        SavedCafeNotesRepository.initialize(applicationContext)
         BookmarkRepository.initialize(applicationContext)
         StudySessionRepository.initialize(applicationContext)
         requestPermissionLauncher.launch(Manifest.permission.ACCESS_FINE_LOCATION)
@@ -2488,7 +2603,7 @@ fun MainScreen(navController: NavHostController) {
     val showLoadError = loadError != null && !isNoCoffeeHousesMessage(loadError)
     var currentVisibleCafes by remember { mutableStateOf<List<Cafe>>(emptyList()) }
     var nextCafeIndex by rememberSaveable { mutableIntStateOf(0) }
-    var expandedCafeId by remember { mutableStateOf<String?>(null) }
+    var expandedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
     var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
     var transitionState by remember { mutableStateOf<SelectedCafeTransitionState?>(null) }
     var overlayHostBounds by remember { mutableStateOf<Rect?>(null) }
@@ -3471,7 +3586,7 @@ fun MapScreen(navController: NavHostController) {
     val isLoading = cafeFeedState.isLoading && allCafes.isEmpty()
     val loadError = cafeFeedState.loadError.takeIf { allCafes.isEmpty() }
     val showLoadError = loadError != null && !isNoCoffeeHousesMessage(loadError)
-    var selectedCafeId by remember { mutableStateOf<String?>(null) }
+    var selectedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
     var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
     val detailProgress = remember { Animatable(0f) }
     val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
@@ -3892,11 +4007,14 @@ fun BookmarkScreen(navController: NavHostController) {
     val scope = rememberCoroutineScope()
     val savedCafes = BookmarkRepository.cafes()
     var showAllSaved by rememberSaveable { mutableStateOf(false) }
-    var selectedSavedCafeId by remember { mutableStateOf<String?>(null) }
+    var selectedSavedCafeId by rememberSaveable { mutableStateOf<String?>(null) }
     var selectedStudySession by remember { mutableStateOf<StudySession?>(null) }
     var studySessionCafe by remember { mutableStateOf<Cafe?>(null) }
     var loadingStudySessionCafeId by remember { mutableStateOf<String?>(null) }
     var overlayCafe by remember { mutableStateOf<Cafe?>(null) }
+    var transitionState by remember { mutableStateOf<SelectedCafeTransitionState?>(null) }
+    var overlayHostBounds by remember { mutableStateOf<Rect?>(null) }
+    var isPreparingDetailTransition by remember { mutableStateOf(false) }
     val detailProgress = remember { Animatable(0f) }
     ReportBottomNavOverlayCoverage(isActive = selectedStudySession != null)
     val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
@@ -3966,16 +4084,19 @@ fun BookmarkScreen(navController: NavHostController) {
 
     LaunchedEffect(selectedSavedCafeId) {
         if (selectedSavedCafeId != null) {
+            isPreparingDetailTransition = false
             detailProgress.animateTo(
                 targetValue = 1f,
-                animationSpec = tween(durationMillis = 320, easing = FastOutSlowInEasing)
+                animationSpec = tween(durationMillis = 460, easing = FastOutSlowInEasing)
             )
         } else if (overlayCafe != null || detailProgress.value > 0f) {
             detailProgress.animateTo(
                 targetValue = 0f,
-                animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing)
+                animationSpec = tween(durationMillis = 320, easing = FastOutSlowInEasing)
             )
             overlayCafe = null
+            transitionState = null
+            isPreparingDetailTransition = false
         }
     }
 
@@ -3983,31 +4104,58 @@ fun BookmarkScreen(navController: NavHostController) {
         selectedSavedCafeId = null
     }
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .onGloballyPositioned { coordinates ->
+                overlayHostBounds = coordinates.boundsInRoot()
+            }
+    ) {
         Scaffold(
+            topBar = {
+                SavedTitleBar(
+                    modifier = Modifier.graphicsLayer {
+                        alpha = 1f - detailProgress.value
+                    }
+                )
+            },
             bottomBar = {
                 BottomNavBar(
                     navController = navController,
-                    enabled = detailProgress.value < 0.01f,
+                    enabled = detailProgress.value < 0.01f && !isPreparingDetailTransition,
                     dimFraction = detailProgress.value
                 )
             },
-            containerColor = CoffeeLight
+            containerColor = Color(0xFFC79A87)
         ) { innerPadding ->
             LazyColumn(
                 modifier = Modifier
                     .padding(innerPadding)
                     .fillMaxSize()
                     .padding(horizontal = 16.dp),
-                contentPadding = PaddingValues(top = 16.dp, bottom = 24.dp)
+                contentPadding = PaddingValues(top = 4.dp, bottom = 24.dp)
             ) {
                 item {
                     PlaceSaved(
                         savedCafes = savedCafes,
                         showAllSaved = showAllSaved,
                         onToggleShowAllSaved = { showAllSaved = !showAllSaved },
-                        onSavedCafeSelected = { cafe ->
-                            selectedSavedCafeId = cafe.id
+                        transitioningCafeId = transitionState?.cafeId,
+                        transitionProgress = detailProgress.value,
+                        onSavedCafeSelected = { cafe, sourceBounds, heroModel ->
+                            RecentRepository.add(cafe.id)
+                            transitionState = SelectedCafeTransitionState(
+                                cafeId = cafe.id,
+                                sourceBounds = sourceBounds,
+                                heroModel = heroModel
+                            )
+                            overlayCafe = cafe
+                            isPreparingDetailTransition = true
+                            scope.launch {
+                                detailProgress.snapTo(0f)
+                                withFrameNanos { }
+                                selectedSavedCafeId = cafe.id
+                            }
                         },
                         onStudySessionSelected = { session ->
                             selectedStudySession = session
@@ -4040,11 +4188,6 @@ fun BookmarkScreen(navController: NavHostController) {
                 animationSpec = tween(durationMillis = 120, easing = FastOutSlowInEasing),
                 label = "savedDetailScrimAlpha"
             )
-            val overlayScale by animateFloatAsState(
-                targetValue = 0.94f + (0.06f * detailProgress.value),
-                animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
-                label = "savedDetailOverlayScale"
-            )
 
             Box(
                 modifier = Modifier
@@ -4059,40 +4202,107 @@ fun BookmarkScreen(navController: NavHostController) {
                     }
             )
 
-            ExpandedCafeDetailOverlay(
-                navController = navController,
-                cafe = overlayCafe!!,
-                onClose = { selectedSavedCafeId = null },
-                cornerRadius = lerp(
-                    detailOverlayLayoutSpec.collapsedCornerRadius,
-                    detailOverlayLayoutSpec.expandedCornerRadius,
-                    detailProgress.value
-                ),
-                heroHeight = lerp(
-                    detailOverlayLayoutSpec.collapsedHeroHeight,
-                    detailOverlayLayoutSpec.expandedHeroHeight,
-                    detailProgress.value
-                ),
-                sharedHeroModel = overlayCafe!!.primaryImageModel(),
-                transitionProgress = detailProgress.value,
-                modifier = Modifier
-                    .align(Alignment.TopCenter)
-                    .zIndex(21f)
-                    .statusBarsPadding()
-                    .navigationBarsPadding()
-                    .padding(
-                        start = detailOverlayLayoutSpec.horizontalInset,
-                        end = detailOverlayLayoutSpec.horizontalInset,
-                        top = detailOverlayLayoutSpec.topInset,
-                        bottom = detailOverlayLayoutSpec.bottomInset
+            val savedTransition = transitionState
+            val detailCafe = overlayCafe!!
+            if (savedTransition != null) {
+                BoxWithConstraints(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .zIndex(21f)
+                ) {
+                    val density = LocalDensity.current
+                    val sourceBounds = savedTransition.sourceBounds
+                    val hostBounds = overlayHostBounds
+
+                    val endHorizontalInsetPx = with(density) { detailOverlayLayoutSpec.horizontalInset.toPx() }
+                    val endTopInsetPx = with(density) { detailOverlayLayoutSpec.topInset.toPx() }
+                    val endBottomInsetPx = with(density) { detailOverlayLayoutSpec.bottomInset.toPx() }
+                    val endWidthPx = with(density) { maxWidth.toPx() } - (endHorizontalInsetPx * 2f)
+                    val endHeightPx = with(density) { maxHeight.toPx() } - endTopInsetPx - endBottomInsetPx
+                    val endLeftPx = endHorizontalInsetPx
+                    val endTopPx = endTopInsetPx
+
+                    val hasValidSourceBounds = hostBounds != null &&
+                        sourceBounds.width > 0f &&
+                        sourceBounds.height > 0f
+                    val fallbackStartWidthPx = with(density) { (maxWidth * 0.76f).toPx() }
+                    val fallbackStartHeightPx = with(density) { 390.dp.toPx() }
+                    val startLeftPx = if (hasValidSourceBounds) sourceBounds.left - hostBounds!!.left else endLeftPx
+                    val startTopPx = if (hasValidSourceBounds) sourceBounds.top - hostBounds!!.top else endTopPx
+                    val startWidthPx = if (hasValidSourceBounds) sourceBounds.width else fallbackStartWidthPx
+                    val startHeightPx = if (hasValidSourceBounds) sourceBounds.height else fallbackStartHeightPx
+
+                    val animatedLeftPx = lerpFloat(startLeftPx, endLeftPx, detailProgress.value)
+                    val animatedTopPx = lerpFloat(startTopPx, endTopPx, detailProgress.value)
+                    val animatedWidthPx = lerpFloat(startWidthPx, endWidthPx, detailProgress.value)
+                    val animatedHeightPx = lerpFloat(startHeightPx, endHeightPx, detailProgress.value)
+
+                    ExpandedCafeDetailOverlay(
+                        navController = navController,
+                        cafe = detailCafe,
+                        onClose = { selectedSavedCafeId = null },
+                        cornerRadius = lerp(
+                            detailOverlayLayoutSpec.collapsedCornerRadius,
+                            detailOverlayLayoutSpec.expandedCornerRadius,
+                            detailProgress.value
+                        ),
+                        heroHeight = lerp(
+                            detailOverlayLayoutSpec.collapsedHeroHeight,
+                            detailOverlayLayoutSpec.expandedHeroHeight,
+                            detailProgress.value
+                        ),
+                        sharedHeroModel = savedTransition.heroModel,
+                        transitionProgress = detailProgress.value,
+                        modifier = Modifier
+                            .graphicsLayer {
+                                translationX = animatedLeftPx
+                                translationY = animatedTopPx
+                            }
+                            .width(with(density) { animatedWidthPx.toDp() })
+                            .height(with(density) { animatedHeightPx.toDp() })
                     )
-                    .fillMaxWidth()
-                    .graphicsLayer {
-                        alpha = detailProgress.value
-                        scaleX = overlayScale
-                        scaleY = overlayScale
-                    }
+                }
+            } else {
+                val overlayScale by animateFloatAsState(
+                    targetValue = 0.94f + (0.06f * detailProgress.value),
+                    animationSpec = tween(durationMillis = 220, easing = FastOutSlowInEasing),
+                    label = "savedDetailOverlayScale"
                 )
+                ExpandedCafeDetailOverlay(
+                    navController = navController,
+                    cafe = detailCafe,
+                    onClose = { selectedSavedCafeId = null },
+                    cornerRadius = lerp(
+                        detailOverlayLayoutSpec.collapsedCornerRadius,
+                        detailOverlayLayoutSpec.expandedCornerRadius,
+                        detailProgress.value
+                    ),
+                    heroHeight = lerp(
+                        detailOverlayLayoutSpec.collapsedHeroHeight,
+                        detailOverlayLayoutSpec.expandedHeroHeight,
+                        detailProgress.value
+                    ),
+                    sharedHeroModel = detailCafe.primaryImageModel(),
+                    transitionProgress = detailProgress.value,
+                    modifier = Modifier
+                        .align(Alignment.TopCenter)
+                        .zIndex(21f)
+                        .statusBarsPadding()
+                        .navigationBarsPadding()
+                        .padding(
+                            start = detailOverlayLayoutSpec.horizontalInset,
+                            end = detailOverlayLayoutSpec.horizontalInset,
+                            top = detailOverlayLayoutSpec.topInset,
+                            bottom = detailOverlayLayoutSpec.bottomInset
+                        )
+                        .fillMaxWidth()
+                        .graphicsLayer {
+                            alpha = detailProgress.value
+                            scaleX = overlayScale
+                            scaleY = overlayScale
+                        }
+                )
+            }
         }
     }
 }
@@ -4181,15 +4391,28 @@ fun SavedCafeRow(
 
 @Composable
 private fun SavedSectionHeading(title: String) {
-    val outlineColor = Color(0xFFE6E6E6)
-    Text(title, fontWeight = FontWeight.SemiBold)
-    Spacer(Modifier.height(4.dp))
+    val caramel = Color(0xFFC5A07D)
+    val lightBrown = Color(0xFFEAD7CE)
     Box(
-        Modifier
-            .width(80.dp)
-            .height(1.dp)
-            .background(outlineColor)
-    )
+        modifier = Modifier
+            .wrapContentWidth()
+            .shadow(
+                elevation = 6.dp,
+                shape = RoundedCornerShape(16.dp),
+                clip = false
+            )
+            .background(
+                color = caramel,
+                shape = RoundedCornerShape(10.dp)
+            )
+            .padding(horizontal = 12.dp, vertical = 6.dp)
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleMedium,
+            color = lightBrown
+        )
+    }
 }
 
 private val CardTopControlHorizontalPadding = 16.dp
@@ -4198,6 +4421,51 @@ private val CardFilterBubbleSize = 55.1.dp
 private val CardTopControlGap = 12.dp
 private val CardFilterIconSize = 21.12.dp
 private val CardToolbarOutlineColor = Color.White.copy(alpha = 0.14f)
+private val CardToolbarSelectedTitleColor = Color(0xFF4B3621)
+
+@Composable
+private fun SavedTitleBar(modifier: Modifier = Modifier) {
+    val playfairDisplay = remember { FontFamily(Font(R.font.playfair_display)) }
+
+    BoxWithConstraints(
+        modifier = modifier
+            .fillMaxWidth()
+            .statusBarsPadding()
+            .padding(
+                horizontal = CardTopControlHorizontalPadding,
+                vertical = CardTopControlVerticalPadding
+            )
+            .heightIn(min = CardFilterBubbleSize),
+        contentAlignment = Alignment.Center
+    ) {
+        val reservedSideWidth = CardFilterBubbleSize + CardTopControlGap
+        val availableToolbarWidth = (maxWidth - reservedSideWidth * 2f).coerceAtLeast(112.dp)
+        val toolbarScale = (availableToolbarWidth.value / 212f).coerceAtMost(1f)
+
+        Surface(
+            modifier = Modifier.wrapContentSize(),
+            shape = RoundedCornerShape(28.dp),
+            color = BottomNavToolbarColor,
+            border = BorderStroke(1.dp, CardToolbarOutlineColor)
+        ) {
+            Text(
+                text = "Saved",
+                modifier = Modifier.padding(
+                    horizontal = (26f * toolbarScale).dp,
+                    vertical = (14f * toolbarScale).dp
+                ),
+                color = CardToolbarSelectedTitleColor,
+                maxLines = 1,
+                style = MaterialTheme.typography.titleLarge.copy(
+                    fontFamily = playfairDisplay,
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = (28f * toolbarScale).sp,
+                    lineHeight = (28f * toolbarScale).sp
+                )
+            )
+        }
+    }
+}
 
 @Composable
 private fun CardsExploreFilterBar(
@@ -4211,7 +4479,7 @@ private fun CardsExploreFilterBar(
     val menuShape = RoundedCornerShape(22.dp)
     val toolbarBubbleColor = BottomNavToolbarColor
     val selectedLabelColor = if (selectedOption == CardsFilterOption.Nearby) {
-        Color(0xFF4B3621)
+        CardToolbarSelectedTitleColor
     } else {
         Color.White.copy(alpha = 0.96f)
     }
@@ -5656,7 +5924,13 @@ private val StudySessionPopupTextColor = Color.White
 private val StudySessionPopupSecondaryTextColor = Color.White.copy(alpha = 0.78f)
 private val StudySessionPopupFieldColor = DetailInfoBubbleColor
 private val StudySessionPopupFieldTextColor = Color.Black
-private val StudySessionCafeButtonColor = Color(0xFFB44436)
+private val StudySessionPaperColor = Color(0xFFD9EEFF)
+private val StudySessionPaperFieldColor = Color(0xFFEAF7FF)
+private val StudySessionPaperBorderColor = Color(0xFF78BFEA)
+private val StudySessionPaperTextColor = Color(0xFF12304A)
+private val StudySessionPaperSecondaryTextColor = StudySessionPaperTextColor.copy(alpha = 0.68f)
+private val StudySessionPaperDateTextColor = StudySessionPaperTextColor.copy(alpha = 0.48f)
+private val StudySessionPaperAccentColor = Color(0xFF185FA5)
 private val CrowdActionBubbleSize = 42.dp
 private const val CROWD_TOOLTIP_DISPLAY_MILLIS = 2400L
 private const val CAFE_CROWD_PHOTO_BUCKET = "cafe-crowd-photos"
@@ -7912,115 +8186,840 @@ private fun PlaceSaved(
     savedCafes: List<Cafe>,
     showAllSaved: Boolean,
     onToggleShowAllSaved: () -> Unit,
-    onSavedCafeSelected: (Cafe) -> Unit,
+    transitioningCafeId: String?,
+    transitionProgress: Float,
+    onSavedCafeSelected: (Cafe, Rect, Any) -> Unit,
     onStudySessionSelected: (StudySession) -> Unit
 ) {
-    val outlineColor = Color(0xFFE6E6E6)
     val studySessions = StudySessionRepository.sessions()
-    Column(modifier = Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(22.dp)) {
+
+    LaunchedEffect(showAllSaved) {
+        if (showAllSaved) onToggleShowAllSaved()
+    }
+
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(3.dp)
+    ) {
         Column {
-            SavedSectionHeading("Saved")
-            Spacer(Modifier.height(10.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                if (savedCafes.isEmpty()) {
-                    SavedTile(Modifier.weight(1f))
-                    SavedTile(Modifier.weight(1f))
-                    SavedTile(Modifier.weight(1f), true)
-                } else {
-                    savedCafes.take(3).forEach { cafe ->
-                        SavedCafeTile(
-                            cafe = cafe,
-                            onOpen = { onSavedCafeSelected(cafe) },
-                            modifier = Modifier.weight(1f)
+            SavedCafeCarousel(
+                savedCafes = savedCafes,
+                transitioningCafeId = transitioningCafeId,
+                transitionProgress = transitionProgress,
+                onSavedCafeSelected = onSavedCafeSelected
+            )
+        }
+        Column(horizontalAlignment = Alignment.CenterHorizontally) {
+            StudySessionSectionLabel()
+            Spacer(Modifier.height(1.dp))
+            StudySessionCarousel(
+                studySessions = studySessions,
+                onStudySessionSelected = onStudySessionSelected
+            )
+        }
+    }
+}
+
+@Composable
+private fun StudySessionSectionLabel() {
+    Surface(
+        shape = RoundedCornerShape(28.dp),
+        color = StudySessionPaperColor,
+        border = BorderStroke(1.dp, StudySessionPaperBorderColor),
+        shadowElevation = 3.dp
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(7.dp)
+        ) {
+            Icon(
+                painter = painterResource(id = R.drawable.study),
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+                tint = Color.Unspecified
+            )
+            Text(
+                text = "Study sessions",
+                style = MaterialTheme.typography.labelLarge.copy(fontSize = 21.9.sp),
+                color = StudySessionPaperTextColor,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun StudySessionCarousel(
+    studySessions: List<StudySession>,
+    onStudySessionSelected: (StudySession) -> Unit
+) {
+    val pagerState = rememberPagerState(pageCount = { studySessions.size })
+
+    LaunchedEffect(studySessions.size) {
+        if (studySessions.isNotEmpty() && pagerState.currentPage > studySessions.lastIndex) {
+            pagerState.scrollToPage(studySessions.lastIndex)
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(bottom = 6.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        if (studySessions.isEmpty()) {
+            StudySessionCarouselEmptyState()
+            return@Column
+        }
+
+        val density = LocalDensity.current
+        val cameraDistancePx = with(density) { 28.dp.toPx() }
+        val sideCardPeekPx = with(density) { 50.dp.toPx() }
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(426.dp)
+        ) {
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .fillMaxWidth()
+                    .height(390.dp),
+                contentPadding = PaddingValues(horizontal = 42.dp),
+                pageSpacing = 6.dp
+            ) { page ->
+                val session = studySessions[page]
+                val pageOffset = (pagerState.currentPage - page) + pagerState.currentPageOffsetFraction
+                val absOffset = abs(pageOffset).coerceIn(0f, 1f)
+                val focusedAmount = 1f - absOffset
+
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .zIndex(focusedAmount)
+                        .graphicsLayer {
+                            alpha = 0.58f + (0.42f * focusedAmount)
+                            translationX = pageOffset.coerceIn(-1f, 1f) * sideCardPeekPx
+                            scaleX = 0.78f + (0.22f * focusedAmount)
+                            scaleY = 0.78f + (0.22f * focusedAmount)
+                            rotationY = pageOffset.coerceIn(-1f, 1f) * -42f
+                            cameraDistance = cameraDistancePx
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    StudySessionPaperCard(
+                        session = session,
+                        onOpen = { onStudySessionSelected(session) },
+                        modifier = Modifier
+                            .fillMaxHeight()
+                            .aspectRatio(1f / 1.4142f)
+                            .offset(x = 11.dp, y = 1.dp)
+                    )
+                }
+            }
+
+            if (studySessions.size > 1) {
+                Row(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .padding(bottom = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    repeat(studySessions.size) { index ->
+                        Box(
+                            modifier = Modifier
+                                .size(if (index == pagerState.currentPage) 8.dp else 6.dp)
+                                .background(
+                                    color = if (index == pagerState.currentPage) {
+                                        StudySessionPaperAccentColor
+                                    } else {
+                                        StudySessionPaperAccentColor.copy(alpha = 0.34f)
+                                    },
+                                    shape = CircleShape
+                                )
                         )
-                    }
-                    if (savedCafes.size < 3) {
-                        repeat(3 - savedCafes.size) { index ->
-                            if (savedCafes.size + index == 2) {
-                                SavedTile(Modifier.weight(1f), true)
-                            } else {
-                                SavedTile(Modifier.weight(1f))
-                            }
-                        }
                     }
                 }
             }
-            Spacer(Modifier.height(12.dp))
-            OutlinedButton(
-                onClick = onToggleShowAllSaved,
-                modifier = Modifier.fillMaxWidth(),
-                colors = ButtonDefaults.outlinedButtonColors(
-                    containerColor = CoffeeDark,
-                    contentColor = Color.White
-                ),
-                border = BorderStroke(1.dp, CoffeeDark)
+        }
+    }
+}
+
+@Composable
+private fun StudySessionCarouselEmptyState() {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 14.dp)
+            .height(210.dp),
+        shape = RoundedCornerShape(14.dp),
+        color = StudySessionPaperColor,
+        border = BorderStroke(1.dp, StudySessionPaperBorderColor.copy(alpha = 0.74f)),
+        shadowElevation = 4.dp
+    ) {
+        Box(contentAlignment = Alignment.Center) {
+            Text(
+                text = "No study sessions yet.",
+                modifier = Modifier.padding(horizontal = 18.dp),
+                style = MaterialTheme.typography.bodyMedium,
+                color = StudySessionPaperSecondaryTextColor,
+                textAlign = TextAlign.Center
+            )
+        }
+    }
+}
+
+@Composable
+private fun StudySessionPaperCard(
+    session: StudySession,
+    onOpen: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Box(
+        modifier = modifier.clickable { onOpen() }
+    ) {
+        Surface(
+            modifier = Modifier
+                .matchParentSize()
+                .padding(end = 22.dp, bottom = 24.dp),
+            shape = RoundedCornerShape(6.dp),
+            color = StudySessionPaperColor,
+            contentColor = StudySessionPaperTextColor,
+            border = BorderStroke(1.dp, StudySessionPaperBorderColor),
+            shadowElevation = 8.dp
+        ) {
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(18.dp)
             ) {
-                Text(if (showAllSaved) "Hide saved" else "Show all saved")
-            }
-            if (showAllSaved) {
-                Spacer(Modifier.height(12.dp))
-                if (savedCafes.isEmpty()) {
-                    OutlinedCard(
+                StudySessionPaperPhotoCluster(
+                    photoUris = session.photoUris,
+                    modifier = Modifier.align(Alignment.TopEnd)
+                )
+
+                Column(
+                    modifier = Modifier.fillMaxSize()
+                ) {
+                    Text(
+                        text = session.title,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(end = 94.dp),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        textDecoration = TextDecoration.Underline,
+                        color = StudySessionPaperTextColor,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text(
+                        text = session.className,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(end = 94.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        textDecoration = TextDecoration.Underline,
+                        color = StudySessionPaperTextColor,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(Modifier.height(22.dp))
+                    Row(
                         modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(12.dp),
-                        colors = CardDefaults.outlinedCardColors(
-                            containerColor = CoffeeSurfaceLight,
-                            contentColor = CafeDark
-                        ),
-                        border = BorderStroke(1.dp, outlineColor)
+                        verticalAlignment = Alignment.Top
                     ) {
                         Text(
-                            text = "No saved places yet. Swipe right on a cafe to add it here.",
-                            modifier = Modifier.padding(16.dp),
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = CoffeeDark.copy(alpha = 0.78f)
+                            text = "\u2022",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = StudySessionPaperAccentColor
+                        )
+                        Spacer(Modifier.width(8.dp))
+                        Text(
+                            text = session.summary,
+                            modifier = Modifier.weight(1f),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = StudySessionPaperTextColor.copy(alpha = 0.82f),
+                            lineHeight = 18.sp,
+                            maxLines = 7,
+                            overflow = TextOverflow.Ellipsis
                         )
                     }
+                    Spacer(Modifier.weight(1f))
+                    Text(
+                        text = session.cafeName,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = StudySessionPaperAccentColor,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Spacer(Modifier.height(2.dp))
+                    Text(
+                        text = "${session.dateText}  \u2022  ${session.timeRangeText}",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = StudySessionPaperDateTextColor,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+
+        Image(
+            painter = painterResource(id = R.drawable.newpencil),
+            contentDescription = null,
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .offset(x = 2.dp, y = 2.dp)
+                .size(68.dp)
+                .graphicsLayer {
+                    rotationZ = -12f
+                    transformOrigin = TransformOrigin(0.56f, 0.52f)
+                }
+        )
+    }
+}
+
+@Composable
+private fun StudySessionPaperPhotoCluster(
+    photoUris: List<String>,
+    modifier: Modifier = Modifier
+) {
+    val visiblePhotos = photoUris.take(3)
+    Box(
+        modifier = modifier.size(width = 92.dp, height = 78.dp)
+    ) {
+        if (visiblePhotos.isEmpty()) {
+            Surface(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .size(62.dp),
+                shape = RoundedCornerShape(8.dp),
+                color = StudySessionPaperFieldColor,
+                border = BorderStroke(1.dp, StudySessionPaperBorderColor.copy(alpha = 0.58f))
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Icon(
+                        painter = painterResource(id = R.drawable.study),
+                        contentDescription = null,
+                        modifier = Modifier.size(32.dp),
+                        tint = Color.Unspecified
+                    )
+                }
+            }
+        } else {
+            visiblePhotos.forEachIndexed { index, uri ->
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.TopEnd)
+                        .offset(x = (-index * 12).dp, y = (index * 8).dp)
+                        .size(58.dp)
+                        .zIndex((visiblePhotos.size - index).toFloat()),
+                    shape = RoundedCornerShape(8.dp),
+                    border = BorderStroke(1.dp, Color.White.copy(alpha = 0.82f)),
+                    shadowElevation = 3.dp
+                ) {
+                    AsyncImage(
+                        model = uri,
+                        contentDescription = "Study session photo",
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
+                    )
+                }
+            }
+        }
+    }
+}
+
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun SavedCafeCarousel(
+    savedCafes: List<Cafe>,
+    transitioningCafeId: String?,
+    transitionProgress: Float,
+    onSavedCafeSelected: (Cafe, Rect, Any) -> Unit
+) {
+    val heroBg = Color(0xFF4A231C)
+    val lightBrown = Color(0xFFEAD7CE)
+    val darkBrown = Color(0xFF694B2E)
+    val pagerState = rememberPagerState(pageCount = { savedCafes.size })
+    val currentCafe = savedCafes.getOrNull(pagerState.currentPage)
+    val currentNote = currentCafe?.let { cafe -> SavedCafeNotesRepository.noteFor(cafe.id) }
+    var noteEditorCafe by remember { mutableStateOf<Cafe?>(null) }
+    var noteBubbleColor by remember { mutableStateOf(randomSavedNotePastelColor()) }
+    var displayedNote by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(savedCafes.size) {
+        if (savedCafes.isNotEmpty() && pagerState.currentPage > savedCafes.lastIndex) {
+            pagerState.scrollToPage(savedCafes.lastIndex)
+        }
+    }
+
+    LaunchedEffect(currentCafe?.id) {
+        noteBubbleColor = randomSavedNotePastelColor()
+    }
+
+    LaunchedEffect(currentCafe?.id, currentNote) {
+        if (currentNote != null) {
+            displayedNote = currentNote
+        } else {
+            delay(220)
+            if (currentCafe?.let { cafe -> SavedCafeNotesRepository.noteFor(cafe.id) } == null) {
+                displayedNote = null
+            }
+        }
+    }
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 6.dp, bottom = 0.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        if (savedCafes.isEmpty()) {
+            Surface(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 14.dp)
+                    .height(180.dp),
+                shape = RoundedCornerShape(14.dp),
+                color = CoffeeSurfaceLight,
+                border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.14f))
+            ) {
+                Box(contentAlignment = Alignment.Center) {
+                    Text(
+                        text = "No saved cafes yet. Swipe right on a cafe to save it.",
+                        modifier = Modifier.padding(horizontal = 18.dp),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = darkBrown.copy(alpha = 0.72f),
+                        textAlign = TextAlign.Center
+                    )
+                }
+            }
+            return@Column
+        }
+
+        val density = LocalDensity.current
+        val cameraDistancePx = with(density) { 28.dp.toPx() }
+        val sideCardPeekPx = with(density) { 64.dp.toPx() }
+        val isPagerSettled = !pagerState.isScrollInProgress &&
+            abs(pagerState.currentPageOffsetFraction) < 0.01f
+        val noteOverlayAlpha by animateFloatAsState(
+            targetValue = if (currentNote != null && isPagerSettled && transitionProgress < 0.01f) 1f else 0f,
+            animationSpec = tween(durationMillis = 180, easing = FastOutSlowInEasing),
+            label = "savedCafeNoteOverlayAlpha"
+        )
+        val activeNoteText = displayedNote ?: currentNote
+
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(440.dp)
+        ) {
+            HorizontalPager(
+                state = pagerState,
+                modifier = Modifier
+                    .align(Alignment.TopCenter)
+                    .fillMaxWidth()
+                    .height(390.dp),
+                contentPadding = PaddingValues(horizontal = 26.dp),
+                pageSpacing = 6.dp
+            ) { page ->
+                val cafe = savedCafes[page]
+                val pageOffset = (pagerState.currentPage - page) + pagerState.currentPageOffsetFraction
+                val absOffset = abs(pageOffset).coerceIn(0f, 1f)
+                val focusedAmount = 1f - absOffset
+                val transitionAlpha = if (cafe.id == transitioningCafeId) {
+                    transitionCardFadeAlpha(transitionProgress)
                 } else {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        savedCafes.forEach { cafe ->
-                            SavedCafeRow(
-                                cafe = cafe,
-                                onOpen = { onSavedCafeSelected(cafe) },
-                                onRemove = { BookmarkRepository.remove(cafe.id) }
+                    1f
+                }
+                val isFocusedPage = page == pagerState.currentPage
+
+                SavedCarouselCafeCard(
+                    cafe = cafe,
+                    onOpen = { bounds, heroModel -> onSavedCafeSelected(cafe, bounds, heroModel) },
+                    onNoteClick = { noteEditorCafe = cafe },
+                    showNoteControls = isFocusedPage,
+                    noteColor = noteBubbleColor,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .zIndex(focusedAmount)
+                        .graphicsLayer {
+                            alpha = (0.62f + (0.38f * focusedAmount)) * transitionAlpha
+                            translationX = pageOffset.coerceIn(-1f, 1f) * sideCardPeekPx
+                            scaleX = 0.76f + (0.24f * focusedAmount)
+                            scaleY = 0.76f + (0.24f * focusedAmount)
+                            rotationY = pageOffset.coerceIn(-1f, 1f) * -44f
+                            cameraDistance = cameraDistancePx
+                        }
+                )
+            }
+
+            if (activeNoteText != null) {
+                SavedCafeLeakingNoteOverlay(
+                    noteText = activeNoteText,
+                    noteColor = noteBubbleColor,
+                    alpha = noteOverlayAlpha,
+                    cardBottom = 390.dp,
+                    modifier = Modifier
+                        .matchParentSize()
+                        .padding(start = 56.dp, end = 56.dp)
+                        .zIndex(2f)
+                )
+            }
+        }
+    }
+
+    noteEditorCafe?.let { cafe ->
+        SavedCafeNoteDialog(
+            cafe = cafe,
+            initialNote = SavedCafeNotesRepository.noteFor(cafe.id),
+            onDismiss = { noteEditorCafe = null },
+            onSave = { noteText ->
+                SavedCafeNotesRepository.save(cafe.id, noteText)
+                noteEditorCafe = null
+            },
+            onDelete = {
+                SavedCafeNotesRepository.remove(cafe.id)
+                noteEditorCafe = null
+            }
+        )
+    }
+}
+
+@Composable
+private fun SavedCafeLeakingNoteOverlay(
+    noteText: String,
+    noteColor: Color,
+    alpha: Float,
+    cardBottom: Dp,
+    modifier: Modifier = Modifier
+) {
+    Layout(
+        modifier = modifier,
+        content = {
+            SavedCafeNoteOverlay(
+                noteText = noteText,
+                noteColor = noteColor,
+                alpha = alpha
+            )
+        }
+    ) { measurables, constraints ->
+        val placeable = measurables.first().measure(
+            constraints.copy(minWidth = 0, minHeight = 0)
+        )
+        val centerY = cardBottom.roundToPx()
+        val x = ((constraints.maxWidth - placeable.width) / 2).coerceAtLeast(0)
+        val y = (centerY - (placeable.height / 2)).coerceAtLeast(0)
+
+        layout(constraints.maxWidth, constraints.maxHeight) {
+            placeable.placeRelative(x, y)
+        }
+    }
+}
+
+@Composable
+private fun SavedCafeNoteOverlay(
+    noteText: String,
+    noteColor: Color,
+    alpha: Float,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .heightIn(min = 54.dp)
+            .graphicsLayer { this.alpha = alpha },
+        shape = CircleShape,
+        color = noteColor.copy(alpha = 0.86f),
+        shadowElevation = 6.dp,
+        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.78f))
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 14.dp, vertical = 8.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Text(
+                text = noteText,
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFF4A231C),
+                textAlign = TextAlign.Center,
+                lineHeight = 16.sp
+            )
+        }
+    }
+}
+
+@Composable
+private fun SavedCarouselCafeCard(
+    cafe: Cafe,
+    onOpen: (Rect, Any) -> Unit,
+    onNoteClick: () -> Unit,
+    showNoteControls: Boolean,
+    noteColor: Color,
+    modifier: Modifier = Modifier
+) {
+    var cardBounds by remember(cafe.id) { mutableStateOf<Rect?>(null) }
+    val cardTextColor = Color.White
+    val cardSecondaryTextColor = Color.White.copy(alpha = 0.78f)
+
+    Card(
+        modifier = modifier
+            .onGloballyPositioned { coordinates ->
+                cardBounds = coordinates.boundsInRoot()
+            },
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = SelectedCafeSurfaceColor,
+            contentColor = cardTextColor
+        ),
+        border = BorderStroke(2.dp, Color.Black),
+        elevation = CardDefaults.cardElevation(defaultElevation = 3.dp)
+    ) {
+        Box(modifier = Modifier.fillMaxSize()) {
+            Column {
+                BoxWithConstraints(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(205.dp)
+                        .clickable { onOpen(cardBounds ?: Rect.Zero, cafe.primaryImageModel()) }
+                ) {
+                    AsyncImage(
+                        model = cafe.primaryImageModel(),
+                        contentDescription = cafe.name,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
+                    )
+                    IconButton(
+                        onClick = { BookmarkRepository.toggle(cafe.id) },
+                        modifier = Modifier
+                            .align(Alignment.TopEnd)
+                            .padding(8.dp)
+                            .background(Color.Black.copy(alpha = 0.35f), CircleShape)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Filled.Bookmark,
+                            contentDescription = "Remove bookmark",
+                            tint = Color.White
+                        )
+                    }
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(90.dp)
+                            .align(Alignment.BottomCenter)
+                            .background(
+                                Brush.verticalGradient(
+                                    listOf(Color.Transparent, Color.Black.copy(alpha = 0.58f))
+                                )
+                            )
+                    )
+                    val nameMaxWidth = (maxWidth - 82.dp).coerceAtLeast(96.dp)
+                    Text(
+                        text = cafe.name,
+                        modifier = Modifier
+                            .align(Alignment.BottomStart)
+                            .padding(start = 14.dp, bottom = 14.dp)
+                            .widthIn(max = nameMaxWidth),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = Color.White,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    if (showNoteControls) {
+                        IconButton(
+                            onClick = onNoteClick,
+                            modifier = Modifier
+                                .align(Alignment.BottomEnd)
+                                .padding(10.dp)
+                                .background(noteColor.copy(alpha = 0.86f), CircleShape)
+                                .border(1.dp, Color.White.copy(alpha = 0.72f), CircleShape)
+                        ) {
+                            Icon(
+                                painter = painterResource(id = R.drawable.notes),
+                                contentDescription = "Add note",
+                                modifier = Modifier.size(22.dp),
+                                tint = Color.Unspecified
                             )
                         }
                     }
                 }
-            }
-        }
-        Column {
-            SavedSectionHeading("Collection")
-            Spacer(Modifier.height(10.dp))
-            Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                Column(Modifier.weight(1f)) {
-                    SavedTile()
-                    Text("Good Coffee", style = MaterialTheme.typography.bodySmall)
-                }
-                Column(Modifier.weight(1f)) {
-                    SavedTile()
-                    Text("Quiet Area", style = MaterialTheme.typography.bodySmall)
-                }
-                SavedTile(Modifier.weight(1f), true)
-            }
-        }
-        Column {
-            SavedSectionHeading("Study Plan")
-            Spacer(Modifier.height(10.dp))
-            if (studySessions.isEmpty()) {
-                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                    SavedTile(Modifier.weight(1f))
-                    SavedTile(Modifier.weight(1f))
-                    SavedTile(Modifier.weight(1f), true)
-                }
-            } else {
-                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                    studySessions.forEach { session ->
-                        StudySessionSavedCard(
-                            session = session,
-                            onOpen = { onStudySessionSelected(session) },
-                            onDelete = { StudySessionRepository.remove(session.id) }
+
+                Column(
+                    modifier = Modifier.padding(10.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    val rating = cafe.rating
+                    val reviewCount = cafe.userRatingCount ?: 0
+                    if (rating != null && reviewCount > 0) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            RatingStars(rating)
+                            Spacer(Modifier.width(6.dp))
+                            Text(
+                                text = String.format(Locale.US, "%.1f (%d)", rating, reviewCount),
+                                color = cardSecondaryTextColor,
+                                style = MaterialTheme.typography.labelSmall,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    } else {
+                        Text(
+                            "No ratings yet",
+                            color = cardSecondaryTextColor,
+                            style = MaterialTheme.typography.labelSmall
                         )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        CompactDetailInfoBubble(
+                            iconRes = R.drawable.distance,
+                            iconName = "Distance",
+                            value = formatDistanceAway(cafe.distanceMeters) ?: "Distance unavailable",
+                            modifier = Modifier.weight(1f),
+                            height = 34.dp,
+                            iconSize = 14.dp,
+                            horizontalPadding = 7.dp,
+                            horizontalSpacing = 4.dp
+                        )
+                        CompactDetailInfoBubble(
+                            iconRes = R.drawable.address,
+                            iconName = "Address",
+                            value = cafe.address,
+                            modifier = Modifier.weight(1f),
+                            height = 34.dp,
+                            iconSize = 14.dp,
+                            horizontalPadding = 7.dp,
+                            horizontalSpacing = 4.dp
+                        )
+                        CompactDetailInfoBubble(
+                            iconRes = R.drawable.phone,
+                            iconName = "Phone",
+                            value = cafe.phone,
+                            modifier = Modifier.weight(1f),
+                            copyLabel = "${cafe.name} phone number",
+                            height = 34.dp,
+                            iconSize = 14.dp,
+                            horizontalPadding = 7.dp,
+                            horizontalSpacing = 4.dp
+                        )
+                    }
+
+                    CardTodayHoursBubble(
+                        hours = cafe.hours,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    Spacer(Modifier.height(54.dp))
+                }
+            }
+        }
+    }
+}
+@Composable
+private fun SavedCafeNoteDialog(
+    cafe: Cafe,
+    initialNote: String?,
+    onDismiss: () -> Unit,
+    onSave: (String) -> Unit,
+    onDelete: () -> Unit
+) {
+    var noteText by rememberSaveable(cafe.id) {
+        mutableStateOf(initialNote.orEmpty().take(SAVED_CAFE_NOTE_MAX_CHARS))
+    }
+    val heroBg = Color(0xFF4A231C)
+    val lightBrown = Color(0xFFEAD7CE)
+    val darkBrown = Color(0xFF694B2E)
+
+    Dialog(onDismissRequest = onDismiss) {
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(18.dp),
+            color = Color.White,
+            shadowElevation = 12.dp
+        ) {
+            Column(
+                modifier = Modifier.padding(18.dp),
+                verticalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                Text(
+                    text = "Note for ${cafe.name}",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = darkBrown,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                OutlinedTextField(
+                    value = noteText,
+                    onValueChange = { noteText = it.take(SAVED_CAFE_NOTE_MAX_CHARS) },
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = 120.dp),
+                    placeholder = { Text("Add a note...") },
+                    minLines = 4,
+                    maxLines = 6,
+                    supportingText = {
+                        Text("${noteText.length}/$SAVED_CAFE_NOTE_MAX_CHARS")
+                    },
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = darkBrown,
+                        unfocusedTextColor = darkBrown,
+                        focusedContainerColor = lightBrown.copy(alpha = 0.55f),
+                        unfocusedContainerColor = lightBrown.copy(alpha = 0.42f),
+                        focusedBorderColor = heroBg,
+                        unfocusedBorderColor = heroBg.copy(alpha = 0.35f),
+                        cursorColor = heroBg
+                    ),
+                    shape = RoundedCornerShape(12.dp)
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    if (initialNote != null) {
+                        TextButton(
+                            onClick = onDelete,
+                            colors = ButtonDefaults.textButtonColors(contentColor = Color.Red)
+                        ) {
+                            Text("Delete")
+                        }
+                    } else {
+                        Spacer(Modifier.width(1.dp))
+                    }
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        TextButton(
+                            onClick = onDismiss,
+                            colors = ButtonDefaults.textButtonColors(contentColor = darkBrown)
+                        ) {
+                            Text("Cancel")
+                        }
+                        Button(
+                            onClick = { onSave(noteText) },
+                            shape = RoundedCornerShape(14.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = heroBg,
+                                contentColor = Color.White
+                            )
+                        ) {
+                            Text("Save")
+                        }
                     }
                 }
             }
@@ -8031,111 +9030,17 @@ private fun PlaceSaved(
 @Composable
 fun SavedTile(modifier: Modifier = Modifier, plus: Boolean = false) {
     val outlineColor = Color(0xFFE6E6E6)
-    OutlinedCard(modifier.aspectRatio(1f), shape = RoundedCornerShape(4.dp), border = BorderStroke(1.dp, outlineColor)) { Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { if (plus) Text("+", style = MaterialTheme.typography.headlineLarge) } }
-}
-
-@Composable
-private fun StudySessionSavedCard(
-    session: StudySession,
-    onOpen: () -> Unit,
-    onDelete: () -> Unit
-) {
-    val firstPhotoUri = session.photoUris.firstOrNull()
-
     OutlinedCard(
-        modifier = Modifier
-            .fillMaxWidth()
-            .clickable { onOpen() },
+        modifier = modifier.aspectRatio(1f),
         shape = RoundedCornerShape(12.dp),
-        border = BorderStroke(1.dp, Color(0xFFE6E6E6)),
-        colors = CardDefaults.outlinedCardColors(
-            containerColor = Color(0xFFD9EEFF),
-            contentColor = Color.Black
-        )
+        border = BorderStroke(1.dp, outlineColor)
     ) {
-        Row(
-            modifier = Modifier.padding(12.dp),
-            verticalAlignment = Alignment.CenterVertically
-        ) {
-            OutlinedCard(
-                modifier = Modifier.size(64.dp),
-                shape = RoundedCornerShape(8.dp),
-                border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.24f)),
-                colors = CardDefaults.outlinedCardColors(
-                    containerColor = StudySessionPopupFieldColor,
-                    contentColor = StudySessionPopupFieldTextColor
-                )
-            ) {
-                if (firstPhotoUri != null) {
-                    AsyncImage(
-                        model = firstPhotoUri,
-                        contentDescription = session.title,
-                        modifier = Modifier.fillMaxSize(),
-                        contentScale = ContentScale.Crop
-                    )
-                } else {
-                    Box(contentAlignment = Alignment.Center) {
-                        Icon(
-                            painter = painterResource(id = R.drawable.study),
-                            contentDescription = null,
-                            modifier = Modifier.size(34.dp),
-                            tint = Color.Unspecified
-                        )
-                    }
-                }
-            }
-
-            Spacer(modifier = Modifier.width(12.dp))
-
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = session.title,
-                    style = MaterialTheme.typography.titleSmall,
-                    fontWeight = FontWeight.SemiBold,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    text = session.cafeName,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color.Gray,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    text = "${session.className} - ${session.dateText}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color.Black.copy(alpha = 0.74f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    text = "Time: ${session.timeRangeText}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color.Black.copy(alpha = 0.68f),
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis
-                )
-                Text(
-                    text = session.summary,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = Color.Black.copy(alpha = 0.64f),
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis
-                )
-            }
-
-            Spacer(modifier = Modifier.width(8.dp))
-
-            IconButton(onClick = onDelete) {
-                Icon(
-                    imageVector = Icons.Filled.Delete,
-                    contentDescription = "Delete study session",
-                    tint = Color.Black.copy(alpha = 0.74f)
-                )
-            }
-        }
-    }
+        Box(
+        modifier = Modifier
+            .fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        if (plus) Text("+", style = MaterialTheme.typography.headlineLarge) } }
 }
 
 private fun StudySession.toCafePlaceholder(): Cafe {
@@ -8222,11 +9127,11 @@ private fun StudySessionDetailOverlay(
                 },
             shape = RoundedCornerShape(20.dp),
             colors = CardDefaults.cardColors(
-                containerColor = StudySessionPopupSurfaceColor,
-                contentColor = StudySessionPopupTextColor
+                containerColor = StudySessionPaperColor,
+                contentColor = StudySessionPaperTextColor
             ),
             elevation = CardDefaults.cardElevation(defaultElevation = 12.dp),
-            border = BorderStroke(2.dp, Color.Black)
+            border = BorderStroke(1.dp, StudySessionPaperBorderColor)
         ) {
             Column(
                 modifier = Modifier
@@ -8241,7 +9146,8 @@ private fun StudySessionDetailOverlay(
                     Surface(
                         modifier = Modifier.size(44.dp),
                         shape = CircleShape,
-                        color = Color(0xFFD5F1FF)
+                        color = StudySessionPaperFieldColor,
+                        border = BorderStroke(1.dp, StudySessionPaperBorderColor.copy(alpha = 0.62f))
                     ) {
                         Icon(
                             painter = painterResource(id = R.drawable.study),
@@ -8256,14 +9162,14 @@ private fun StudySessionDetailOverlay(
                             text = session.title,
                             style = MaterialTheme.typography.titleMedium,
                             fontWeight = FontWeight.SemiBold,
-                            color = StudySessionPopupTextColor,
+                            color = StudySessionPaperTextColor,
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis
                         )
                         Text(
                             text = session.cafeName,
                             style = MaterialTheme.typography.bodySmall,
-                            color = StudySessionPopupSecondaryTextColor,
+                            color = StudySessionPaperSecondaryTextColor,
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis
                         )
@@ -8272,7 +9178,7 @@ private fun StudySessionDetailOverlay(
                         Icon(
                             Icons.Filled.Close,
                             contentDescription = "Close study session",
-                            tint = StudySessionPopupTextColor
+                            tint = StudySessionPaperTextColor
                         )
                     }
                 }
@@ -8296,7 +9202,7 @@ private fun StudySessionDetailOverlay(
                     TextButton(
                         onClick = onDelete,
                         colors = ButtonDefaults.textButtonColors(
-                            contentColor = StudySessionPopupTextColor
+                            contentColor = Color(0xFF8A2930)
                         )
                     ) {
                         Text("Delete")
@@ -8304,8 +9210,8 @@ private fun StudySessionDetailOverlay(
                     Button(
                         onClick = { closeDetails() },
                         colors = ButtonDefaults.buttonColors(
-                            containerColor = StudySessionPopupFieldColor,
-                            contentColor = StudySessionPopupFieldTextColor
+                            containerColor = StudySessionPaperAccentColor,
+                            contentColor = Color.White
                         )
                     ) {
                         Text("Done")
@@ -8325,22 +9231,22 @@ private fun StudySessionReadonlyField(
         Text(
             text = label,
             style = MaterialTheme.typography.labelMedium,
-            color = StudySessionPopupSecondaryTextColor
+            color = StudySessionPaperSecondaryTextColor
         )
         OutlinedCard(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(8.dp),
-            border = BorderStroke(1.dp, Color.Black),
+            border = BorderStroke(1.dp, StudySessionPaperBorderColor.copy(alpha = 0.72f)),
             colors = CardDefaults.outlinedCardColors(
-                containerColor = StudySessionPopupFieldColor,
-                contentColor = StudySessionPopupFieldTextColor
+                containerColor = StudySessionPaperFieldColor,
+                contentColor = StudySessionPaperTextColor
             )
         ) {
             Text(
                 text = value,
                 modifier = Modifier.padding(12.dp),
                 style = MaterialTheme.typography.bodyMedium,
-                color = StudySessionPopupFieldTextColor
+                color = StudySessionPaperTextColor
             )
         }
     }
@@ -8356,20 +9262,20 @@ private fun StudySessionCafeDetailsButton(
         Text(
             text = "Cafe",
             style = MaterialTheme.typography.labelMedium,
-            color = StudySessionPopupSecondaryTextColor
+            color = StudySessionPaperSecondaryTextColor
         )
         Button(
             onClick = onClick,
             enabled = !isLoading,
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(
-                containerColor = StudySessionCafeButtonColor,
+                containerColor = StudySessionPaperAccentColor,
                 contentColor = Color.White,
-                disabledContainerColor = StudySessionCafeButtonColor.copy(alpha = 0.72f),
+                disabledContainerColor = StudySessionPaperAccentColor.copy(alpha = 0.72f),
                 disabledContentColor = Color.White.copy(alpha = 0.78f)
             ),
             shape = RoundedCornerShape(8.dp),
-            border = BorderStroke(1.dp, Color.Black)
+            border = BorderStroke(1.dp, StudySessionPaperTextColor.copy(alpha = 0.32f))
         ) {
             if (isLoading) {
                 CircularProgressIndicator(
@@ -8402,7 +9308,7 @@ private fun StudySessionSubmittedPhotos(photoUris: List<String>) {
             text = "Submitted photos",
             style = MaterialTheme.typography.titleSmall,
             fontWeight = FontWeight.SemiBold,
-            color = StudySessionPopupTextColor
+            color = StudySessionPaperTextColor
         )
 
         if (photoUris.isEmpty()) {
@@ -8411,7 +9317,8 @@ private fun StudySessionSubmittedPhotos(photoUris: List<String>) {
                     .fillMaxWidth()
                     .height(140.dp),
                 shape = RoundedCornerShape(8.dp),
-                color = StudySessionPopupFieldColor
+                color = StudySessionPaperFieldColor,
+                border = BorderStroke(1.dp, StudySessionPaperBorderColor.copy(alpha = 0.64f))
             ) {
                 Box(contentAlignment = Alignment.Center) {
                     Icon(
@@ -8464,11 +9371,13 @@ fun SavedCafeTile(cafe: Cafe, onOpen: () -> Unit, modifier: Modifier = Modifier)
     val outlineColor = Color(0xFFE6E6E6)
     OutlinedCard(
         modifier = modifier.aspectRatio(1f),
-        shape = RoundedCornerShape(4.dp),
+        shape = RoundedCornerShape(12.dp),
         border = BorderStroke(1.dp, outlineColor)
     ) {
         Box(modifier = Modifier.fillMaxSize()) {
-            Box(modifier = Modifier.fillMaxSize().clickable { onOpen() }) {
+            Box(modifier = Modifier
+                .fillMaxSize()
+                .clickable { onOpen() }) {
                 AsyncImage(
                     model = cafe.primaryImageModel(),
                     contentDescription = cafe.name,
@@ -8482,6 +9391,7 @@ fun SavedCafeTile(cafe: Cafe, onOpen: () -> Unit, modifier: Modifier = Modifier)
             ) {
                 Icon(Icons.Filled.Bookmark, contentDescription = "Remove", tint = Color.White)
             }
+
         }
     }
 }
@@ -8616,7 +9526,7 @@ fun ExpandedCafeDetailOverlay(
     val overlayAlpha = sCurve(((transitionProgress - 0.04f) / 0.34f).coerceIn(0f, 1f))
     val detailTextColor = Color.White
     val detailSecondaryTextColor = Color.White.copy(alpha = 0.78f)
-    var showStudyComposer by remember(cafe.id) { mutableStateOf(false) }
+    var showStudyComposer by rememberSaveable(cafe.id) { mutableStateOf(false) }
     var showSuggestionOverlay by remember(cafe.id) { mutableStateOf(false) }
 
     LaunchedEffect(cafe.id) {
@@ -9270,31 +10180,47 @@ private fun StudySessionComposerOverlay(
     val interactionSource = remember { MutableInteractionSource() }
     var isVisible by remember { mutableStateOf(false) }
     var isClosing by remember { mutableStateOf(false) }
-    var title by remember(cafe.id) { mutableStateOf("") }
-    var className by remember(cafe.id) { mutableStateOf("") }
-    var selectedDateUtcMillis by remember(cafe.id) { mutableStateOf<Long?>(null) }
-    var selectedStartHour by remember(cafe.id) { mutableStateOf<Int?>(null) }
-    var selectedStartMinute by remember(cafe.id) { mutableStateOf<Int?>(null) }
-    var selectedEndHour by remember(cafe.id) { mutableStateOf<Int?>(null) }
-    var selectedEndMinute by remember(cafe.id) { mutableStateOf<Int?>(null) }
-    var summary by remember(cafe.id) { mutableStateOf("") }
-    var showDatePicker by remember(cafe.id) { mutableStateOf(false) }
+    var title by rememberSaveable(cafe.id) { mutableStateOf("") }
+    var className by rememberSaveable(cafe.id) { mutableStateOf("") }
+    var selectedDateUtcMillis by rememberSaveable(cafe.id) { mutableStateOf<Long?>(null) }
+    var selectedStartHour by rememberSaveable(cafe.id) { mutableStateOf<Int?>(null) }
+    var selectedStartMinute by rememberSaveable(cafe.id) { mutableStateOf<Int?>(null) }
+    var selectedEndHour by rememberSaveable(cafe.id) { mutableStateOf<Int?>(null) }
+    var selectedEndMinute by rememberSaveable(cafe.id) { mutableStateOf<Int?>(null) }
+    var summary by rememberSaveable(cafe.id) { mutableStateOf("") }
+    var showDatePicker by rememberSaveable(cafe.id) { mutableStateOf(false) }
     var activeTimeField by remember(cafe.id) { mutableStateOf<StudySessionTimeField?>(null) }
-    val selectedPhotoUris = remember(cafe.id) { mutableStateListOf<String>() }
+    var selectedPhotoUris by rememberSaveable(cafe.id) { mutableStateOf(emptyList<String>()) }
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.OpenMultipleDocuments()
     ) { uris ->
+        val updatedPhotoUris = selectedPhotoUris.toMutableList()
         uris.forEach { uri ->
             persistStudySessionPhotoPermission(context, uri)
             val uriText = uri.toString()
-            if (selectedPhotoUris.size < 5 && uriText !in selectedPhotoUris) {
-                selectedPhotoUris.add(uriText)
+            if (updatedPhotoUris.size < 5 && uriText !in updatedPhotoUris) {
+                updatedPhotoUris.add(uriText)
             }
         }
+        selectedPhotoUris = updatedPhotoUris
     }
 
     LaunchedEffect(Unit) {
         isVisible = true
+    }
+
+    fun resetDraft() {
+        title = ""
+        className = ""
+        selectedDateUtcMillis = null
+        selectedStartHour = null
+        selectedStartMinute = null
+        selectedEndHour = null
+        selectedEndMinute = null
+        summary = ""
+        showDatePicker = false
+        activeTimeField = null
+        selectedPhotoUris = emptyList()
     }
 
     fun closeComposer() {
@@ -9330,7 +10256,7 @@ private fun StudySessionComposerOverlay(
         endHour = selectedEndHour,
         endMinute = selectedEndMinute,
         summary = summary,
-        photoUris = selectedPhotoUris.toList()
+        photoUris = selectedPhotoUris
     )
     val canCreate = StudySessionRepository.canCreate(draft)
     val textFieldColors = studySessionTextFieldColors()
@@ -9556,7 +10482,7 @@ private fun StudySessionComposerOverlay(
                             selectedPhotoUris.forEach { uri ->
                                 StudySessionPhotoPreview(
                                     uri = uri,
-                                    onRemove = { selectedPhotoUris.remove(uri) }
+                                    onRemove = { selectedPhotoUris = selectedPhotoUris - uri }
                                 )
                             }
                         }
@@ -9577,6 +10503,7 @@ private fun StudySessionComposerOverlay(
                     Button(
                         onClick = {
                             StudySessionRepository.add(cafe, draft)?.let {
+                                resetDraft()
                                 closeComposer()
                             }
                         },
