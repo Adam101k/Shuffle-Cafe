@@ -7447,7 +7447,7 @@ private fun CafeReviewsMessagesPage(
                 .weight(1f)
                 .fillMaxWidth(),
             contentPadding = PaddingValues(horizontal = 14.dp, vertical = 14.dp),
-            verticalArrangement = Arrangement.spacedBy(10.dp)
+            verticalArrangement = Arrangement.spacedBy(26.dp)
         ) {
             if (reviews.isEmpty()) {
                 item {
@@ -7645,84 +7645,103 @@ private fun ReviewMessageBubble(
 ) {
     val reaction = ReviewReaction.fromKey(review.reaction_key)
 
-    Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = if (alignEnd) Arrangement.End else Arrangement.Start,
-        verticalAlignment = Alignment.Bottom
-    ) {
-        if (!alignEnd) {
-            ReviewAvatar(review = review)
-            Spacer(modifier = Modifier.width(8.dp))
+    BoxWithConstraints(modifier = Modifier.fillMaxWidth()) {
+        val avatarSize = 34.dp
+        val avatarGap = 8.dp
+        val avatarSlotWidth = avatarSize + avatarGap
+        val centerOverlap = 28.dp
+        val hardMaxBubbleWidth = 220.dp
+        val laneMaxBubbleWidth = (maxWidth / 2f) + centerOverlap - avatarSlotWidth
+        val bubbleMaxWidth = if (laneMaxBubbleWidth < hardMaxBubbleWidth) {
+            laneMaxBubbleWidth.coerceAtLeast(96.dp)
+        } else {
+            hardMaxBubbleWidth
+        }
+        val bubbleWidthModifier = if (review.photo_urls.isNotEmpty()) {
+            Modifier.width(bubbleMaxWidth)
+        } else {
+            Modifier.widthIn(max = bubbleMaxWidth)
         }
 
-        Column(
-            modifier = Modifier.widthIn(max = 286.dp),
-            horizontalAlignment = if (alignEnd) Alignment.End else Alignment.Start
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = if (alignEnd) Arrangement.End else Arrangement.Start,
+            verticalAlignment = Alignment.Bottom
         ) {
-            Text(
-                text = review.reviewerDisplayName(),
-                style = MaterialTheme.typography.labelSmall,
-                color = CoffeeDark.copy(alpha = 0.64f),
-                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis
-            )
-            Box {
-                Surface(
-                    shape = RoundedCornerShape(
-                        topStart = 19.dp,
-                        topEnd = 19.dp,
-                        bottomStart = if (alignEnd) 19.dp else 5.dp,
-                        bottomEnd = if (alignEnd) 5.dp else 19.dp
-                    ),
-                    color = if (alignEnd) CoffeeSurfaceLight else Color(0xFFFFF8F0),
-                    contentColor = CoffeeDark,
-                    shadowElevation = 1.dp,
-                    border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.1f))
-                ) {
-                    Column(
-                        modifier = Modifier.padding(
-                            start = if (reaction != null && alignEnd) 24.dp else 10.dp,
-                            top = if (review.photo_urls.isEmpty()) 9.dp else 10.dp,
-                            end = if (reaction != null && !alignEnd) 24.dp else 10.dp,
-                            bottom = if (reaction == null) 9.dp else 16.dp
+            if (!alignEnd) {
+                ReviewAvatar(review = review)
+                Spacer(modifier = Modifier.width(avatarGap))
+            }
+
+            Column(
+                modifier = bubbleWidthModifier,
+                horizontalAlignment = if (alignEnd) Alignment.End else Alignment.Start
+            ) {
+                Text(
+                    text = review.reviewerDisplayName(),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = CoffeeDark.copy(alpha = 0.64f),
+                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Box {
+                    Surface(
+                        shape = RoundedCornerShape(
+                            topStart = 19.dp,
+                            topEnd = 19.dp,
+                            bottomStart = if (alignEnd) 19.dp else 5.dp,
+                            bottomEnd = if (alignEnd) 5.dp else 19.dp
                         ),
-                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                        color = if (alignEnd) CoffeeSurfaceLight else Color(0xFFFFF8F0),
+                        contentColor = CoffeeDark,
+                        shadowElevation = 1.dp,
+                        border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.1f))
                     ) {
-                        if (review.photo_urls.isNotEmpty()) {
-                            ReviewBubblePhotoAttachment(
-                                photoUris = review.photo_urls,
-                                onClick = onPhotoClick
-                            )
-                        }
-                        if (review.body.isNotBlank()) {
-                            Text(
-                                text = review.body,
-                                style = MaterialTheme.typography.bodyMedium,
-                                lineHeight = 19.sp
-                            )
+                        Column(
+                            modifier = Modifier.padding(
+                                start = if (reaction != null && alignEnd) 24.dp else 10.dp,
+                                top = if (review.photo_urls.isEmpty()) 9.dp else 10.dp,
+                                end = if (reaction != null && !alignEnd) 24.dp else 10.dp,
+                                bottom = if (reaction == null) 9.dp else 16.dp
+                            ),
+                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            if (review.photo_urls.isNotEmpty()) {
+                                ReviewBubblePhotoAttachment(
+                                    photoUris = review.photo_urls,
+                                    onClick = onPhotoClick
+                                )
+                            }
+                            if (review.body.isNotBlank()) {
+                                Text(
+                                    text = review.body,
+                                    style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp),
+                                    lineHeight = 16.sp
+                                )
+                            }
                         }
                     }
-                }
 
-                reaction?.let { selectedReaction ->
-                    ReviewReactionBadge(
-                        reaction = selectedReaction,
-                        modifier = Modifier
-                            .align(if (alignEnd) Alignment.BottomStart else Alignment.BottomEnd)
-                            .offset(
-                                x = if (alignEnd) (-14).dp else 14.dp,
-                                y = 14.dp
+                    reaction?.let { selectedReaction ->
+                        ReviewReactionBadge(
+                            reaction = selectedReaction,
+                            modifier = Modifier
+                                .align(if (alignEnd) Alignment.BottomStart else Alignment.BottomEnd)
+                                .offset(
+                                    x = if (alignEnd) (-14).dp else 14.dp,
+                                    y = 14.dp
+                                )
+                                .zIndex(2f)
                             )
-                            .zIndex(2f)
-                    )
+                    }
                 }
             }
-        }
 
-        if (alignEnd) {
-            Spacer(modifier = Modifier.width(8.dp))
-            ReviewAvatar(review = review)
+            if (alignEnd) {
+                Spacer(modifier = Modifier.width(avatarGap))
+                ReviewAvatar(review = review)
+            }
         }
     }
 }
@@ -7766,8 +7785,8 @@ private fun ReviewBubblePhotoAttachment(
     val attachmentShape = RoundedCornerShape(14.dp)
     Box(
         modifier = Modifier
-            .width(196.dp)
-            .height(142.dp)
+            .fillMaxWidth()
+            .aspectRatio(196f / 142f)
             .clickable { onClick(0) },
         contentAlignment = Alignment.Center
     ) {
@@ -7797,7 +7816,7 @@ private fun ReviewBubblePhotoAttachment(
                 model = photoUris.first(),
                 contentDescription = "Review photo",
                 modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.Crop
+                contentScale = ContentScale.FillHeight
             )
         }
 
@@ -8002,9 +8021,13 @@ private fun ReviewMessageComposer(
                     placeholder = { Text("Message") },
                     modifier = Modifier
                         .weight(1f)
-                        .heightIn(min = 48.dp, max = 112.dp),
+                        .heightIn(min = 48.dp, max = 168.dp),
                     shape = RoundedCornerShape(24.dp),
-                    maxLines = 4,
+                    textStyle = MaterialTheme.typography.bodyMedium.copy(
+                        fontSize = 12.sp,
+                        lineHeight = 16.sp
+                    ),
+                    maxLines = 8,
                     enabled = !isPosting,
                     colors = OutlinedTextFieldDefaults.colors(
                         focusedTextColor = CoffeeDark,
