@@ -29,6 +29,9 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.RepeatMode
@@ -399,8 +402,8 @@ private const val MAP_MARKER_DESCRIPTOR_CACHE_MAX_ENTRIES = 120
 private const val CAFE_DETAIL_MAX_LOADED_PHOTOS = 4
 private const val CAFE_CARD_PHOTO_MAX_WIDTH = 720
 private const val CAFE_CARD_PHOTO_MAX_HEIGHT = 560
-private const val CAFE_DETAIL_PHOTO_MAX_WIDTH = 1100
-private const val CAFE_DETAIL_PHOTO_MAX_HEIGHT = 850
+private const val CAFE_DETAIL_PHOTO_MAX_WIDTH = 1600
+private const val CAFE_DETAIL_PHOTO_MAX_HEIGHT = 1200
 private const val UNKNOWN_CITY_CACHE_KEY = "nearby_unknown_city"
 private const val ADDRESS_UNAVAILABLE_TEXT = "Address unavailable"
 private const val PHONE_UNAVAILABLE_TEXT = "Phone unavailable"
@@ -703,6 +706,16 @@ private fun Cafe.nextUnloadedPhotoIndex(): Int? {
     return photoMetadatas.indices
         .take(CAFE_DETAIL_MAX_LOADED_PHOTOS)
         .firstOrNull { index -> photoBitmaps.getOrNull(index) == null }
+}
+
+private fun Cafe.nextPhotoIndexForDetail(): Int? {
+    if (photoMetadatas.isEmpty()) return null
+    return photoMetadatas.indices
+        .take(CAFE_DETAIL_MAX_LOADED_PHOTOS)
+        .firstOrNull { index ->
+            val bitmap = photoBitmaps.getOrNull(index)
+            bitmap == null || (bitmap.width <= CAFE_CARD_PHOTO_MAX_WIDTH && bitmap.height <= CAFE_CARD_PHOTO_MAX_HEIGHT)
+        }
 }
 
 internal fun mergeCafeDetailData(existingCafe: Cafe, detailCafe: Cafe): Cafe {
@@ -5328,7 +5341,7 @@ private fun CafeDetailDataEffect(
     ) {
         val selectedCafe = cafe ?: return@LaunchedEffect
         val client = placesClient ?: return@LaunchedEffect
-        val nextPhotoIndex = selectedCafe.nextUnloadedPhotoIndex() ?: return@LaunchedEffect
+        val nextPhotoIndex = selectedCafe.nextPhotoIndexForDetail() ?: return@LaunchedEffect
 
         val bitmap = fetchCafePhotoBitmap(
             placesClient = client,
@@ -7689,26 +7702,21 @@ private fun ReviewMessageBubble(
         val avatarSize = 34.dp
         val avatarGap = 8.dp
         val avatarSlotWidth = avatarSize + avatarGap
-        val centerOverlap = 28.dp
-        val hardMaxBubbleWidth = 220.dp
-        val laneMediaMaxWidth = ((maxWidth / 2f) - avatarSlotWidth - 4.dp).coerceAtLeast(112.dp)
-        val mediaMaxWidth = if (laneMediaMaxWidth < hardMaxBubbleWidth) {
-            laneMediaMaxWidth
-        } else {
-            hardMaxBubbleWidth
-        }
+        val centerOverlap = 72.dp
+        val hardMaxBubbleWidth = 288.dp
         val laneMaxBubbleWidth = (maxWidth / 2f) + centerOverlap - avatarSlotWidth
         val bubbleMaxWidth = if (laneMaxBubbleWidth < hardMaxBubbleWidth) {
             laneMaxBubbleWidth.coerceAtLeast(96.dp)
         } else {
             hardMaxBubbleWidth
         }
+        val mediaMaxWidth = bubbleMaxWidth
         val hasPhotos = review.photo_urls.isNotEmpty()
         val hasBody = review.body.isNotBlank()
         val messageBubbleColor = if (alignEnd) CoffeeSurfaceLight else Color(0xFFFFF8F0)
         val bodyTextStyle = MaterialTheme.typography.bodyMedium.copy(
-            fontSize = 12.sp,
-            lineHeight = 16.sp
+            fontSize = 10.sp,
+            lineHeight = 14.sp
         )
         val bodyStartPadding = if (reaction != null && alignEnd) 24.dp else 10.dp
         val bodyEndPadding = if (reaction != null && !alignEnd) 24.dp else 10.dp
@@ -7923,6 +7931,28 @@ private fun ReviewReactionBadge(
 }
 
 @Composable
+private fun ReactionTooltipBubble(label: String, visible: Boolean) {
+    AnimatedVisibility(
+        visible = visible,
+        enter = fadeIn(animationSpec = tween(150)),
+        exit = fadeOut(animationSpec = tween(250))
+    ) {
+        Surface(
+            shape = RoundedCornerShape(8.dp),
+            color = Color(0xFFFFFBF0),
+            shadowElevation = 3.dp
+        ) {
+            Text(
+                text = label,
+                color = Color.Black,
+                style = MaterialTheme.typography.labelMedium,
+                modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp)
+            )
+        }
+    }
+}
+
+@Composable
 private fun ReviewReactionTray(
     selectedReactionKey: String?,
     onReactionSelected: (String?) -> Unit,
@@ -7930,6 +7960,11 @@ private fun ReviewReactionTray(
     modifier: Modifier = Modifier
 ) {
     val selectedReaction = ReviewReaction.fromKey(selectedReactionKey)
+    var tooltipKey by remember { mutableStateOf<String?>(null) }
+    var tooltipVisible by remember { mutableStateOf(false) }
+    var tooltipJob by remember { mutableStateOf<Job?>(null) }
+    val scope = rememberCoroutineScope()
+    val density = LocalDensity.current
 
     Surface(
         modifier = modifier,
@@ -7950,29 +7985,58 @@ private fun ReviewReactionTray(
                 val isSelected = selectedReaction?.key == reaction.key
                 val borderColor = if (isSelected) Color(0xFF007AFF) else CoffeeDark.copy(alpha = 0.14f)
 
-                Surface(
-                    modifier = Modifier
-                        .size(42.dp)
-                        .clickable(enabled = enabled) {
-                            onReactionSelected(if (isSelected) null else reaction.key)
-                        },
-                    shape = CircleShape,
-                    color = if (isSelected) Color.White else Color.Transparent,
-                    border = BorderStroke(if (isSelected) 2.dp else 1.dp, borderColor),
-                    shadowElevation = if (isSelected) 2.dp else 0.dp
-                ) {
-                    Box(
-                        modifier = Modifier.padding(6.dp),
-                        contentAlignment = Alignment.Center
+                Box {
+                    if (tooltipKey == reaction.key) {
+                        Popup(
+                            alignment = Alignment.TopCenter,
+                            offset = IntOffset(0, with(density) { -52.dp.roundToPx() }),
+                            properties = PopupProperties(
+                                focusable = false,
+                                dismissOnBackPress = false,
+                                dismissOnClickOutside = false
+                            )
+                        ) {
+                            ReactionTooltipBubble(label = reaction.key, visible = tooltipVisible)
+                        }
+                    }
+
+                    Surface(
+                        modifier = Modifier
+                            .size(42.dp)
+                            .clickable(enabled = enabled) {
+                                tooltipJob?.cancel()
+                                tooltipVisible = false
+                                tooltipKey = null
+                                tooltipJob = scope.launch {
+                                    delay(32)
+                                    tooltipKey = reaction.key
+                                    delay(16)
+                                    tooltipVisible = true
+                                    delay(1500)
+                                    tooltipVisible = false
+                                    delay(300)
+                                    tooltipKey = null
+                                }
+                                onReactionSelected(if (isSelected) null else reaction.key)
+                            },
+                        shape = CircleShape,
+                        color = if (isSelected) Color.White else Color.Transparent,
+                        border = BorderStroke(if (isSelected) 2.dp else 1.dp, borderColor),
+                        shadowElevation = if (isSelected) 2.dp else 0.dp
                     ) {
-                        Image(
-                            painter = painterResource(reaction.iconRes),
-                            contentDescription = reaction.contentDescription,
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .scale(reaction.iconScale),
-                            contentScale = ContentScale.Fit
-                        )
+                        Box(
+                            modifier = Modifier.padding(6.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Image(
+                                painter = painterResource(reaction.iconRes),
+                                contentDescription = reaction.contentDescription,
+                                modifier = Modifier
+                                    .fillMaxSize()
+                                    .scale(reaction.iconScale),
+                                contentScale = ContentScale.Fit
+                            )
+                        }
                     }
                 }
             }
