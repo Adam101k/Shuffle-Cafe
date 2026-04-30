@@ -58,6 +58,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -200,6 +201,7 @@ import io.github.jan.supabase.exceptions.RestException
 import io.github.jan.supabase.postgrest.Postgrest
 import io.github.jan.supabase.postgrest.exception.PostgrestRestException
 import io.github.jan.supabase.postgrest.from
+import io.github.jan.supabase.postgrest.query.Order
 import io.github.jan.supabase.storage.storage
 import io.github.jan.supabase.auth.auth
 import io.github.jan.supabase.auth.status.SessionStatus
@@ -2360,8 +2362,22 @@ data class Review(
     val cafe_id: String,
     val user_id: String = "",
     val display_name: String? = null,
+    val avatar_url: String? = null,
     val body: String,
+    val photo_urls: List<String> = emptyList(),
+    val reaction_key: String? = null,
     val created_at: String = ""
+)
+
+@Serializable
+private data class ReviewInsert(
+    val cafe_id: String,
+    val user_id: String,
+    val display_name: String? = null,
+    val avatar_url: String? = null,
+    val body: String,
+    val photo_urls: List<String> = emptyList(),
+    val reaction_key: String? = null
 )
 
 object ReviewRepository {
@@ -2374,7 +2390,10 @@ object ReviewRepository {
     suspend fun loadMyReviews() {
         val user = supabase.auth.currentUserOrNull() ?: return
         val fetched = supabase.from("reviews")
-            .select { filter { eq("user_id", user.id) } }
+            .select {
+                filter { eq("user_id", user.id) }
+                order("created_at", Order.ASCENDING)
+            }
             .decodeList<Review>()
         myReviewsList.clear()
         myReviewsList.addAll(fetched)
@@ -2385,23 +2404,52 @@ object ReviewRepository {
 
     suspend fun loadReviews(cafeId: String) {
         val fetched = supabase.from("reviews")
-            .select { filter { eq("cafe_id", cafeId) } }
+            .select {
+                filter { eq("cafe_id", cafeId) }
+                order("created_at", Order.ASCENDING)
+            }
             .decodeList<Review>()
         val list = reviewsByCafe.getOrPut(cafeId) { mutableStateListOf() }
         list.clear()
         list.addAll(fetched)
     }
 
-    suspend fun addReview(cafeId: String, body: String, displayName: String?) {
-        val user = supabase.auth.currentUserOrNull() ?: return
-        val review = Review(
+    suspend fun addReview(
+        context: Context,
+        cafeId: String,
+        body: String,
+        photoUris: List<String> = emptyList(),
+        displayName: String? = null,
+        reactionKey: String? = null
+    ) {
+        val user = supabase.auth.currentUserOrNull()
+            ?: throw IllegalStateException("Sign in before posting a review.")
+        val profile = runCatching {
+            supabase.from("profiles")
+                .select { filter { eq("id", user.id) } }
+                .decodeSingle<Profile>()
+        }.getOrNull()
+        val reviewerName = profile?.reviewDisplayName()
+            ?: displayName?.trim()?.takeIf { it.isNotBlank() }
+            ?: user.email?.trim()?.takeIf { it.isNotBlank() }
+        val uploadedPhotoUrls = uploadReviewPhotos(
+            context = context,
+            cafeId = cafeId,
+            userId = user.id,
+            photoUris = photoUris.take(MAX_REVIEW_PHOTOS)
+        )
+        val review = ReviewInsert(
             cafe_id = cafeId,
             user_id = user.id,
-            display_name = displayName,
-            body = body
+            display_name = reviewerName,
+            avatar_url = profile?.avatar_url?.trim()?.takeIf { it.isNotBlank() },
+            body = body.trim(),
+            photo_urls = uploadedPhotoUrls,
+            reaction_key = ReviewReaction.fromKey(reactionKey)?.key
         )
         supabase.from("reviews").insert(review)
         loadReviews(cafeId) // refresh after posting
+        runCatching { loadMyReviews() }
     }
 
     suspend fun deleteReview(review: Review) {
@@ -5595,6 +5643,7 @@ private fun CardTodayHoursBubble(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
     val context = LocalContext.current
@@ -5610,6 +5659,8 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
     }
 
     val reviews = ReviewRepository.reviewsFor(cafeId)
+    val detailPagerState = rememberPagerState(pageCount = { 2 })
+    val detailPagerScope = rememberCoroutineScope()
 
     val isBookmarked = BookmarkRepository.isBookmarked(cafeId)
     CafeDetailDataEffect(cafe = cafe, placesClient = placesClient)
@@ -5636,148 +5687,135 @@ fun CafeDetailsScreen(navController: NavHostController, cafeId: String) {
             }
             val crowdAttributes = CrowdAttributeRepository.attributesFor(cafe.id)
 
-            LazyColumn(
+            HorizontalPager(
+                state = detailPagerState,
                 modifier = Modifier
                     .padding(innerPadding)
                     .fillMaxSize()
-                    .padding(horizontal = 16.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp)
-            ) {
-            item {
-                Spacer(Modifier.height(8.dp))
-
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    IconButton(onClick = { navController.popBackStack() }) {
-                        Icon(
-                            Icons.AutoMirrored.Filled.ArrowBack,
-                            contentDescription = "Back",
-                            tint = detailTextColor
-                        )
-                    }
-
-                    Text(
-                        cafe.name,
-                        style = MaterialTheme.typography.titleLarge,
-                        fontWeight = FontWeight.SemiBold,
-                        modifier = Modifier.weight(1f),
-                        textAlign = TextAlign.Center,
-                        color = detailTextColor
-                    )
-
-                    IconButton(
-                        onClick = { BookmarkRepository.toggle(cafeId) }
-                    ) {
-                        Icon(
-                            imageVector = if (isBookmarked) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder,
-                            contentDescription = if (isBookmarked) "Remove bookmark" else "Add bookmark",
-                            tint = detailTextColor
-                        )
-                    }
-                }
-            }
-
-            item {
-                Column(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalAlignment = Alignment.CenterHorizontally,
-                    verticalArrangement = Arrangement.spacedBy(10.dp)
-                ) {
-                    DetailInfoBubble(
-                        iconRes = R.drawable.address,
-                        iconName = "Address",
-                        value = cafe.address,
-                        maxLines = 3
-                    )
-                    DetailInfoBubble(
-                        iconRes = R.drawable.phone,
-                        iconName = "Phone",
-                        value = cafe.phone,
-                        maxLines = 2,
-                        copyLabel = "${cafe.name} phone number"
-                    )
-                    Text(cafe.status, color = detailTextColor)
-                    HoursDropdown(cafe.hours)
-                }
-                Spacer(Modifier.height(12.dp))
-                StudySessionActionRow(
-                    cafe = cafe,
-                    onCreateStudySession = { studyComposerCafe = cafe },
-                    modifier = Modifier.fillMaxWidth()
-                )
-            }
-
-            item {
-                CafeCrowdAttributesPanel(
-                    cafe = cafe,
-                    attributes = crowdAttributes,
-                    backendState = crowdAttributeBackendState,
-                    onSuggestChanges = { suggestionCafe = cafe }
-                )
-            }
-
-            item {
-                OutlinedCard(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(4.dp),
-                    border = BorderStroke(1.dp, Color.Black),
-                    colors = CardDefaults.outlinedCardColors(
-                        containerColor = SelectedCafeSurfaceColor,
-                        contentColor = detailTextColor
-                    )
-                ) {
-                    Row(
-                        modifier = Modifier.padding(12.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Menu", modifier = Modifier.weight(1f), color = detailTextColor)
-                        Icon(Icons.Filled.PlayArrow, null, tint = detailTextColor)
-                    }
-                }
-            }
-
-            item {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text("Reviews:", modifier = Modifier.weight(1f), color = detailTextColor)
-                    TextButton(
-                        onClick = { navController.navigate(Screen.WriteReview.createRoute(cafeId)) },
-                        colors = ButtonDefaults.textButtonColors(contentColor = detailTextColor)
-                    ) {
-                        Text("Write review")
-                    }
-                }
-            }
-
-            if (reviews.isEmpty()) {
-                item { Text("No reviews yet.", color = detailSecondaryTextColor) }
-            } else {
-                items(reviews) { review ->
-                    OutlinedCard(
+            ) { page ->
+                if (page == 0) {
+                    LazyColumn(
                         modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 20.dp),
-                        border = BorderStroke(1.dp, Color.Black),
-                        colors = CardDefaults.outlinedCardColors(
-                            containerColor = SelectedCafeSurfaceColor,
-                            contentColor = detailTextColor
-                        )
+                            .fillMaxSize()
+                            .padding(horizontal = 16.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp)
                     ) {
-                        Column(modifier = Modifier.padding(12.dp)) {
-                            review.display_name?.let { name ->
-                                Text(name, fontWeight = FontWeight.SemiBold,
-                                    style = MaterialTheme.typography.labelSmall, color = detailTextColor)
+                        item {
+                            Spacer(Modifier.height(8.dp))
+
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                verticalAlignment = Alignment.CenterVertically
+                            ) {
+                                IconButton(onClick = { navController.popBackStack() }) {
+                                    Icon(
+                                        Icons.AutoMirrored.Filled.ArrowBack,
+                                        contentDescription = "Back",
+                                        tint = detailTextColor
+                                    )
+                                }
+
+                                Text(
+                                    cafe.name,
+                                    style = MaterialTheme.typography.titleLarge,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.weight(1f),
+                                    textAlign = TextAlign.Center,
+                                    color = detailTextColor
+                                )
+
+                                IconButton(
+                                    onClick = { BookmarkRepository.toggle(cafeId) }
+                                ) {
+                                    Icon(
+                                        imageVector = if (isBookmarked) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder,
+                                        contentDescription = if (isBookmarked) "Remove bookmark" else "Add bookmark",
+                                        tint = detailTextColor
+                                    )
+                                }
                             }
-                            Text(review.body, color = detailTextColor)
+                        }
+
+                        item {
+                            Column(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                DetailInfoBubble(
+                                    iconRes = R.drawable.address,
+                                    iconName = "Address",
+                                    value = cafe.address,
+                                    maxLines = 3
+                                )
+                                DetailInfoBubble(
+                                    iconRes = R.drawable.phone,
+                                    iconName = "Phone",
+                                    value = cafe.phone,
+                                    maxLines = 2,
+                                    copyLabel = "${cafe.name} phone number"
+                                )
+                                Text(cafe.status, color = detailTextColor)
+                                HoursDropdown(cafe.hours)
+                            }
+                            Spacer(Modifier.height(12.dp))
+                            StudySessionActionRow(
+                                cafe = cafe,
+                                onCreateStudySession = { studyComposerCafe = cafe },
+                                modifier = Modifier.fillMaxWidth()
+                            )
+                        }
+
+                        item {
+                            CafeCrowdAttributesPanel(
+                                cafe = cafe,
+                                attributes = crowdAttributes,
+                                backendState = crowdAttributeBackendState,
+                                onSuggestChanges = { suggestionCafe = cafe }
+                            )
+                        }
+
+                        item {
+                            OutlinedCard(
+                                modifier = Modifier.fillMaxWidth(),
+                                shape = RoundedCornerShape(4.dp),
+                                border = BorderStroke(1.dp, Color.Black),
+                                colors = CardDefaults.outlinedCardColors(
+                                    containerColor = SelectedCafeSurfaceColor,
+                                    contentColor = detailTextColor
+                                )
+                            ) {
+                                Row(
+                                    modifier = Modifier.padding(12.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Text("Menu", modifier = Modifier.weight(1f), color = detailTextColor)
+                                    Icon(Icons.Filled.PlayArrow, null, tint = detailTextColor)
+                                }
+                            }
+                        }
+
+                        item {
+                            ReviewsSlideEntry(
+                                reviewCount = reviews.size,
+                                onOpenReviews = {
+                                    detailPagerScope.launch { detailPagerState.animateScrollToPage(1) }
+                                }
+                            )
                         }
                     }
+                } else {
+                    CafeReviewsMessagesPage(
+                        cafe = cafe,
+                        reviews = reviews,
+                        onClose = { navController.popBackStack() },
+                        onOpenDetails = {
+                            detailPagerScope.launch { detailPagerState.animateScrollToPage(0) }
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
                 }
             }
-        }
         }
 
         studyComposerCafe?.let { selectedCafe ->
@@ -5927,6 +5965,8 @@ private val StudySessionPopupFieldTextColor = Color.Black
 private val StudySessionPaperColor = Color(0xFFD9EEFF)
 private val StudySessionPaperFieldColor = Color(0xFFEAF7FF)
 private val StudySessionPaperBorderColor = Color(0xFF78BFEA)
+private val StudySessionSavedContainerColor = Color(0xFFE4F5FF)
+private val StudySessionSavedContainerBorderColor = Color(0xFF2F7FBC)
 private val StudySessionPaperTextColor = Color(0xFF12304A)
 private val StudySessionPaperSecondaryTextColor = StudySessionPaperTextColor.copy(alpha = 0.68f)
 private val StudySessionPaperDateTextColor = StudySessionPaperTextColor.copy(alpha = 0.48f)
@@ -5934,6 +5974,30 @@ private val StudySessionPaperAccentColor = Color(0xFF185FA5)
 private val CrowdActionBubbleSize = 42.dp
 private const val CROWD_TOOLTIP_DISPLAY_MILLIS = 2400L
 private const val CAFE_CROWD_PHOTO_BUCKET = "cafe-crowd-photos"
+private const val REVIEW_PHOTO_BUCKET = "review-photos"
+private const val MAX_REVIEW_PHOTOS = 5
+
+private data class ReviewReaction(
+    val key: String,
+    val iconRes: Int,
+    val contentDescription: String,
+    val iconScale: Float = 1f
+) {
+    companion object {
+        val options = listOf(
+            ReviewReaction("terrible", R.drawable.terrible, "Terrible reaction"),
+            ReviewReaction("mid", R.drawable.mid, "Mid reaction"),
+            ReviewReaction("good", R.drawable.good, "Good reaction"),
+            ReviewReaction("great", R.drawable.great, "Great reaction"),
+            ReviewReaction("incredible", R.drawable.incredible, "Incredible reaction", iconScale = 1.3f)
+        )
+
+        fun fromKey(key: String?): ReviewReaction? {
+            val normalizedKey = key?.trim()?.lowercase(Locale.US) ?: return null
+            return options.firstOrNull { reaction -> reaction.key == normalizedKey }
+        }
+    }
+}
 
 private data class VisitorPhotoViewerState(
     val title: String,
@@ -7355,6 +7419,725 @@ private fun VisitorPhotoPageIndicator(
     }
 }
 
+@Composable
+private fun CafeReviewsMessagesPage(
+    cafe: Cafe,
+    reviews: List<Review>,
+    onClose: () -> Unit,
+    onOpenDetails: () -> Unit,
+    modifier: Modifier = Modifier,
+    contentPadding: PaddingValues = PaddingValues()
+) {
+    var photoViewerState by remember(cafe.id) { mutableStateOf<VisitorPhotoViewerState?>(null) }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .background(Color(0xFFF6E9D8))
+            .padding(contentPadding)
+    ) {
+        ReviewMessagesHeader(
+            cafe = cafe,
+            onClose = onClose,
+            onOpenDetails = onOpenDetails
+        )
+
+        LazyColumn(
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxWidth(),
+            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            if (reviews.isEmpty()) {
+                item {
+                    ReviewMessagesEmptyState(modifier = Modifier.fillMaxWidth())
+                }
+            } else {
+                itemsIndexed(
+                    items = reviews,
+                    key = { index, review ->
+                        review.id.ifBlank { "${review.cafe_id}-${review.created_at}-$index" }
+                    }
+                ) { index, review ->
+                    ReviewMessageBubble(
+                        review = review,
+                        alignEnd = index % 2 == 1,
+                        onPhotoClick = { photoIndex ->
+                            photoViewerState = VisitorPhotoViewerState(
+                                title = "${review.reviewerDisplayName()} photos",
+                                photoUris = review.photo_urls,
+                                initialIndex = photoIndex
+                            )
+                        }
+                    )
+                }
+            }
+        }
+
+        ReviewMessageComposer(
+            cafe = cafe,
+            modifier = Modifier.fillMaxWidth()
+        )
+    }
+
+    photoViewerState
+        ?.takeIf { it.photoUris.isNotEmpty() }
+        ?.let { viewerState ->
+            VisitorPhotoFullScreenViewer(
+                title = viewerState.title,
+                photoUris = viewerState.photoUris,
+                initialPage = viewerState.initialIndex,
+                onDismiss = { photoViewerState = null }
+            )
+        }
+}
+
+@Composable
+private fun ReviewMessagesHeader(
+    cafe: Cafe,
+    onClose: () -> Unit,
+    onOpenDetails: () -> Unit
+) {
+    Surface(
+        modifier = Modifier.fillMaxWidth(),
+        color = CoffeeSurfaceLight,
+        contentColor = CoffeeDark,
+        shadowElevation = 2.dp
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .heightIn(min = 74.dp)
+                .padding(horizontal = 6.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            IconButton(
+                onClick = onOpenDetails,
+                modifier = Modifier.size(48.dp)
+            ) {
+                Icon(
+                    Icons.AutoMirrored.Filled.ArrowBack,
+                    contentDescription = "Back to details",
+                    tint = CoffeeDark
+                )
+            }
+            Column(
+                modifier = Modifier.weight(1f),
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.spacedBy(2.dp)
+            ) {
+                Surface(
+                    modifier = Modifier.size(40.dp),
+                    shape = CircleShape,
+                    color = Color(0xFFF6E9D8),
+                    border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.16f)),
+                    shadowElevation = 1.dp
+                ) {
+                    AsyncImage(
+                        model = cafe.primaryImageModel(),
+                        contentDescription = "${cafe.name} thumbnail",
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
+                    )
+                }
+                Text(
+                    text = cafe.name,
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = CoffeeDark.copy(alpha = 0.82f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth(0.86f)
+                )
+            }
+            IconButton(
+                onClick = onClose,
+                modifier = Modifier.size(48.dp)
+            ) {
+                Icon(
+                    Icons.Filled.Close,
+                    contentDescription = "Close reviews",
+                    tint = CoffeeDark
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReviewMessagesEmptyState(modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier.padding(vertical = 44.dp, horizontal = 20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        Surface(
+            modifier = Modifier.size(54.dp),
+            shape = CircleShape,
+            color = CoffeeSurfaceLight,
+            border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.12f))
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    Icons.Filled.ChatBubbleOutline,
+                    contentDescription = null,
+                    tint = CoffeeDark.copy(alpha = 0.64f)
+                )
+            }
+        }
+        Text(
+            text = "No reviews yet.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = CoffeeDark.copy(alpha = 0.72f),
+            textAlign = TextAlign.Center
+        )
+    }
+}
+
+@Composable
+private fun ReviewsSlideEntry(
+    reviewCount: Int,
+    onOpenReviews: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier
+            .fillMaxWidth()
+            .clickable { onOpenReviews() },
+        shape = RoundedCornerShape(24.dp),
+        color = DetailInfoBubbleColor,
+        contentColor = DetailInfoBubbleTextColor,
+        shadowElevation = 1.dp
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(10.dp)
+        ) {
+            Icon(Icons.Filled.ChatBubbleOutline, contentDescription = null)
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "Reviews",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Text(
+                    text = if (reviewCount == 1) "1 message" else "$reviewCount messages",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = DetailInfoBubbleTextColor.copy(alpha = 0.72f)
+                )
+            }
+            Icon(
+                Icons.AutoMirrored.Filled.ArrowForward,
+                contentDescription = "Open reviews"
+            )
+        }
+    }
+}
+
+@Composable
+private fun ReviewMessageBubble(
+    review: Review,
+    alignEnd: Boolean,
+    onPhotoClick: (Int) -> Unit
+) {
+    val reaction = ReviewReaction.fromKey(review.reaction_key)
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = if (alignEnd) Arrangement.End else Arrangement.Start,
+        verticalAlignment = Alignment.Bottom
+    ) {
+        if (!alignEnd) {
+            ReviewAvatar(review = review)
+            Spacer(modifier = Modifier.width(8.dp))
+        }
+
+        Column(
+            modifier = Modifier.widthIn(max = 286.dp),
+            horizontalAlignment = if (alignEnd) Alignment.End else Alignment.Start
+        ) {
+            Text(
+                text = review.reviewerDisplayName(),
+                style = MaterialTheme.typography.labelSmall,
+                color = CoffeeDark.copy(alpha = 0.64f),
+                modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Box {
+                Surface(
+                    shape = RoundedCornerShape(
+                        topStart = 19.dp,
+                        topEnd = 19.dp,
+                        bottomStart = if (alignEnd) 19.dp else 5.dp,
+                        bottomEnd = if (alignEnd) 5.dp else 19.dp
+                    ),
+                    color = if (alignEnd) CoffeeSurfaceLight else Color(0xFFFFF8F0),
+                    contentColor = CoffeeDark,
+                    shadowElevation = 1.dp,
+                    border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.1f))
+                ) {
+                    Column(
+                        modifier = Modifier.padding(
+                            start = if (reaction != null && alignEnd) 24.dp else 10.dp,
+                            top = if (review.photo_urls.isEmpty()) 9.dp else 10.dp,
+                            end = if (reaction != null && !alignEnd) 24.dp else 10.dp,
+                            bottom = if (reaction == null) 9.dp else 16.dp
+                        ),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        if (review.photo_urls.isNotEmpty()) {
+                            ReviewBubblePhotoAttachment(
+                                photoUris = review.photo_urls,
+                                onClick = onPhotoClick
+                            )
+                        }
+                        if (review.body.isNotBlank()) {
+                            Text(
+                                text = review.body,
+                                style = MaterialTheme.typography.bodyMedium,
+                                lineHeight = 19.sp
+                            )
+                        }
+                    }
+                }
+
+                reaction?.let { selectedReaction ->
+                    ReviewReactionBadge(
+                        reaction = selectedReaction,
+                        modifier = Modifier
+                            .align(if (alignEnd) Alignment.BottomStart else Alignment.BottomEnd)
+                            .offset(
+                                x = if (alignEnd) (-14).dp else 14.dp,
+                                y = 14.dp
+                            )
+                            .zIndex(2f)
+                    )
+                }
+            }
+        }
+
+        if (alignEnd) {
+            Spacer(modifier = Modifier.width(8.dp))
+            ReviewAvatar(review = review)
+        }
+    }
+}
+
+@Composable
+private fun ReviewAvatar(review: Review) {
+    Surface(
+        modifier = Modifier.size(34.dp),
+        shape = CircleShape,
+        color = Color(0xFFE6D6CC),
+        contentColor = Color(0xFF4B3621),
+        border = BorderStroke(1.dp, Color.White.copy(alpha = 0.9f))
+    ) {
+        val avatarUrl = review.avatar_url?.trim()?.takeIf { it.isNotBlank() }
+        if (avatarUrl != null) {
+            AsyncImage(
+                model = avatarUrl,
+                contentDescription = "${review.reviewerDisplayName()} profile picture",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        } else {
+            Box(contentAlignment = Alignment.Center) {
+                Text(
+                    text = review.reviewerInitials(),
+                    style = MaterialTheme.typography.labelSmall,
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReviewBubblePhotoAttachment(
+    photoUris: List<String>,
+    onClick: (Int) -> Unit
+) {
+    if (photoUris.isEmpty()) return
+
+    val attachmentShape = RoundedCornerShape(14.dp)
+    Box(
+        modifier = Modifier
+            .width(196.dp)
+            .height(142.dp)
+            .clickable { onClick(0) },
+        contentAlignment = Alignment.Center
+    ) {
+        if (photoUris.size > 1) {
+            repeat(minOf(photoUris.size - 1, 2)) { index ->
+                Surface(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .offset(x = ((index + 1) * 5).dp, y = (-(index + 1) * 5).dp)
+                        .padding(4.dp)
+                        .zIndex(index.toFloat()),
+                    shape = attachmentShape,
+                    color = Color.White.copy(alpha = 0.72f),
+                    border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.1f))
+                ) {}
+            }
+        }
+
+        Surface(
+            modifier = Modifier
+                .matchParentSize()
+                .zIndex(4f),
+            shape = attachmentShape,
+            color = Color.Black.copy(alpha = 0.06f)
+        ) {
+            AsyncImage(
+                model = photoUris.first(),
+                contentDescription = "Review photo",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        }
+
+        if (photoUris.size > 1) {
+            Box(
+                modifier = Modifier
+                    .matchParentSize()
+                    .zIndex(5f)
+                    .background(
+                        Brush.verticalGradient(
+                            listOf(Color.Transparent, Color.Black.copy(alpha = 0.58f))
+                        ),
+                        attachmentShape
+                    ),
+                contentAlignment = Alignment.BottomCenter
+            ) {
+                Text(
+                    text = "Tap to reveal ${photoUris.size} photos",
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    modifier = Modifier.padding(10.dp),
+                    textAlign = TextAlign.Center
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReviewReactionBadge(
+    reaction: ReviewReaction,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        modifier = modifier.size(38.dp),
+        shape = CircleShape,
+        color = Color(0xFFFFF8F0),
+        border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.22f)),
+        shadowElevation = 3.dp
+    ) {
+        Box(
+            modifier = Modifier.padding(5.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Image(
+                painter = painterResource(reaction.iconRes),
+                contentDescription = "${reaction.contentDescription} badge",
+                modifier = Modifier
+                    .fillMaxSize()
+                    .scale(reaction.iconScale),
+                contentScale = ContentScale.Fit
+            )
+        }
+    }
+}
+
+@Composable
+private fun ReviewReactionTray(
+    selectedReactionKey: String?,
+    onReactionSelected: (String?) -> Unit,
+    enabled: Boolean,
+    modifier: Modifier = Modifier
+) {
+    val selectedReaction = ReviewReaction.fromKey(selectedReactionKey)
+
+    Surface(
+        modifier = modifier,
+        shape = RoundedCornerShape(22.dp),
+        color = Color(0xFFF6E9D8),
+        contentColor = CoffeeDark,
+        border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.14f)),
+        shadowElevation = 1.dp
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            ReviewReaction.options.forEach { reaction ->
+                val isSelected = selectedReaction?.key == reaction.key
+                val borderColor = if (isSelected) Color(0xFF007AFF) else CoffeeDark.copy(alpha = 0.14f)
+
+                Surface(
+                    modifier = Modifier
+                        .size(42.dp)
+                        .clickable(enabled = enabled) {
+                            onReactionSelected(if (isSelected) null else reaction.key)
+                        },
+                    shape = CircleShape,
+                    color = if (isSelected) Color.White else Color.Transparent,
+                    border = BorderStroke(if (isSelected) 2.dp else 1.dp, borderColor),
+                    shadowElevation = if (isSelected) 2.dp else 0.dp
+                ) {
+                    Box(
+                        modifier = Modifier.padding(6.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Image(
+                            painter = painterResource(reaction.iconRes),
+                            contentDescription = reaction.contentDescription,
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .scale(reaction.iconScale),
+                            contentScale = ContentScale.Fit
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReviewMessageComposer(
+    cafe: Cafe,
+    modifier: Modifier = Modifier
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var body by rememberSaveable(cafe.id) { mutableStateOf("") }
+    var selectedPhotoUris by rememberSaveable(cafe.id) { mutableStateOf(emptyList<String>()) }
+    var selectedReactionKey by rememberSaveable(cafe.id) { mutableStateOf<String?>(null) }
+    var isPosting by remember(cafe.id) { mutableStateOf(false) }
+    var postError by remember(cafe.id) { mutableStateOf<String?>(null) }
+    val photoPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.GetMultipleContents()
+    ) { uris ->
+        selectedPhotoUris = addPickedReviewPhotoUris(selectedPhotoUris, uris)
+    }
+    val canPost = (body.isNotBlank() || selectedPhotoUris.isNotEmpty()) && !isPosting
+
+    Surface(
+        modifier = modifier,
+        color = CoffeeSurfaceLight,
+        contentColor = CoffeeDark,
+        shadowElevation = 6.dp
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            if (selectedPhotoUris.isNotEmpty()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    selectedPhotoUris.forEach { uri ->
+                        ReviewComposerPhotoPreview(
+                            uri = uri,
+                            onRemove = { selectedPhotoUris = selectedPhotoUris - uri }
+                        )
+                    }
+                }
+            }
+
+            ReviewReactionTray(
+                selectedReactionKey = selectedReactionKey,
+                onReactionSelected = { reactionKey -> selectedReactionKey = reactionKey },
+                enabled = !isPosting,
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            postError?.let { message ->
+                Text(
+                    text = message,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error
+                )
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(7.dp)
+            ) {
+                IconButton(
+                    onClick = { photoPicker.launch("image/*") },
+                    enabled = selectedPhotoUris.size < MAX_REVIEW_PHOTOS && !isPosting,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .background(Color(0xFFF6E9D8), CircleShape)
+                ) {
+                    Icon(
+                        Icons.Filled.AddPhotoAlternate,
+                        contentDescription = "Attach review photos",
+                        tint = if (selectedPhotoUris.size < MAX_REVIEW_PHOTOS) {
+                            CoffeeDark
+                        } else {
+                            CoffeeDark.copy(alpha = 0.38f)
+                        }
+                    )
+                }
+
+                OutlinedTextField(
+                    value = body,
+                    onValueChange = { body = it },
+                    placeholder = { Text("Message") },
+                    modifier = Modifier
+                        .weight(1f)
+                        .heightIn(min = 48.dp, max = 112.dp),
+                    shape = RoundedCornerShape(24.dp),
+                    maxLines = 4,
+                    enabled = !isPosting,
+                    colors = OutlinedTextFieldDefaults.colors(
+                        focusedTextColor = CoffeeDark,
+                        unfocusedTextColor = CoffeeDark,
+                        focusedPlaceholderColor = CoffeeDark.copy(alpha = 0.54f),
+                        unfocusedPlaceholderColor = CoffeeDark.copy(alpha = 0.54f),
+                        focusedBorderColor = CoffeeDark.copy(alpha = 0.34f),
+                        unfocusedBorderColor = CoffeeDark.copy(alpha = 0.18f),
+                        focusedContainerColor = Color(0xFFFFF8F0),
+                        unfocusedContainerColor = Color(0xFFFFF8F0),
+                        disabledContainerColor = Color(0xFFFFF8F0).copy(alpha = 0.72f),
+                        cursorColor = Color(0xFF007AFF)
+                    )
+                )
+
+                IconButton(
+                    onClick = {
+                        if (!canPost) return@IconButton
+                        isPosting = true
+                        postError = null
+                        val reviewText = body
+                        val photoUris = selectedPhotoUris
+                        val reactionKey = selectedReactionKey
+                        scope.launch {
+                            runCatching {
+                                ReviewRepository.addReview(
+                                    context = context,
+                                    cafeId = cafe.id,
+                                    body = reviewText,
+                                    photoUris = photoUris,
+                                    reactionKey = reactionKey
+                                )
+                            }.onSuccess {
+                                body = ""
+                                selectedPhotoUris = emptyList()
+                                selectedReactionKey = null
+                            }.onFailure { error ->
+                                postError = error.toReviewPostMessage()
+                            }
+                            isPosting = false
+                        }
+                    },
+                    enabled = canPost,
+                    modifier = Modifier
+                        .size(48.dp)
+                        .background(
+                            if (canPost) Color(0xFF007AFF) else Color(0xFFF6E9D8),
+                            CircleShape
+                        )
+                ) {
+                    if (isPosting) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(18.dp),
+                            strokeWidth = 2.dp,
+                            color = Color.White
+                        )
+                    } else {
+                        Icon(
+                            Icons.AutoMirrored.Filled.ArrowForward,
+                            contentDescription = "Post review",
+                            tint = if (canPost) Color.White else CoffeeDark.copy(alpha = 0.38f)
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReviewComposerPhotoPreview(
+    uri: String,
+    onRemove: () -> Unit
+) {
+    Box(modifier = Modifier.size(64.dp)) {
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            shape = RoundedCornerShape(12.dp),
+            color = Color.White,
+            border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.1f))
+        ) {
+            AsyncImage(
+                model = uri,
+                contentDescription = "Selected review photo",
+                modifier = Modifier.fillMaxSize(),
+                contentScale = ContentScale.Crop
+            )
+        }
+        Surface(
+            modifier = Modifier
+                .align(Alignment.TopEnd)
+                .padding(3.dp)
+                .size(22.dp)
+                .clickable { onRemove() },
+            shape = CircleShape,
+            color = Color.Black.copy(alpha = 0.66f),
+            contentColor = Color.White
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    Icons.Filled.Close,
+                    contentDescription = "Remove review photo",
+                    modifier = Modifier.size(13.dp)
+                )
+            }
+        }
+    }
+}
+
+private fun Review.reviewerDisplayName(): String {
+    return display_name?.trim()?.takeIf { it.isNotBlank() } ?: "Reviewer"
+}
+
+private fun Review.reviewerInitials(): String {
+    val name = reviewerDisplayName()
+    val initials = name
+        .split(Regex("\\s+"))
+        .mapNotNull { part -> part.firstOrNull()?.uppercaseChar()?.toString() }
+        .take(2)
+        .joinToString("")
+    return initials.ifBlank { "R" }
+}
+
+private fun Review.previewText(): String {
+    return body.trim().ifBlank {
+        when (photo_urls.size) {
+            0 -> "Review"
+            1 -> "Photo review"
+            else -> "${photo_urls.size} photo review"
+        }
+    }
+}
+
 private fun List<Offset>.averageOffset(): Offset {
     if (isEmpty()) return Offset.Zero
 
@@ -7395,6 +8178,62 @@ private fun addPickedPhotoUris(
                 target.add(uriText)
             }
         }
+}
+
+private fun addPickedReviewPhotoUris(
+    currentPhotoUris: List<String>,
+    pickedUris: List<Uri>
+): List<String> {
+    val updatedPhotoUris = currentPhotoUris.toMutableList()
+    pickedUris
+        .map(Uri::toString)
+        .forEach { uriText ->
+            if (updatedPhotoUris.size < MAX_REVIEW_PHOTOS && uriText !in updatedPhotoUris) {
+                updatedPhotoUris.add(uriText)
+            }
+        }
+    return updatedPhotoUris
+}
+
+private suspend fun uploadReviewPhotos(
+    context: Context,
+    cafeId: String,
+    userId: String,
+    photoUris: List<String>
+): List<String> {
+    if (photoUris.isEmpty()) return emptyList()
+
+    val bucket = supabase.storage.from(REVIEW_PHOTO_BUCKET)
+    val cafePath = cafeId.toStoragePathSegment()
+    val userPath = userId.toStoragePathSegment()
+    val uploadedUrls = mutableListOf<String>()
+
+    photoUris
+        .mapNotNull { uriText -> uriText.trim().takeIf { it.isNotBlank() } }
+        .distinct()
+        .take(MAX_REVIEW_PHOTOS)
+        .forEach { uriText ->
+            if (uriText.startsWith("http://") || uriText.startsWith("https://")) {
+                uploadedUrls.add(uriText)
+                return@forEach
+            }
+
+            val uri = Uri.parse(uriText)
+            val bytes = withContext(Dispatchers.IO) {
+                context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                    inputStream.readBytes()
+                }
+            } ?: return@forEach
+
+            val storagePath = "$cafePath/$userPath/${UUID.randomUUID()}.jpg"
+            bucket.upload(
+                path = storagePath,
+                data = bytes
+            )
+            uploadedUrls.add(bucket.publicUrl(storagePath))
+        }
+
+    return uploadedUrls
 }
 
 private suspend fun uploadCafeCrowdPhotos(
@@ -7444,6 +8283,39 @@ private fun String.toStoragePathSegment(): String {
 private fun Throwable.toCrowdSuggestionMessage(): String = toCrowdBackendMessage("submit this suggestion")
 
 private fun Throwable.toCrowdLoadMessage(): String = toCrowdBackendMessage("load community suggestions")
+
+private fun Throwable.toReviewPostMessage(): String {
+    val details = buildList {
+        message?.takeIf { it.isNotBlank() }?.let { add(it) }
+        when (this@toReviewPostMessage) {
+            is PostgrestRestException -> {
+                code?.takeIf { it.isNotBlank() }?.let { add("Code: $it") }
+                hint?.takeIf { it.isNotBlank() }?.let { add("Hint: $it") }
+                details?.toString()?.takeIf { it.isNotBlank() && it != "null" }?.let { add("Details: $it") }
+            }
+            is RestException -> {
+                description?.takeIf { it.isNotBlank() }?.let { add(it) }
+            }
+        }
+    }.joinToString(" ")
+
+    return when {
+        details.contains("Sign in", ignoreCase = true) ->
+            "Sign in before posting a review."
+        this is RestException && (statusCode == 401 || statusCode == 403) ->
+            "Sign in before posting a review. ${details.toDebugSuffix()}"
+        this is HttpRequestException ->
+            "Could not reach Supabase. Check your connection and try again."
+        details.contains(REVIEW_PHOTO_BUCKET, ignoreCase = true) ->
+            "Review photo uploads are not set up yet. Run the review photo SQL setup, then try again. ${details.toDebugSuffix()}"
+        details.contains("photo_urls", ignoreCase = true) ||
+            details.contains("avatar_url", ignoreCase = true) ||
+            details.contains("reaction_key", ignoreCase = true) ->
+            "Reviews need the latest Supabase columns before posting works. Run the review photo SQL setup, then try again. ${details.toDebugSuffix()}"
+        else ->
+            "Could not post this review yet. ${details.toDebugSuffix().ifBlank { this::class.simpleName ?: "Unknown error" }}"
+    }
+}
 
 private fun Throwable.toCrowdBackendMessage(operation: String): String {
     val details = buildList {
@@ -8130,6 +9002,7 @@ fun RecentCafeRow(
 
 @Composable
 fun WriteReviewScreen(navController: NavHostController, cafeId: String) {
+    val context = LocalContext.current
     var text by rememberSaveable { mutableStateOf("") }
     val scope = rememberCoroutineScope()
     var isPosting by remember { mutableStateOf(false) }
@@ -8162,6 +9035,7 @@ fun WriteReviewScreen(navController: NavHostController, cafeId: String) {
                         scope.launch {
                             runCatching {
                                 ReviewRepository.addReview(
+                                    context = context,
                                     cafeId = cafeId,
                                     body = text,
                                     displayName = authorDisplayName
@@ -8209,43 +9083,44 @@ private fun PlaceSaved(
                 onSavedCafeSelected = onSavedCafeSelected
             )
         }
-        Column(horizontalAlignment = Alignment.CenterHorizontally) {
-            StudySessionSectionLabel()
-            Spacer(Modifier.height(1.dp))
-            StudySessionCarousel(
-                studySessions = studySessions,
-                onStudySessionSelected = onStudySessionSelected
-            )
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(18.dp),
+            color = StudySessionSavedContainerColor.copy(alpha = 0.72f),
+            border = BorderStroke(2.dp, StudySessionSavedContainerBorderColor)
+        ) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                StudySessionSectionLabel()
+                StudySessionCarousel(
+                    studySessions = studySessions,
+                    onStudySessionSelected = onStudySessionSelected
+                )
+            }
         }
     }
 }
 
 @Composable
 private fun StudySessionSectionLabel() {
-    Surface(
-        shape = RoundedCornerShape(28.dp),
-        color = StudySessionPaperColor,
-        border = BorderStroke(1.dp, StudySessionPaperBorderColor),
-        shadowElevation = 3.dp
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 18.dp, end = 18.dp, top = 10.dp, bottom = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(7.dp)
     ) {
-        Row(
-            modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(7.dp)
-        ) {
-            Icon(
-                painter = painterResource(id = R.drawable.study),
-                contentDescription = null,
-                modifier = Modifier.size(18.dp),
-                tint = Color.Unspecified
-            )
-            Text(
-                text = "Study sessions",
-                style = MaterialTheme.typography.labelLarge.copy(fontSize = 21.9.sp),
-                color = StudySessionPaperTextColor,
-                fontWeight = FontWeight.SemiBold
-            )
-        }
+        Icon(
+            painter = painterResource(id = R.drawable.study),
+            contentDescription = null,
+            modifier = Modifier.size(18.dp),
+            tint = Color.Unspecified
+        )
+        Text(
+            text = "Study sessions",
+            style = MaterialTheme.typography.labelLarge.copy(fontSize = 21.9.sp),
+            color = StudySessionPaperTextColor,
+            fontWeight = FontWeight.SemiBold
+        )
     }
 }
 
@@ -8778,7 +9653,8 @@ private fun SavedCarouselCafeCard(
         modifier = modifier
             .onGloballyPositioned { coordinates ->
                 cardBounds = coordinates.boundsInRoot()
-            },
+            }
+            .clickable { onOpen(cardBounds ?: Rect.Zero, cafe.primaryImageModel()) },
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(
             containerColor = SelectedCafeSurfaceColor,
@@ -8793,7 +9669,6 @@ private fun SavedCarouselCafeCard(
                     modifier = Modifier
                         .fillMaxWidth()
                         .height(205.dp)
-                        .clickable { onOpen(cardBounds ?: Rect.Zero, cafe.primaryImageModel()) }
                 ) {
                     AsyncImage(
                         model = cafe.primaryImageModel(),
@@ -9413,7 +10288,8 @@ fun PlaceCard(
             }
             .onGloballyPositioned { coordinates ->
                 cardBounds = coordinates.boundsInRoot()
-            },
+            }
+            .clickable { onOpen(cardBounds ?: Rect.Zero, cafe.primaryImageModel()) },
         shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(
             containerColor = SelectedCafeSurfaceColor,
@@ -9423,9 +10299,11 @@ fun PlaceCard(
         elevation = CardDefaults.cardElevation(defaultElevation = 2.dp)
     ) {
         Column {
-            Box(modifier = Modifier.fillMaxWidth().height(340.dp).clickable {
-                onOpen(cardBounds ?: Rect.Zero, cafe.primaryImageModel())
-            }) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(340.dp)
+            ) {
                 AsyncImage(
                     model = cafe.primaryImageModel(),
                     contentDescription = cafe.name,
@@ -9519,7 +10397,9 @@ fun ExpandedCafeDetailOverlay(
     val crowdAttributes = CrowdAttributeRepository.attributesFor(cafe.id)
     val crowdAttributeBackendState = rememberCrowdAttributeBackendState(cafe.id)
     val pageCount = cafe.photoPageCount()
-    val pagerState = rememberPagerState(pageCount = { pageCount })
+    val heroPagerState = rememberPagerState(pageCount = { pageCount })
+    val detailPagerState = rememberPagerState(pageCount = { 2 })
+    val detailPagerScope = rememberCoroutineScope()
     val detailRevealAlpha = transitionRevealAlpha(transitionProgress)
     val detailSurfaceAlpha = transitionDetailSurfaceAlpha(transitionProgress)
     val pagerAlpha = ((transitionProgress - 0.22f) / 0.18f).coerceIn(0f, 1f)
@@ -9561,257 +10441,235 @@ fun ExpandedCafeDetailOverlay(
                 contentScale = ContentScale.Crop
             )
 
-            LazyColumn(
+            HorizontalPager(
+                state = detailPagerState,
                 modifier = Modifier
                     .fillMaxSize()
                     .graphicsLayer {
                         alpha = detailRevealAlpha
-                    },
-                contentPadding = PaddingValues(bottom = 28.dp),
-                verticalArrangement = Arrangement.spacedBy(18.dp)
-            ) {
-                item {
-                    Box(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .height(heroHeight)
+                    }
+            ) { detailPage ->
+                if (detailPage == 0) {
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(bottom = 28.dp),
+                        verticalArrangement = Arrangement.spacedBy(18.dp)
                     ) {
-                        AsyncImage(
-                            model = sharedHeroModel,
-                            contentDescription = cafe.name,
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .graphicsLayer {
-                                    alpha = 1f - pagerAlpha
-                                },
-                            contentScale = ContentScale.Crop
-                        )
-
-                        HorizontalPager(
-                            state = pagerState,
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .graphicsLayer {
-                                    alpha = pagerAlpha
-                                }
-                        ) { page ->
-                            val pageModel = cafe.photoPageModel(page)
-                            if (pageModel != null) {
+                        item {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(heroHeight)
+                            ) {
                                 AsyncImage(
-                                    model = pageModel,
+                                    model = sharedHeroModel,
                                     contentDescription = cafe.name,
-                                    modifier = Modifier.fillMaxSize(),
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .graphicsLayer {
+                                            alpha = 1f - pagerAlpha
+                                        },
                                     contentScale = ContentScale.Crop
                                 )
-                            } else {
-                                Box(
+
+                                HorizontalPager(
+                                    state = heroPagerState,
                                     modifier = Modifier
-                                        .fillMaxSize(),
-                                    contentAlignment = Alignment.Center
-                                ) {
-                                    AsyncImage(
-                                        model = sharedHeroModel,
-                                        contentDescription = cafe.name,
-                                        modifier = Modifier
-                                            .fillMaxSize()
-                                            .graphicsLayer { alpha = 0.35f },
-                                        contentScale = ContentScale.Crop
-                                    )
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxSize()
-                                            .background(Color(0xFF4A231C).copy(alpha = 0.12f))
-                                    )
-                                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                        CircularProgressIndicator(color = Color(0xFF4A231C))
-                                        Spacer(modifier = Modifier.height(12.dp))
-                                        Text("Loading photo...", color = Color(0xFF4A231C))
-                                    }
-                                }
-                            }
-                        }
-
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(100.dp)
-                                .align(Alignment.BottomCenter)
-                                .background(
-                                    Brush.verticalGradient(
-                                        listOf(Color.Transparent, Color.Black.copy(alpha = 0.5f))
-                                    )
-                                )
-                        )
-
-                        IconButton(
-                            onClick = onClose,
-                            modifier = Modifier
-                                .align(Alignment.TopStart)
-                                .padding(16.dp)
-                                .background(Color.Black.copy(alpha = 0.35f), CircleShape)
-                        ) {
-                            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close details", tint = Color.White)
-                        }
-
-                        IconButton(
-                            onClick = { BookmarkRepository.toggle(cafe.id) },
-                            modifier = Modifier
-                                .align(Alignment.TopEnd)
-                                .padding(16.dp)
-                                .background(Color.Black.copy(alpha = 0.35f), CircleShape)
-                        ) {
-                            Icon(
-                                imageVector = if (isBookmarked) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder,
-                                contentDescription = if (isBookmarked) "Remove bookmark" else "Add bookmark",
-                                tint = Color.White
-                            )
-                        }
-
-                        Column(
-                            modifier = Modifier
-                                .align(Alignment.BottomStart)
-                                .padding(horizontal = 20.dp, vertical = 18.dp)
-                        ) {
-                            Text(
-                                text = cafe.name,
-                                style = MaterialTheme.typography.headlineSmall,
-                                fontWeight = FontWeight.Bold,
-                                color = Color.White
-                            )
-                            if (pageCount > 1) {
-                                Spacer(modifier = Modifier.height(10.dp))
-                                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                                    repeat(pageCount) { page ->
+                                        .fillMaxSize()
+                                        .graphicsLayer {
+                                            alpha = pagerAlpha
+                                        }
+                                ) { page ->
+                                    val pageModel = cafe.photoPageModel(page)
+                                    if (pageModel != null) {
+                                        AsyncImage(
+                                            model = pageModel,
+                                            contentDescription = cafe.name,
+                                            modifier = Modifier.fillMaxSize(),
+                                            contentScale = ContentScale.Crop
+                                        )
+                                    } else {
                                         Box(
                                             modifier = Modifier
-                                                .size(if (page == pagerState.currentPage) 9.dp else 7.dp)
-                                                .background(
-                                                    color = if (page == pagerState.currentPage) Color.White else Color.White.copy(alpha = 0.45f),
-                                                    shape = CircleShape
-                                                )
+                                                .fillMaxSize(),
+                                            contentAlignment = Alignment.Center
+                                        ) {
+                                            AsyncImage(
+                                                model = sharedHeroModel,
+                                                contentDescription = cafe.name,
+                                                modifier = Modifier
+                                                    .fillMaxSize()
+                                                    .graphicsLayer { alpha = 0.35f },
+                                                contentScale = ContentScale.Crop
+                                            )
+                                            Box(
+                                                modifier = Modifier
+                                                    .fillMaxSize()
+                                                    .background(Color(0xFF4A231C).copy(alpha = 0.12f))
+                                            )
+                                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                                CircularProgressIndicator(color = Color(0xFF4A231C))
+                                                Spacer(modifier = Modifier.height(12.dp))
+                                                Text("Loading photo...", color = Color(0xFF4A231C))
+                                            }
+                                        }
+                                    }
+                                }
+
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .height(100.dp)
+                                        .align(Alignment.BottomCenter)
+                                        .background(
+                                            Brush.verticalGradient(
+                                                listOf(Color.Transparent, Color.Black.copy(alpha = 0.5f))
+                                            )
                                         )
+                                )
+
+                                IconButton(
+                                    onClick = onClose,
+                                    modifier = Modifier
+                                        .align(Alignment.TopStart)
+                                        .padding(16.dp)
+                                        .background(Color.Black.copy(alpha = 0.35f), CircleShape)
+                                ) {
+                                    Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close details", tint = Color.White)
+                                }
+
+                                IconButton(
+                                    onClick = { BookmarkRepository.toggle(cafe.id) },
+                                    modifier = Modifier
+                                        .align(Alignment.TopEnd)
+                                        .padding(16.dp)
+                                        .background(Color.Black.copy(alpha = 0.35f), CircleShape)
+                                ) {
+                                    Icon(
+                                        imageVector = if (isBookmarked) Icons.Filled.Bookmark else Icons.Filled.BookmarkBorder,
+                                        contentDescription = if (isBookmarked) "Remove bookmark" else "Add bookmark",
+                                        tint = Color.White
+                                    )
+                                }
+
+                                Column(
+                                    modifier = Modifier
+                                        .align(Alignment.BottomStart)
+                                        .padding(horizontal = 20.dp, vertical = 18.dp)
+                                ) {
+                                    Text(
+                                        text = cafe.name,
+                                        style = MaterialTheme.typography.headlineSmall,
+                                        fontWeight = FontWeight.Bold,
+                                        color = Color.White
+                                    )
+                                    if (pageCount > 1) {
+                                        Spacer(modifier = Modifier.height(10.dp))
+                                        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                                            repeat(pageCount) { page ->
+                                                Box(
+                                                    modifier = Modifier
+                                                        .size(if (page == heroPagerState.currentPage) 9.dp else 7.dp)
+                                                        .background(
+                                                            color = if (page == heroPagerState.currentPage) Color.White else Color.White.copy(alpha = 0.45f),
+                                                            shape = CircleShape
+                                                        )
+                                                )
+                                            }
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
-                }
 
-
-                item {
-                    Column(
-                        modifier = Modifier.padding(horizontal = 20.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
-                    ) {
-                        val rating = cafe.rating
-                        val reviewCount = cafe.userRatingCount ?: 0
-                        if (rating != null && reviewCount > 0) {
-                            Row(verticalAlignment = Alignment.CenterVertically) {
-                                RatingStars(rating)
-                                Spacer(Modifier.width(8.dp))
-                                Text(
-                                    text = String.format(Locale.US, "%.1f (%d Reviews)", rating, reviewCount),
-                                    color = detailSecondaryTextColor,
-                                    style = MaterialTheme.typography.bodySmall
-                                )
-                            }
-                        } else {
-                            Text("No ratings yet", color = detailSecondaryTextColor, style = MaterialTheme.typography.bodySmall)
-                        }
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                            verticalAlignment = Alignment.CenterVertically
-                        ) {
-                            cafe.distanceMeters
-                                ?.let { distanceMeters -> formatDistanceAway(distanceMeters) }
-                                ?.let { distanceText ->
+                        item {
+                            Column(
+                                modifier = Modifier.padding(horizontal = 20.dp),
+                                verticalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                val rating = cafe.rating
+                                val reviewCount = cafe.userRatingCount ?: 0
+                                if (rating != null && reviewCount > 0) {
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        RatingStars(rating)
+                                        Spacer(Modifier.width(8.dp))
+                                        Text(
+                                            text = String.format(Locale.US, "%.1f (%d Reviews)", rating, reviewCount),
+                                            color = detailSecondaryTextColor,
+                                            style = MaterialTheme.typography.bodySmall
+                                        )
+                                    }
+                                } else {
+                                    Text("No ratings yet", color = detailSecondaryTextColor, style = MaterialTheme.typography.bodySmall)
+                                }
+                                Row(
+                                    modifier = Modifier.fillMaxWidth(),
+                                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    cafe.distanceMeters
+                                        ?.let { distanceMeters -> formatDistanceAway(distanceMeters) }
+                                        ?.let { distanceText ->
+                                            CompactDetailInfoBubble(
+                                                iconRes = R.drawable.distance,
+                                                iconName = "Distance",
+                                                value = distanceText,
+                                                modifier = Modifier.weight(1f)
+                                            )
+                                        }
                                     CompactDetailInfoBubble(
-                                        iconRes = R.drawable.distance,
-                                        iconName = "Distance",
-                                        value = distanceText,
+                                        iconRes = R.drawable.address,
+                                        iconName = "Address",
+                                        value = cafe.address,
                                         modifier = Modifier.weight(1f)
                                     )
+                                    CompactDetailInfoBubble(
+                                        iconRes = R.drawable.phone,
+                                        iconName = "Phone",
+                                        value = cafe.phone,
+                                        modifier = Modifier.weight(1f),
+                                        copyLabel = "${cafe.name} phone number"
+                                    )
                                 }
-                            CompactDetailInfoBubble(
-                                iconRes = R.drawable.address,
-                                iconName = "Address",
-                                value = cafe.address,
-                                modifier = Modifier.weight(1f)
-                            )
-                            CompactDetailInfoBubble(
-                                iconRes = R.drawable.phone,
-                                iconName = "Phone",
-                                value = cafe.phone,
-                                modifier = Modifier.weight(1f),
-                                copyLabel = "${cafe.name} phone number"
-                            )
-                        }
-                        HoursDropdown(cafe.hours)
-                        StudySessionActionRow(
-                            cafe = cafe,
-                            onCreateStudySession = { showStudyComposer = true },
-                            modifier = Modifier.fillMaxWidth()
-                        )
-                    }
-                }
-
-                item {
-                    CafeCrowdAttributesPanel(
-                        cafe = cafe,
-                        attributes = crowdAttributes,
-                        backendState = crowdAttributeBackendState,
-                        onSuggestChanges = { showSuggestionOverlay = true },
-                        modifier = Modifier.padding(horizontal = 20.dp)
-                    )
-                }
-
-                item {
-                    Row(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 20.dp),
-                        verticalAlignment = Alignment.CenterVertically
-                    ) {
-                        Text("Reviews", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold, modifier = Modifier.weight(1f), color = detailTextColor)
-                        TextButton(
-                            onClick = { navController.navigate(Screen.WriteReview.createRoute(cafe.id)) },
-                            colors = ButtonDefaults.textButtonColors(contentColor = detailTextColor)
-                        ) {
-                            Text("Write review")
-                        }
-                    }
-                }
-
-                if (reviews.isEmpty()) {
-                    item {
-                        Text(
-                            text = "No reviews yet.",
-                            color = detailSecondaryTextColor,
-                            modifier = Modifier.padding(horizontal = 20.dp)
-                        )
-                    }
-                } else {
-                    items(reviews) { review ->
-                        OutlinedCard(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 20.dp),
-                            border = BorderStroke(1.dp, Color.Black),
-                            colors = CardDefaults.outlinedCardColors(
-                                containerColor = SelectedCafeSurfaceColor,
-                                contentColor = detailTextColor
-                            )
-                        ) {
-                            Column(modifier = Modifier.padding(12.dp)) {
-                                review.display_name?.let { name ->
-                                    Text(name, fontWeight = FontWeight.SemiBold,
-                                        style = MaterialTheme.typography.labelSmall, color = detailTextColor)
-                                }
-                                Text(review.body, color = detailTextColor)
+                                HoursDropdown(cafe.hours)
+                                StudySessionActionRow(
+                                    cafe = cafe,
+                                    onCreateStudySession = { showStudyComposer = true },
+                                    modifier = Modifier.fillMaxWidth()
+                                )
                             }
                         }
+
+                        item {
+                            CafeCrowdAttributesPanel(
+                                cafe = cafe,
+                                attributes = crowdAttributes,
+                                backendState = crowdAttributeBackendState,
+                                onSuggestChanges = { showSuggestionOverlay = true },
+                                modifier = Modifier.padding(horizontal = 20.dp)
+                            )
+                        }
+
+                        item {
+                            ReviewsSlideEntry(
+                                reviewCount = reviews.size,
+                                onOpenReviews = {
+                                    detailPagerScope.launch { detailPagerState.animateScrollToPage(1) }
+                                },
+                                modifier = Modifier.padding(horizontal = 20.dp)
+                            )
+                        }
                     }
+                } else {
+                    CafeReviewsMessagesPage(
+                        cafe = cafe,
+                        reviews = reviews,
+                        onClose = onClose,
+                        onOpenDetails = {
+                            detailPagerScope.launch { detailPagerState.animateScrollToPage(0) }
+                        },
+                        modifier = Modifier.fillMaxSize()
+                    )
                 }
             }
 
@@ -10848,6 +11706,14 @@ data class Profile(
     val avatar_url: String? = null,
     val bio: String? = null
 )
+
+private fun Profile.reviewDisplayName(): String? {
+    return listOf(first_name, last_name)
+        .map { it.trim() }
+        .filter { it.isNotBlank() }
+        .joinToString(" ")
+        .takeIf { it.isNotBlank() }
+}
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -11989,7 +12855,7 @@ private fun ProfileStatPanel(
                     "reviews" -> {
                         if (myReviews.isEmpty()) {
                             Text(
-                                "No reviews yet. Open a cafe and tap \"Write review\" to add one.",
+                                "No reviews yet. Open a cafe and add one from the reviews slide.",
                                 style = MaterialTheme.typography.bodySmall,
                                 color = darkBrown.copy(alpha = 0.5f),
                                 modifier = Modifier.padding(vertical = 8.dp)
@@ -12033,7 +12899,7 @@ private fun ProfileStatPanel(
                                         )
                                         Spacer(Modifier.height(2.dp))
                                         Text(
-                                            review.body,
+                                            review.previewText(),
                                             style = MaterialTheme.typography.labelSmall,
                                             color = darkBrown.copy(alpha = 0.75f),
                                             maxLines = 2,
