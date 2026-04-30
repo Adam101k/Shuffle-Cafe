@@ -7651,17 +7651,27 @@ private fun ReviewMessageBubble(
         val avatarSlotWidth = avatarSize + avatarGap
         val centerOverlap = 28.dp
         val hardMaxBubbleWidth = 220.dp
+        val laneMediaMaxWidth = ((maxWidth / 2f) - avatarSlotWidth - 4.dp).coerceAtLeast(112.dp)
+        val mediaMaxWidth = if (laneMediaMaxWidth < hardMaxBubbleWidth) {
+            laneMediaMaxWidth
+        } else {
+            hardMaxBubbleWidth
+        }
         val laneMaxBubbleWidth = (maxWidth / 2f) + centerOverlap - avatarSlotWidth
         val bubbleMaxWidth = if (laneMaxBubbleWidth < hardMaxBubbleWidth) {
             laneMaxBubbleWidth.coerceAtLeast(96.dp)
         } else {
             hardMaxBubbleWidth
         }
-        val bubbleWidthModifier = if (review.photo_urls.isNotEmpty()) {
-            Modifier.width(bubbleMaxWidth)
-        } else {
-            Modifier.widthIn(max = bubbleMaxWidth)
-        }
+        val hasPhotos = review.photo_urls.isNotEmpty()
+        val hasBody = review.body.isNotBlank()
+        val messageBubbleColor = if (alignEnd) CoffeeSurfaceLight else Color(0xFFFFF8F0)
+        val bodyTextStyle = MaterialTheme.typography.bodyMedium.copy(
+            fontSize = 12.sp,
+            lineHeight = 16.sp
+        )
+        val bodyStartPadding = if (reaction != null && alignEnd) 24.dp else 10.dp
+        val bodyEndPadding = if (reaction != null && !alignEnd) 24.dp else 10.dp
 
         Row(
             modifier = Modifier.fillMaxWidth(),
@@ -7674,7 +7684,7 @@ private fun ReviewMessageBubble(
             }
 
             Column(
-                modifier = bubbleWidthModifier,
+                modifier = Modifier.widthIn(max = bubbleMaxWidth),
                 horizontalAlignment = if (alignEnd) Alignment.End else Alignment.Start
             ) {
                 Text(
@@ -7685,55 +7695,75 @@ private fun ReviewMessageBubble(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis
                 )
-                Box {
-                    Surface(
-                        shape = RoundedCornerShape(
-                            topStart = 19.dp,
-                            topEnd = 19.dp,
-                            bottomStart = if (alignEnd) 19.dp else 5.dp,
-                            bottomEnd = if (alignEnd) 5.dp else 19.dp
-                        ),
-                        color = if (alignEnd) CoffeeSurfaceLight else Color(0xFFFFF8F0),
-                        contentColor = CoffeeDark,
-                        shadowElevation = 1.dp,
-                        border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.1f))
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(
-                                start = if (reaction != null && alignEnd) 24.dp else 10.dp,
-                                top = if (review.photo_urls.isEmpty()) 9.dp else 10.dp,
-                                end = if (reaction != null && !alignEnd) 24.dp else 10.dp,
-                                bottom = if (reaction == null) 9.dp else 16.dp
-                            ),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
-                        ) {
-                            if (review.photo_urls.isNotEmpty()) {
-                                ReviewBubblePhotoAttachment(
-                                    photoUris = review.photo_urls,
-                                    onClick = onPhotoClick
-                                )
-                            }
-                            if (review.body.isNotBlank()) {
-                                Text(
-                                    text = review.body,
-                                    style = MaterialTheme.typography.bodyMedium.copy(fontSize = 12.sp),
-                                    lineHeight = 16.sp
+
+                if (hasPhotos) {
+                    Box {
+                        ReviewMessagePhotoStack(
+                            photoUris = review.photo_urls,
+                            stackWidth = mediaMaxWidth,
+                            onClick = onPhotoClick,
+                            modifier = Modifier
+                        )
+
+                        if (!hasBody) {
+                            reaction?.let { selectedReaction ->
+                                ReviewReactionBadge(
+                                    reaction = selectedReaction,
+                                    modifier = Modifier
+                                        .align(if (alignEnd) Alignment.BottomStart else Alignment.BottomEnd)
+                                        .offset(
+                                            x = if (alignEnd) (-14).dp else 14.dp,
+                                            y = 14.dp
+                                        )
+                                        .zIndex(2f)
                                 )
                             }
                         }
                     }
+                }
 
-                    reaction?.let { selectedReaction ->
-                        ReviewReactionBadge(
-                            reaction = selectedReaction,
-                            modifier = Modifier
-                                .align(if (alignEnd) Alignment.BottomStart else Alignment.BottomEnd)
-                                .offset(
-                                    x = if (alignEnd) (-14).dp else 14.dp,
-                                    y = 14.dp
+                if (hasPhotos && hasBody) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+
+                if (hasBody) {
+                    Box {
+                        Surface(
+                            shape = RoundedCornerShape(
+                                topStart = 19.dp,
+                                topEnd = 19.dp,
+                                bottomStart = if (alignEnd) 19.dp else 5.dp,
+                                bottomEnd = if (alignEnd) 5.dp else 19.dp
+                            ),
+                            color = messageBubbleColor,
+                            contentColor = CoffeeDark,
+                            shadowElevation = 1.dp,
+                            border = BorderStroke(1.dp, CoffeeDark.copy(alpha = 0.1f))
+                        ) {
+                            Text(
+                                text = review.body,
+                                style = bodyTextStyle,
+                                modifier = Modifier.padding(
+                                    start = bodyStartPadding,
+                                    top = 9.dp,
+                                    end = bodyEndPadding,
+                                    bottom = if (reaction == null) 9.dp else 16.dp
                                 )
-                                .zIndex(2f)
                             )
+                        }
+
+                        reaction?.let { selectedReaction ->
+                            ReviewReactionBadge(
+                                reaction = selectedReaction,
+                                modifier = Modifier
+                                    .align(if (alignEnd) Alignment.BottomStart else Alignment.BottomEnd)
+                                    .offset(
+                                        x = if (alignEnd) (-14).dp else 14.dp,
+                                        y = 14.dp
+                                    )
+                                    .zIndex(2f)
+                            )
+                        }
                     }
                 }
             }
@@ -7776,73 +7806,51 @@ private fun ReviewAvatar(review: Review) {
 }
 
 @Composable
-private fun ReviewBubblePhotoAttachment(
+private fun ReviewMessagePhotoStack(
     photoUris: List<String>,
-    onClick: (Int) -> Unit
+    stackWidth: Dp,
+    onClick: (Int) -> Unit,
+    modifier: Modifier = Modifier
 ) {
     if (photoUris.isEmpty()) return
 
     val attachmentShape = RoundedCornerShape(14.dp)
+    val visibleLayerCount = minOf(photoUris.size - 1, 2)
+    val stackOffset = 5.dp
+    val stackDepth = (visibleLayerCount * stackOffset.value).dp
     Box(
-        modifier = Modifier
-            .fillMaxWidth()
-            .aspectRatio(196f / 142f)
-            .clickable { onClick(0) },
-        contentAlignment = Alignment.Center
+        modifier = modifier
+            .width(stackWidth)
+            .height(stackWidth + stackDepth)
+            .clickable { onClick(0) }
     ) {
-        if (photoUris.size > 1) {
-            repeat(minOf(photoUris.size - 1, 2)) { index ->
-                Surface(
+        if (visibleLayerCount > 0) {
+            repeat(visibleLayerCount) { layer ->
+                val layerNumber = visibleLayerCount - layer
+                val layerOffset = (layerNumber * stackOffset.value).dp
+                val photoIndex = layerNumber
+                AsyncImage(
+                    model = photoUris[photoIndex],
+                    contentDescription = "Review photo ${photoIndex + 1}",
                     modifier = Modifier
-                        .matchParentSize()
-                        .offset(x = ((index + 1) * 5).dp, y = (-(index + 1) * 5).dp)
-                        .padding(4.dp)
-                        .zIndex(index.toFloat()),
-                    shape = attachmentShape,
-                    color = Color.White.copy(alpha = 0.72f),
-                    border = BorderStroke(1.dp, Color.Black.copy(alpha = 0.1f))
-                ) {}
-            }
-        }
-
-        Surface(
-            modifier = Modifier
-                .matchParentSize()
-                .zIndex(4f),
-            shape = attachmentShape,
-            color = Color.Black.copy(alpha = 0.06f)
-        ) {
-            AsyncImage(
-                model = photoUris.first(),
-                contentDescription = "Review photo",
-                modifier = Modifier.fillMaxSize(),
-                contentScale = ContentScale.FillHeight
-            )
-        }
-
-        if (photoUris.size > 1) {
-            Box(
-                modifier = Modifier
-                    .matchParentSize()
-                    .zIndex(5f)
-                    .background(
-                        Brush.verticalGradient(
-                            listOf(Color.Transparent, Color.Black.copy(alpha = 0.58f))
-                        ),
-                        attachmentShape
-                    ),
-                contentAlignment = Alignment.BottomCenter
-            ) {
-                Text(
-                    text = "Tap to reveal ${photoUris.size} photos",
-                    color = Color.White,
-                    style = MaterialTheme.typography.labelMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.padding(10.dp),
-                    textAlign = TextAlign.Center
+                        .size(stackWidth)
+                        .offset(y = layerOffset)
+                        .clip(attachmentShape)
+                        .zIndex(layer.toFloat()),
+                    contentScale = ContentScale.Crop
                 )
             }
         }
+
+        AsyncImage(
+            model = photoUris.first(),
+            contentDescription = "Review photo",
+            modifier = Modifier
+                .size(stackWidth)
+                .clip(attachmentShape)
+                .zIndex(visibleLayerCount.toFloat() + 1f),
+            contentScale = ContentScale.Crop
+        )
     }
 }
 
