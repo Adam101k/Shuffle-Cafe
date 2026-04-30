@@ -105,6 +105,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalInspectionMode
 import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.Font
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -391,6 +393,9 @@ private const val SAVED_CAFE_NOTES_ENTRY_KEY = "saved_cafe_notes"
 private const val SAVED_CAFE_NOTE_MAX_CHARS = 140
 private const val CARD_STACK_PROGRESS_PREFS_NAME = "shuffle_cafe_card_stack_progress"
 private const val CARD_STACK_TOP_CAFE_ID_KEY = "top_cafe_id"
+private const val CAFE_ATTRIBUTE_FILTER_PREFS_NAME = "shuffle_cafe_attribute_filters"
+private const val CAFE_ATTRIBUTE_FILTER_CARDS_PREFIX = "cards"
+private const val CAFE_ATTRIBUTE_FILTER_MAP_PREFIX = "map"
 private const val CAFE_CACHE_MAX_CAFES_PER_ENTRY = 20
 private const val CAFE_CACHE_IMAGE_MAX_DIMENSION_PX = 360
 private const val CAFE_CACHE_IMAGE_JPEG_QUALITY = 62
@@ -1315,6 +1320,92 @@ private object CardStackProgressStore {
             .edit()
             .putString(CARD_STACK_TOP_CAFE_ID_KEY, topCafeId)
             .apply()
+    }
+}
+
+private object CafeAttributeFilterStore {
+    private const val HIDE_BIG_BRANDS_KEY = "hide_big_brands"
+    private const val OPEN_NOW_KEY = "open_now"
+    private const val WIFI_SPEED_KEY = "wifi_speed"
+    private const val BATHROOM_AVAILABILITY_KEY = "bathroom_availability"
+    private const val SEATING_AVAILABILITY_KEY = "seating_availability"
+    private const val SEATING_COMFORT_KEY = "seating_comfort"
+    private const val CROWD_LEVEL_KEY = "crowd_level"
+    private const val NOISE_LEVEL_KEY = "noise_level"
+    private const val PET_FRIENDLY_KEY = "pet_friendly"
+    private const val CLEANLINESS_RATING_KEY = "cleanliness_rating"
+
+    private fun prefs(context: Context): SharedPreferences {
+        return context.applicationContext.getSharedPreferences(
+            CAFE_ATTRIBUTE_FILTER_PREFS_NAME,
+            Context.MODE_PRIVATE
+        )
+    }
+
+    fun loadCards(context: Context): CafeAttributeFilters {
+        return load(context, CAFE_ATTRIBUTE_FILTER_CARDS_PREFIX)
+    }
+
+    fun saveCards(context: Context, filters: CafeAttributeFilters) {
+        save(context, CAFE_ATTRIBUTE_FILTER_CARDS_PREFIX, filters)
+    }
+
+    fun loadMap(context: Context): CafeAttributeFilters {
+        return load(context, CAFE_ATTRIBUTE_FILTER_MAP_PREFIX)
+    }
+
+    fun saveMap(context: Context, filters: CafeAttributeFilters) {
+        save(context, CAFE_ATTRIBUTE_FILTER_MAP_PREFIX, filters)
+    }
+
+    private fun load(context: Context, prefix: String): CafeAttributeFilters {
+        val preferences = prefs(context)
+        return CafeAttributeFilters(
+            hideBigBrands = preferences.getBoolean(key(prefix, HIDE_BIG_BRANDS_KEY), false),
+            openNow = preferences.enumValue<OpenNowFilter>(key(prefix, OPEN_NOW_KEY)) ?: OpenNowFilter.ANY,
+            wifiSpeed = preferences.enumValue<WifiSpeed>(key(prefix, WIFI_SPEED_KEY)),
+            bathroomAvailability = preferences.enumValue<BathroomAvailability>(
+                key(prefix, BATHROOM_AVAILABILITY_KEY)
+            ),
+            seatingAvailability = preferences.enumValue<SeatingAvailability>(
+                key(prefix, SEATING_AVAILABILITY_KEY)
+            ),
+            seatingComfort = preferences.enumValue<SeatingComfort>(key(prefix, SEATING_COMFORT_KEY)),
+            crowdLevel = preferences.enumValue<CrowdLevel>(key(prefix, CROWD_LEVEL_KEY)),
+            noiseLevel = preferences.enumValue<NoiseLevel>(key(prefix, NOISE_LEVEL_KEY)),
+            petFriendly = preferences.enumValue<PetFriendly>(key(prefix, PET_FRIENDLY_KEY)),
+            cleanlinessRating = preferences.enumValue<CleanlinessRating>(key(prefix, CLEANLINESS_RATING_KEY))
+        )
+    }
+
+    private fun save(context: Context, prefix: String, filters: CafeAttributeFilters) {
+        prefs(context)
+            .edit()
+            .putBoolean(key(prefix, HIDE_BIG_BRANDS_KEY), filters.hideBigBrands)
+            .putString(key(prefix, OPEN_NOW_KEY), filters.openNow.name)
+            .putOptionalEnum(key(prefix, WIFI_SPEED_KEY), filters.wifiSpeed)
+            .putOptionalEnum(key(prefix, BATHROOM_AVAILABILITY_KEY), filters.bathroomAvailability)
+            .putOptionalEnum(key(prefix, SEATING_AVAILABILITY_KEY), filters.seatingAvailability)
+            .putOptionalEnum(key(prefix, SEATING_COMFORT_KEY), filters.seatingComfort)
+            .putOptionalEnum(key(prefix, CROWD_LEVEL_KEY), filters.crowdLevel)
+            .putOptionalEnum(key(prefix, NOISE_LEVEL_KEY), filters.noiseLevel)
+            .putOptionalEnum(key(prefix, PET_FRIENDLY_KEY), filters.petFriendly)
+            .putOptionalEnum(key(prefix, CLEANLINESS_RATING_KEY), filters.cleanlinessRating)
+            .apply()
+    }
+
+    private fun key(prefix: String, key: String): String = "${prefix}_$key"
+
+    private inline fun <reified T : Enum<T>> SharedPreferences.enumValue(key: String): T? {
+        val value = getString(key, null) ?: return null
+        return enumValues<T>().firstOrNull { enumValue -> enumValue.name == value }
+    }
+
+    private fun SharedPreferences.Editor.putOptionalEnum(
+        key: String,
+        value: Enum<*>?
+    ): SharedPreferences.Editor {
+        return if (value == null) remove(key) else putString(key, value.name)
     }
 }
 
@@ -2688,7 +2779,7 @@ fun MainScreen(navController: NavHostController) {
     var overlayHostBounds by remember { mutableStateOf<Rect?>(null) }
     var isPreparingDetailTransition by remember { mutableStateOf(false) }
     var selectedFilterOption by remember { mutableStateOf(CardsFilterOption.Nearby) }
-    var cardAttributeFilters by remember { mutableStateOf(CafeAttributeFilters()) }
+    var cardAttributeFilters by remember(context) { mutableStateOf(CafeAttributeFilterStore.loadCards(context)) }
     var isCardFilterSheetVisible by remember { mutableStateOf(false) }
     val detailProgress = remember { Animatable(0f) }
     val detailOverlayLayoutSpec = remember { DetailOverlayLayoutSpec() }
@@ -2711,6 +2802,10 @@ fun MainScreen(navController: NavHostController) {
         }
     }
     CafeDetailDataEffect(cafe = expandedCafe, placesClient = placesClient)
+
+    LaunchedEffect(context, cardAttributeFilters) {
+        CafeAttributeFilterStore.saveCards(context, cardAttributeFilters)
+    }
 
     LaunchedEffect(hasLocationPermission, placesClient, inspectionMode) {
         if (inspectionMode) {
@@ -3658,7 +3753,7 @@ fun MapScreen(navController: NavHostController) {
     val hasLocationPermission = ContextCompat.checkSelfPermission(context, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED
     val defaultCamera = rememberCameraPositionState()
     var searchQuery by remember { mutableStateOf("") }
-    var mapCafeFilters by remember { mutableStateOf(CafeAttributeFilters()) }
+    var mapCafeFilters by remember(context) { mutableStateOf(CafeAttributeFilterStore.loadMap(context)) }
     var isMapFilterSheetVisible by remember { mutableStateOf(false) }
     val cafeFeedState = CafeRepository.mapUiState
     val allCafes = cafeFeedState.cafes
@@ -3683,6 +3778,10 @@ fun MapScreen(navController: NavHostController) {
     var lastObservedViewportCafeIds by remember { mutableStateOf<List<String>>(emptyList()) }
     var lastObservedViewportSourceKey by remember { mutableStateOf<String?>(null) }
     var lastObservedActiveViewportKey by remember { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(context, mapCafeFilters) {
+        CafeAttributeFilterStore.saveMap(context, mapCafeFilters)
+    }
 
     LaunchedEffect(
         allCafes,
@@ -4939,6 +5038,14 @@ private fun CafeAttributeFilterBottomSheet(
                 verticalArrangement = Arrangement.spacedBy(14.dp)
             ) {
                 item {
+                    BigBrandFilterToggle(
+                        checked = draftFilters.hideBigBrands,
+                        onCheckedChange = { checked ->
+                            draftFilters = draftFilters.copy(hideBigBrands = checked)
+                        }
+                    )
+                }
+                item {
                     CafeAttributeFilterChipGroup(
                         label = "Open now",
                         selected = draftFilters.openNow.takeUnless { it == OpenNowFilter.ANY },
@@ -5082,6 +5189,78 @@ private fun CafeAttributeFilterBottomSheet(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun BigBrandFilterToggle(
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    val chipColors = FilterChipDefaults.filterChipColors(
+        containerColor = CoffeeLight,
+        labelColor = CafeDark,
+        selectedContainerColor = BottomNavToolbarColor,
+        selectedLabelColor = Color.Black
+    )
+
+    WrappingBubbleRow(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalSpacing = 8.dp,
+        verticalSpacing = 8.dp
+    ) {
+        FilterChip(
+            selected = checked,
+            onClick = { onCheckedChange(!checked) },
+            modifier = Modifier
+                .semantics { contentDescription = "No big brands" },
+            label = {
+                Text(
+                    text = "No big brands",
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            },
+            trailingIcon = {
+                CompactFilterSwitch(checked = checked)
+            },
+            shape = RoundedCornerShape(8.dp),
+            colors = chipColors,
+            border = FilterChipDefaults.filterChipBorder(
+                enabled = true,
+                selected = checked,
+                borderColor = CoffeeDark.copy(alpha = 0.24f),
+                selectedBorderColor = CafeDark,
+                borderWidth = 1.dp,
+                selectedBorderWidth = 1.dp
+            )
+        )
+    }
+}
+
+@Composable
+private fun CompactFilterSwitch(checked: Boolean) {
+    val thumbOffset by animateDpAsState(
+        targetValue = if (checked) 16.dp else 2.dp,
+        label = "bigBrandFilterThumbOffset"
+    )
+    val trackColor = if (checked) CafeDark else CoffeeDark.copy(alpha = 0.22f)
+    val thumbColor = if (checked) CoffeeSurfaceLight else CoffeeDark.copy(alpha = 0.72f)
+
+    Box(
+        modifier = Modifier
+            .size(width = 30.dp, height = 16.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(trackColor)
+    ) {
+        Box(
+            modifier = Modifier
+                .offset(x = thumbOffset)
+                .align(Alignment.CenterStart)
+                .size(12.dp)
+                .clip(CircleShape)
+                .background(thumbColor)
+        )
     }
 }
 

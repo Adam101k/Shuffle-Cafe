@@ -171,6 +171,42 @@ class CafeAttributeFiltersTest {
         )
     }
 
+    @Test
+    fun defaultFiltersAllowBigBrandCoffeePlaces() {
+        val filters = CafeAttributeFilters()
+
+        assertTrue(testCafe(name = "Starbucks Reserve").matches(filters, CafeCrowdAttributes()))
+        assertTrue(testCafe(name = "Peet's Coffee & Tea").matches(filters, CafeCrowdAttributes()))
+    }
+
+    @Test
+    fun hideBigBrandsExcludesStarbucksVariants() {
+        val filters = CafeAttributeFilters(hideBigBrands = true)
+
+        assertFalse(testCafe(name = "Starbucks").matches(filters, CafeCrowdAttributes()))
+        assertFalse(testCafe(name = "STARBUCKS Reserve Roastery").matches(filters, CafeCrowdAttributes()))
+    }
+
+    @Test
+    fun hideBigBrandsExcludesPeetsVariants() {
+        val filters = CafeAttributeFilters(hideBigBrands = true)
+
+        assertFalse(testCafe(name = "Peet's Coffee & Tea").matches(filters, CafeCrowdAttributes()))
+        assertFalse(testCafe(name = "Peets Coffee").matches(filters, CafeCrowdAttributes()))
+    }
+
+    @Test
+    fun hideBigBrandsAllowsIndependentCoffeePlaces() {
+        val filters = CafeAttributeFilters(hideBigBrands = true)
+
+        assertTrue(testCafe(name = "Shuffle Cafe Roasters").matches(filters, CafeCrowdAttributes()))
+    }
+
+    @Test
+    fun activeCountIncludesBigBrandFilter() {
+        assertEquals(1, CafeAttributeFilters(hideBigBrands = true).activeCount)
+    }
+
     private fun Cafe.matches(filters: CafeAttributeFilters, attributes: CafeCrowdAttributes): Boolean {
         return cafeMatchesAttributeFilters(
             cafe = this,
@@ -187,11 +223,12 @@ class CafeAttributeFiltersTest {
     }
 
     private fun testCafe(
+        name: String = "Test Cafe",
         hours: LinkedHashMap<String, String> = linkedMapOf("Wednesday" to "8:00 AM - 5:00 PM")
     ): Cafe {
         return Cafe(
             id = "test-cafe",
-            name = "Test Cafe",
+            name = name,
             address = "123 Bean Street",
             phone = "555-0100",
             status = "Open",

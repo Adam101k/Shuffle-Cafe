@@ -16,6 +16,7 @@ internal enum class CafeOpenState {
 }
 
 internal data class CafeAttributeFilters(
+    val hideBigBrands: Boolean = false,
     val openNow: OpenNowFilter = OpenNowFilter.ANY,
     val wifiSpeed: WifiSpeed? = null,
     val bathroomAvailability: BathroomAvailability? = null,
@@ -28,6 +29,7 @@ internal data class CafeAttributeFilters(
 ) {
     val activeCount: Int
         get() = listOf(
+            hideBigBrands.takeIf { it },
             openNow.takeUnless { it == OpenNowFilter.ANY },
             wifiSpeed,
             bathroomAvailability,
@@ -49,6 +51,7 @@ internal fun cafeMatchesAttributeFilters(
     filters: CafeAttributeFilters,
     now: Calendar = Calendar.getInstance(Locale.US)
 ): Boolean {
+    if (filters.hideBigBrands && cafe.isBigBrandCoffeePlace()) return false
     if (!matchesOpenNowFilter(cafe, filters.openNow, now)) return false
 
     filters.wifiSpeed?.let { selected ->
@@ -77,6 +80,11 @@ internal fun cafeMatchesAttributeFilters(
     }
 
     return true
+}
+
+internal fun Cafe.isBigBrandCoffeePlace(): Boolean {
+    val normalizedName = name.lowercase(Locale.US)
+    return normalizedName.contains("starbucks") || normalizedName.contains("peet")
 }
 
 internal fun openStateForCafe(
