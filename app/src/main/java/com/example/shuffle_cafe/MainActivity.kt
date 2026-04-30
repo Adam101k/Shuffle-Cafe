@@ -399,7 +399,7 @@ private const val CAFE_INDEX_MAX_ENTRIES = 80
 private const val MAP_SESSION_CACHE_MAX_CAFES = 80
 private const val MAP_SESSION_CACHE_MAX_VIEWPORTS = 8
 private const val MAP_MARKER_DESCRIPTOR_CACHE_MAX_ENTRIES = 120
-private const val CAFE_DETAIL_MAX_LOADED_PHOTOS = 4
+private const val CAFE_DETAIL_MAX_LOADED_PHOTOS = 10
 private const val CAFE_CARD_PHOTO_MAX_WIDTH = 720
 private const val CAFE_CARD_PHOTO_MAX_HEIGHT = 560
 private const val CAFE_DETAIL_PHOTO_MAX_WIDTH = 1600
@@ -710,12 +710,17 @@ private fun Cafe.nextUnloadedPhotoIndex(): Int? {
 
 private fun Cafe.nextPhotoIndexForDetail(): Int? {
     if (photoMetadatas.isEmpty()) return null
-    return photoMetadatas.indices
+    val candidateIndices = photoMetadatas.indices
         .take(CAFE_DETAIL_MAX_LOADED_PHOTOS)
-        .firstOrNull { index ->
-            val bitmap = photoBitmaps.getOrNull(index)
-            bitmap == null || (bitmap.width <= CAFE_CARD_PHOTO_MAX_WIDTH && bitmap.height <= CAFE_CARD_PHOTO_MAX_HEIGHT)
-        }
+
+    return candidateIndices.firstOrNull { index ->
+        photoBitmaps.getOrNull(index) == null
+    } ?: candidateIndices.firstOrNull { index ->
+        val bitmap = photoBitmaps.getOrNull(index)
+        bitmap != null &&
+            bitmap.width <= CAFE_CARD_PHOTO_MAX_WIDTH &&
+            bitmap.height <= CAFE_CARD_PHOTO_MAX_HEIGHT
+    }
 }
 
 internal fun mergeCafeDetailData(existingCafe: Cafe, detailCafe: Cafe): Cafe {
