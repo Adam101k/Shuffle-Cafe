@@ -14,6 +14,8 @@ import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Paint
 import android.graphics.Typeface
+import android.graphics.drawable.BitmapDrawable
+import android.graphics.drawable.Drawable
 import android.location.Geocoder
 import android.location.Location
 import android.os.Bundle
@@ -46,6 +48,7 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.snapping.rememberSnapFlingBehavior
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.interaction.MutableInteractionSource
@@ -79,11 +82,13 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.draw.scale
 import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
@@ -91,6 +96,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
@@ -134,6 +140,9 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigationevent.NavigationEventInfo
 import coil.compose.AsyncImage
+import coil.imageLoader
+import coil.request.ImageRequest
+import coil.request.SuccessResult
 import com.example.shuffle_cafe.ui.screens.LoginScreen
 import com.example.shuffle_cafe.ui.theme.CafeBrown
 import com.example.shuffle_cafe.ui.theme.CafeDark
@@ -183,12 +192,16 @@ import kotlinx.coroutines.tasks.await
 import kotlinx.coroutines.withContext
 import java.util.Calendar
 import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileOutputStream
 import java.util.Locale
 import java.util.UUID
 import kotlin.math.PI
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
+import kotlin.math.max
+import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlin.math.sqrt
@@ -5976,6 +5989,33 @@ private const val CROWD_TOOLTIP_DISPLAY_MILLIS = 2400L
 private const val CAFE_CROWD_PHOTO_BUCKET = "cafe-crowd-photos"
 private const val REVIEW_PHOTO_BUCKET = "review-photos"
 private const val MAX_REVIEW_PHOTOS = 5
+private const val REVIEW_PHOTO_EDIT_CACHE_DIR = "review_photo_edits"
+private const val REVIEW_PHOTO_EDIT_MAX_DIMENSION_PX = 1600
+private const val REVIEW_PHOTO_EDIT_JPEG_QUALITY = 88
+private const val REVIEW_PHOTO_LABEL_ALPHA = 0.78f
+
+private data class ReviewPhotoEditorRequest(
+    val index: Int,
+    val uri: String
+)
+
+private data class ReviewPhotoLabelDraft(
+    val id: String,
+    val text: String,
+    val normalizedX: Float,
+    val normalizedY: Float,
+    val colorArgb: Int,
+    val scale: Float = 1f
+)
+
+private fun randomPastelColorArgb(): Int {
+    val hsv = floatArrayOf(
+        (Math.random() * 360f).toFloat(),
+        (0.28f + Math.random() * 0.22f).toFloat(),
+        (0.92f + Math.random() * 0.06f).toFloat()
+    )
+    return android.graphics.Color.HSVToColor(hsv)
+}
 
 private data class ReviewReaction(
     val key: String,
@@ -7952,6 +7992,7 @@ private fun ReviewMessageComposer(
     var selectedReactionKey by rememberSaveable(cafe.id) { mutableStateOf<String?>(null) }
     var isPosting by remember(cafe.id) { mutableStateOf(false) }
     var postError by remember(cafe.id) { mutableStateOf<String?>(null) }
+    var photoEditorRequest by remember(cafe.id) { mutableStateOf<ReviewPhotoEditorRequest?>(null) }
     val photoPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.GetMultipleContents()
     ) { uris ->
@@ -7976,10 +8017,18 @@ private fun ReviewMessageComposer(
                         .horizontalScroll(rememberScrollState()),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    selectedPhotoUris.forEach { uri ->
+                    selectedPhotoUris.forEachIndexed { index, uri ->
                         ReviewComposerPhotoPreview(
                             uri = uri,
-                            onRemove = { selectedPhotoUris = selectedPhotoUris - uri }
+                            onEdit = {
+                                if (!isPosting) {
+                                    photoEditorRequest = ReviewPhotoEditorRequest(index, uri)
+                                }
+                            },
+                            onRemove = {
+                                deleteReviewPhotoEditCacheFile(context, uri)
+                                selectedPhotoUris = selectedPhotoUris - uri
+                            }
                         )
                     }
                 }
@@ -8069,6 +8118,7 @@ private fun ReviewMessageComposer(
                                     reactionKey = reactionKey
                                 )
                             }.onSuccess {
+                                deleteReviewPhotoEditCacheFiles(context, photoUris)
                                 body = ""
                                 selectedPhotoUris = emptyList()
                                 selectedReactionKey = null
@@ -8103,11 +8153,29 @@ private fun ReviewMessageComposer(
             }
         }
     }
+
+    photoEditorRequest?.let { request ->
+        ReviewPhotoLabelEditorDialog(
+            sourceUri = request.uri,
+            onDismiss = { photoEditorRequest = null },
+            onSaved = { editedUri ->
+                selectedPhotoUris = replaceReviewPhotoUri(
+                    photoUris = selectedPhotoUris,
+                    index = request.index,
+                    originalUri = request.uri,
+                    editedUri = editedUri
+                )
+                deleteReviewPhotoEditCacheFile(context, request.uri)
+                photoEditorRequest = null
+            }
+        )
+    }
 }
 
 @Composable
 private fun ReviewComposerPhotoPreview(
     uri: String,
+    onEdit: () -> Unit,
     onRemove: () -> Unit
 ) {
     Box(modifier = Modifier.size(64.dp)) {
@@ -8142,7 +8210,679 @@ private fun ReviewComposerPhotoPreview(
                 )
             }
         }
+        Surface(
+            modifier = Modifier
+                .align(Alignment.BottomEnd)
+                .padding(3.dp)
+                .size(20.dp)
+                .clickable { onEdit() },
+            shape = CircleShape,
+            color = Color(0xFFF6E9D8).copy(alpha = 0.92f),
+            contentColor = CoffeeDark
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    Icons.Filled.Edit,
+                    contentDescription = "Edit review photo",
+                    modifier = Modifier.size(11.dp)
+                )
+            }
+        }
     }
+}
+
+@Composable
+private fun ReviewPhotoLabelEditorDialog(
+    sourceUri: String,
+    onDismiss: () -> Unit,
+    onSaved: (String) -> Unit
+) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val focusRequester = remember { FocusRequester() }
+    val labels = remember(sourceUri) { mutableStateListOf<ReviewPhotoLabelDraft>() }
+    val labelSizes = remember(sourceUri) { mutableStateMapOf<String, IntSize>() }
+    var sourceBitmap by remember(sourceUri) { mutableStateOf<Bitmap?>(null) }
+    var imageContainerSize by remember(sourceUri) { mutableStateOf(IntSize.Zero) }
+    var selectedLabelId by remember(sourceUri) { mutableStateOf<String?>(null) }
+    var isLoading by remember(sourceUri) { mutableStateOf(true) }
+    var isSaving by remember(sourceUri) { mutableStateOf(false) }
+    var editorError by remember(sourceUri) { mutableStateOf<String?>(null) }
+
+    LaunchedEffect(sourceUri) {
+        isLoading = true
+        editorError = null
+        runCatching {
+            loadReviewPhotoBitmap(context, sourceUri)
+        }.onSuccess { bitmap ->
+            sourceBitmap = bitmap
+        }.onFailure { error ->
+            editorError = error.toReviewPhotoEditorMessage("load this photo")
+        }
+        isLoading = false
+    }
+
+    val selectedLabel = labels.firstOrNull { label -> label.id == selectedLabelId }
+    LaunchedEffect(selectedLabel?.id) {
+        if (selectedLabel != null) {
+            focusRequester.requestFocus()
+        }
+    }
+
+    fun updateSelectedLabelText(text: String) {
+        val index = labels.indexOfFirst { label -> label.id == selectedLabelId }
+        if (index >= 0) {
+            labels[index] = labels[index].copy(text = text.take(80))
+        }
+    }
+
+    fun removeSelectedLabel() {
+        val index = labels.indexOfFirst { label -> label.id == selectedLabelId }
+        if (index >= 0) {
+            val removed = labels.removeAt(index)
+            labelSizes.remove(removed.id)
+            selectedLabelId = labels.getOrNull((index - 1).coerceAtLeast(0))?.id ?: labels.lastOrNull()?.id
+        }
+    }
+
+    Dialog(
+        onDismissRequest = {
+            if (!isSaving) onDismiss()
+        },
+        properties = DialogProperties(usePlatformDefaultWidth = false)
+    ) {
+        BackHandler(enabled = !isSaving) {
+            onDismiss()
+        }
+
+        Surface(
+            modifier = Modifier.fillMaxSize(),
+            color = Color.Black,
+            contentColor = Color.White
+        ) {
+            Column(modifier = Modifier.fillMaxSize()) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .statusBarsPadding()
+                        .background(Color.Black.copy(alpha = 0.88f))
+                        .padding(horizontal = 8.dp, vertical = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    IconButton(
+                        onClick = onDismiss,
+                        enabled = !isSaving
+                    ) {
+                        Icon(Icons.Filled.Close, contentDescription = "Close photo editor", tint = Color.White)
+                    }
+                    Text(
+                        text = "Label photo",
+                        modifier = Modifier.weight(1f),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.White,
+                        textAlign = TextAlign.Center
+                    )
+                    TextButton(
+                        onClick = {
+                            val bitmap = sourceBitmap ?: return@TextButton
+                            val labelsToBake = labels.filter { label -> label.text.isNotBlank() }
+                            if (labelsToBake.isEmpty()) return@TextButton
+                            isSaving = true
+                            editorError = null
+                            scope.launch {
+                                runCatching {
+                                    bakeReviewPhotoLabels(
+                                        context = context,
+                                        sourceBitmap = bitmap,
+                                        labels = labelsToBake
+                                    )
+                                }.onSuccess { editedUri ->
+                                    onSaved(editedUri)
+                                }.onFailure { error ->
+                                    editorError = error.toReviewPhotoEditorMessage("save this edit")
+                                    isSaving = false
+                                }
+                            }
+                        },
+                        enabled = !isSaving && sourceBitmap != null && labels.any { label -> label.text.isNotBlank() }
+                    ) {
+                        if (isSaving) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(18.dp),
+                                strokeWidth = 2.dp,
+                                color = Color.White
+                            )
+                        } else {
+                            Text("Done", color = Color.White)
+                        }
+                    }
+                }
+
+                Box(
+                    modifier = Modifier
+                        .weight(1f)
+                        .fillMaxWidth()
+                        .background(Color.Black)
+                        .onSizeChanged { size -> imageContainerSize = size }
+                        // Initial pass runs before children, so this intercepts two-finger
+                        // pinch across the entire image area regardless of where fingers land.
+                        .pointerInput(Unit) {
+                            awaitPointerEventScope {
+                                while (true) {
+                                    val event = awaitPointerEvent(PointerEventPass.Initial)
+                                    if (event.changes.size < 2) continue
+                                    val c0 = event.changes[0]
+                                    val c1 = event.changes[1]
+                                    val prev = (c0.previousPosition - c1.previousPosition).getDistance()
+                                    val curr = (c0.position - c1.position).getDistance()
+                                    val zoom = if (prev > 0f) curr / prev else 1f
+                                    if (zoom == 1f) continue
+                                    val id = selectedLabelId ?: continue
+                                    val index = labels.indexOfFirst { it.id == id }
+                                    if (index < 0) continue
+                                    val cur = labels[index]
+                                    labels[index] = cur.copy(
+                                        scale = (cur.scale * zoom).coerceIn(0.4f, 3.0f)
+                                    )
+                                    event.changes.forEach { it.consume() }
+                                }
+                            }
+                        },
+                    contentAlignment = Alignment.Center
+                ) {
+                    when {
+                        isLoading -> CircularProgressIndicator(color = Color.White)
+                        sourceBitmap == null -> Text(
+                            text = editorError ?: "Photo unavailable",
+                            modifier = Modifier.padding(24.dp),
+                            color = Color.White,
+                            textAlign = TextAlign.Center
+                        )
+                        else -> {
+                            val bitmap = sourceBitmap!!
+                            val imageBounds = fittedReviewPhotoImageBounds(
+                                containerSize = imageContainerSize,
+                                imageWidth = bitmap.width,
+                                imageHeight = bitmap.height
+                            )
+
+                            Image(
+                                bitmap = bitmap.asImageBitmap(),
+                                contentDescription = "Review photo being edited",
+                                modifier = Modifier.fillMaxSize(),
+                                contentScale = ContentScale.Fit
+                            )
+
+                            imageBounds?.let { bounds ->
+                                Box(
+                                    modifier = Modifier
+                                        .fillMaxSize()
+                                        .pointerInput(sourceUri, imageContainerSize, labels.size) {
+                                            detectTapGestures { tapOffset ->
+                                                if (!bounds.contains(tapOffset)) return@detectTapGestures
+                                                val label = ReviewPhotoLabelDraft(
+                                                    id = UUID.randomUUID().toString(),
+                                                    text = "",
+                                                    normalizedX = ((tapOffset.x - bounds.left) / bounds.width).coerceIn(0f, 1f),
+                                                    normalizedY = ((tapOffset.y - bounds.top) / bounds.height).coerceIn(0f, 1f),
+                                                    colorArgb = randomPastelColorArgb()
+                                                )
+                                                labels.add(label)
+                                                selectedLabelId = label.id
+                                            }
+                                        }
+                                )
+
+                                // TopStart (default) makes offset() relative to (0,0), not the parent Box center.
+                                Box(modifier = Modifier.fillMaxSize()) {
+                                    labels.forEach { label ->
+                                        ReviewPhotoLabelOverlay(
+                                            label = label,
+                                            imageBounds = bounds,
+                                            measuredSize = labelSizes[label.id],
+                                            selected = label.id == selectedLabelId,
+                                            onMeasured = { size -> labelSizes[label.id] = size },
+                                            onSelect = { selectedLabelId = label.id },
+                                            onDrag = { deltaNormX, deltaNormY ->
+                                                val index = labels.indexOfFirst { it.id == label.id }
+                                                if (index >= 0) {
+                                                    val cur = labels[index]
+                                                    labels[index] = cur.copy(
+                                                        normalizedX = (cur.normalizedX + deltaNormX).coerceIn(0f, 1f),
+                                                        normalizedY = (cur.normalizedY + deltaNormY).coerceIn(0f, 1f)
+                                                    )
+                                                }
+                                            }
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = CoffeeSurfaceLight,
+                    contentColor = CoffeeDark,
+                    shadowElevation = 8.dp
+                ) {
+                    Column(
+                        modifier = Modifier
+                            .navigationBarsPadding()
+                            .padding(horizontal = 12.dp, vertical = 10.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        editorError?.takeIf { !isLoading }?.let { message ->
+                            Text(
+                                text = message,
+                                style = MaterialTheme.typography.bodySmall,
+                                color = MaterialTheme.colorScheme.error
+                            )
+                        }
+
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            OutlinedTextField(
+                                value = selectedLabel?.text.orEmpty(),
+                                onValueChange = ::updateSelectedLabelText,
+                                placeholder = {
+                                    Text(if (selectedLabel == null) "Tap photo to place label" else "Label text")
+                                },
+                                enabled = selectedLabel != null && !isSaving,
+                                modifier = Modifier
+                                    .weight(1f)
+                                    .focusRequester(focusRequester),
+                                singleLine = true,
+                                shape = RoundedCornerShape(22.dp),
+                                colors = OutlinedTextFieldDefaults.colors(
+                                    focusedTextColor = CoffeeDark,
+                                    unfocusedTextColor = CoffeeDark,
+                                    disabledTextColor = CoffeeDark.copy(alpha = 0.5f),
+                                    focusedPlaceholderColor = CoffeeDark.copy(alpha = 0.54f),
+                                    unfocusedPlaceholderColor = CoffeeDark.copy(alpha = 0.54f),
+                                    disabledPlaceholderColor = CoffeeDark.copy(alpha = 0.54f),
+                                    focusedBorderColor = CoffeeDark.copy(alpha = 0.34f),
+                                    unfocusedBorderColor = CoffeeDark.copy(alpha = 0.18f),
+                                    disabledBorderColor = CoffeeDark.copy(alpha = 0.12f),
+                                    focusedContainerColor = Color(0xFFFFF8F0),
+                                    unfocusedContainerColor = Color(0xFFFFF8F0),
+                                    disabledContainerColor = Color(0xFFFFF8F0).copy(alpha = 0.72f),
+                                    cursorColor = Color(0xFF007AFF)
+                                )
+                            )
+                            IconButton(
+                                onClick = ::removeSelectedLabel,
+                                enabled = selectedLabel != null && !isSaving,
+                                modifier = Modifier
+                                    .size(44.dp)
+                                    .background(Color(0xFFFFF8F0), CircleShape)
+                            ) {
+                                Icon(
+                                    Icons.Filled.Delete,
+                                    contentDescription = "Remove label",
+                                    tint = if (selectedLabel != null && !isSaving) {
+                                        CoffeeDark
+                                    } else {
+                                        CoffeeDark.copy(alpha = 0.32f)
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReviewPhotoLabelOverlay(
+    label: ReviewPhotoLabelDraft,
+    imageBounds: Rect,
+    measuredSize: IntSize?,
+    selected: Boolean,
+    onMeasured: (IntSize) -> Unit,
+    onSelect: () -> Unit,
+    onDrag: (deltaNormX: Float, deltaNormY: Float) -> Unit
+) {
+    val density = LocalDensity.current
+    val fallbackWidthPx = with(density) { 100.dp.toPx() }
+    val fallbackHeightPx = with(density) { 36.dp.toPx() }
+    val labelWidthPx = measuredSize?.width?.takeIf { it > 0 }?.toFloat() ?: fallbackWidthPx
+    val labelHeightPx = measuredSize?.height?.takeIf { it > 0 }?.toFloat() ?: fallbackHeightPx
+    val center = Offset(
+        x = imageBounds.left + imageBounds.width * label.normalizedX.coerceIn(0f, 1f),
+        y = imageBounds.top + imageBounds.height * label.normalizedY.coerceIn(0f, 1f)
+    )
+    val topLeft = reviewPhotoLabelTopLeft(
+        center = center,
+        labelWidth = labelWidthPx,
+        labelHeight = labelHeightPx,
+        bounds = imageBounds
+    )
+    val maxBubbleWidth = with(density) { imageBounds.width.toDp() }
+
+    Surface(
+        modifier = Modifier
+            .offset { IntOffset(topLeft.x.roundToInt(), topLeft.y.roundToInt()) }
+            .graphicsLayer {
+                scaleX = label.scale
+                scaleY = label.scale
+                transformOrigin = TransformOrigin.Center
+            }
+            .onSizeChanged(onMeasured)
+            .pointerInput(label.id, imageBounds) {
+                detectDragGestures(onDragStart = { onSelect() }) { change, dragAmount ->
+                    change.consume()
+                    onDrag(dragAmount.x / imageBounds.width, dragAmount.y / imageBounds.height)
+                }
+            }
+            .clickable { onSelect() },
+        shape = RoundedCornerShape(20.dp),
+        color = if (selected) Color.White.copy(alpha = 0.14f) else Color.Transparent,
+        border = if (selected) BorderStroke(1.dp, Color.White.copy(alpha = 0.84f)) else null
+    ) {
+        Surface(
+            modifier = Modifier.padding(3.dp),
+            shape = RoundedCornerShape(16.dp),
+            color = Color(label.colorArgb).copy(alpha = REVIEW_PHOTO_LABEL_ALPHA),
+            contentColor = Color.Black
+        ) {
+            Row(
+                modifier = Modifier
+                    .widthIn(max = maxBubbleWidth)
+                    .padding(horizontal = 8.dp, vertical = 5.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Image(
+                    painter = painterResource(R.drawable.receipt),
+                    contentDescription = "Receipt label icon",
+                    modifier = Modifier.size(20.dp),
+                    alpha = REVIEW_PHOTO_LABEL_ALPHA,
+                    contentScale = ContentScale.Fit
+                )
+                if (label.text.isNotBlank()) {
+                    Spacer(modifier = Modifier.width(5.dp))
+                    Text(
+                        text = label.text,
+                        modifier = Modifier.widthIn(max = maxBubbleWidth - 36.dp),
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = Color.Black,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun fittedReviewPhotoImageBounds(
+    containerSize: IntSize,
+    imageWidth: Int,
+    imageHeight: Int
+): Rect? {
+    if (containerSize.width <= 0 || containerSize.height <= 0 || imageWidth <= 0 || imageHeight <= 0) {
+        return null
+    }
+    val widthScale = containerSize.width.toFloat() / imageWidth.toFloat()
+    val heightScale = containerSize.height.toFloat() / imageHeight.toFloat()
+    val scale = min(widthScale, heightScale)
+    val fittedWidth = imageWidth * scale
+    val fittedHeight = imageHeight * scale
+    val left = (containerSize.width - fittedWidth) / 2f
+    val top = (containerSize.height - fittedHeight) / 2f
+    return Rect(left, top, left + fittedWidth, top + fittedHeight)
+}
+
+private fun reviewPhotoLabelTopLeft(
+    center: Offset,
+    labelWidth: Float,
+    labelHeight: Float,
+    bounds: Rect
+): Offset {
+    val minLeft = bounds.left
+    val maxLeft = bounds.right - labelWidth
+    val minTop = bounds.top
+    val maxTop = bounds.bottom - labelHeight
+    return Offset(
+        x = clampReviewPhotoLabelOffset(center.x - labelWidth / 2f, minLeft, maxLeft),
+        y = clampReviewPhotoLabelOffset(center.y - labelHeight / 2f, minTop, maxTop)
+    )
+}
+
+private fun clampReviewPhotoLabelOffset(value: Float, minValue: Float, maxValue: Float): Float {
+    return if (maxValue < minValue) minValue else value.coerceIn(minValue, maxValue)
+}
+
+private suspend fun loadReviewPhotoBitmap(
+    context: Context,
+    uriText: String
+): Bitmap {
+    return withContext(Dispatchers.IO) {
+        val request = ImageRequest.Builder(context)
+            .data(uriText)
+            .allowHardware(false)
+            .build()
+        val result = context.imageLoader.execute(request)
+        val drawable = (result as? SuccessResult)?.drawable
+            ?: throw IllegalStateException("Image loader could not decode the photo.")
+        drawable.toSoftwareBitmap()
+    }
+}
+
+private fun Drawable.toSoftwareBitmap(): Bitmap {
+    val drawableBitmap = (this as? BitmapDrawable)?.bitmap
+    if (drawableBitmap != null) {
+        runCatching {
+            return drawableBitmap.copy(Bitmap.Config.ARGB_8888, false)
+        }
+    }
+
+    val targetWidth = intrinsicWidth.takeIf { it > 0 } ?: 1
+    val targetHeight = intrinsicHeight.takeIf { it > 0 } ?: 1
+    val output = Bitmap.createBitmap(targetWidth, targetHeight, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(output)
+    setBounds(0, 0, targetWidth, targetHeight)
+    draw(canvas)
+    return output
+}
+
+private suspend fun bakeReviewPhotoLabels(
+    context: Context,
+    sourceBitmap: Bitmap,
+    labels: List<ReviewPhotoLabelDraft>
+): String {
+    return withContext(Dispatchers.IO) {
+        val outputBitmap = createReviewPhotoEditBaseBitmap(sourceBitmap)
+        val receiptBitmap = BitmapFactory.decodeResource(context.resources, R.drawable.receipt)
+            ?: throw IllegalStateException("Receipt label icon is unavailable.")
+        val canvas = Canvas(outputBitmap)
+        labels
+            .filter { label -> label.text.isNotBlank() }
+            .forEach { label ->
+                drawBakedReviewPhotoLabel(
+                    canvas = canvas,
+                    outputWidth = outputBitmap.width,
+                    outputHeight = outputBitmap.height,
+                    receiptBitmap = receiptBitmap,
+                    label = label
+                )
+            }
+
+        val cacheDir = File(context.cacheDir, REVIEW_PHOTO_EDIT_CACHE_DIR).apply { mkdirs() }
+        val outputFile = File(cacheDir, "${UUID.randomUUID()}.jpg")
+        FileOutputStream(outputFile).use { outputStream ->
+            val compressed = outputBitmap.compress(
+                Bitmap.CompressFormat.JPEG,
+                REVIEW_PHOTO_EDIT_JPEG_QUALITY,
+                outputStream
+            )
+            if (!compressed) {
+                throw IllegalStateException("Edited photo could not be compressed.")
+            }
+        }
+        Uri.fromFile(outputFile).toString()
+    }
+}
+
+private fun createReviewPhotoEditBaseBitmap(sourceBitmap: Bitmap): Bitmap {
+    if (sourceBitmap.width <= 0 || sourceBitmap.height <= 0) {
+        throw IllegalStateException("Photo has no drawable size.")
+    }
+    val largestSide = max(sourceBitmap.width, sourceBitmap.height)
+    val scale = if (largestSide > REVIEW_PHOTO_EDIT_MAX_DIMENSION_PX) {
+        REVIEW_PHOTO_EDIT_MAX_DIMENSION_PX.toFloat() / largestSide.toFloat()
+    } else {
+        1f
+    }
+    val outputWidth = (sourceBitmap.width * scale).roundToInt().coerceAtLeast(1)
+    val outputHeight = (sourceBitmap.height * scale).roundToInt().coerceAtLeast(1)
+    val outputBitmap = Bitmap.createBitmap(outputWidth, outputHeight, Bitmap.Config.ARGB_8888)
+    val canvas = Canvas(outputBitmap)
+    canvas.drawColor(android.graphics.Color.WHITE)
+    val paint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
+    canvas.drawBitmap(
+        sourceBitmap,
+        null,
+        android.graphics.Rect(0, 0, outputWidth, outputHeight),
+        paint
+    )
+    return outputBitmap
+}
+
+private fun drawBakedReviewPhotoLabel(
+    canvas: Canvas,
+    outputWidth: Int,
+    outputHeight: Int,
+    receiptBitmap: Bitmap,
+    label: ReviewPhotoLabelDraft
+) {
+    val labelText = label.text.trim()
+    if (labelText.isBlank() || outputWidth <= 0 || outputHeight <= 0) return
+
+    val shortestSide = min(outputWidth, outputHeight).toFloat()
+    val textSize = ((shortestSide * 0.045f) * label.scale).coerceIn(12f, 80f)
+    val textPaint = TextPaint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.BLACK
+        this.textSize = textSize
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+    }
+    val paddingX = textSize * 0.56f
+    val paddingY = textSize * 0.34f
+    val iconSize = textSize * 1.1f
+    val iconGap = textSize * 0.28f
+    val maxPossibleTextWidth = (outputWidth - paddingX * 2f - iconSize - iconGap).coerceAtLeast(textSize * 3f)
+    val maxTextWidth = min(outputWidth * 0.42f, maxPossibleTextWidth).coerceAtLeast(textSize * 3f)
+    val lines = wrapReviewPhotoLabelLines(
+        text = labelText,
+        paint = textPaint,
+        maxLineWidth = maxTextWidth,
+        maxLines = 4
+    )
+    if (lines.isEmpty()) return
+
+    val fontMetrics = textPaint.fontMetrics
+    val lineHeight = fontMetrics.descent - fontMetrics.ascent
+    val textWidth = lines.maxOf { line -> textPaint.measureText(line) }.coerceAtMost(maxTextWidth)
+    val textBlockHeight = lineHeight * lines.size
+    val bubbleWidth = paddingX + iconSize + iconGap + textWidth + paddingX
+    val bubbleHeight = max(iconSize, textBlockHeight) + paddingY * 2f
+    val centerX = outputWidth * label.normalizedX.coerceIn(0f, 1f)
+    val centerY = outputHeight * label.normalizedY.coerceIn(0f, 1f)
+    val left = clampReviewPhotoLabelOffset(centerX - bubbleWidth / 2f, 0f, outputWidth - bubbleWidth)
+    val top = clampReviewPhotoLabelOffset(centerY - bubbleHeight / 2f, 0f, outputHeight - bubbleHeight)
+    val alpha = (255 * REVIEW_PHOTO_LABEL_ALPHA).roundToInt().coerceIn(0, 255)
+    val iconPaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG).apply {
+        this.alpha = alpha
+    }
+    val bubblePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = android.graphics.Color.argb(
+            alpha,
+            android.graphics.Color.red(label.colorArgb),
+            android.graphics.Color.green(label.colorArgb),
+            android.graphics.Color.blue(label.colorArgb)
+        )
+    }
+
+    val bubbleRect = android.graphics.RectF(left, top, left + bubbleWidth, top + bubbleHeight)
+    canvas.drawRoundRect(bubbleRect, textSize * 0.72f, textSize * 0.72f, bubblePaint)
+
+    val iconLeft = left + paddingX
+    val iconTop = top + (bubbleHeight - iconSize) / 2f
+    canvas.drawBitmap(
+        receiptBitmap,
+        null,
+        android.graphics.RectF(iconLeft, iconTop, iconLeft + iconSize, iconTop + iconSize),
+        iconPaint
+    )
+
+    val textX = iconLeft + iconSize + iconGap
+    var baseline = top + (bubbleHeight - textBlockHeight) / 2f - fontMetrics.ascent
+    lines.forEach { line ->
+        canvas.drawText(line, textX, baseline, textPaint)
+        baseline += lineHeight
+    }
+}
+
+private fun wrapReviewPhotoLabelLines(
+    text: String,
+    paint: TextPaint,
+    maxLineWidth: Float,
+    maxLines: Int
+): List<String> {
+    val normalizedText = text.trim().replace(Regex("\\s+"), " ")
+    if (normalizedText.isBlank() || maxLines <= 0) return emptyList()
+    val words = normalizedText.split(" ")
+    val lines = mutableListOf<String>()
+    var currentLine = ""
+    var wordIndex = 0
+    var truncated = false
+
+    while (wordIndex < words.size && lines.size < maxLines) {
+        val word = words[wordIndex]
+        val candidate = if (currentLine.isBlank()) word else "$currentLine $word"
+        when {
+            paint.measureText(candidate) <= maxLineWidth -> {
+                currentLine = candidate
+                wordIndex++
+            }
+            currentLine.isNotBlank() -> {
+                lines.add(currentLine)
+                currentLine = ""
+            }
+            else -> {
+                lines.add(
+                    TextUtils.ellipsize(word, paint, maxLineWidth, TextUtils.TruncateAt.END).toString()
+                )
+                wordIndex++
+            }
+        }
+    }
+
+    if (lines.size < maxLines && currentLine.isNotBlank()) {
+        lines.add(currentLine)
+    } else if (wordIndex < words.size || currentLine.isNotBlank()) {
+        truncated = true
+    }
+
+    if (truncated && lines.isNotEmpty()) {
+        val lastIndex = lines.lastIndex
+        lines[lastIndex] = TextUtils.ellipsize(
+            lines[lastIndex],
+            paint,
+            maxLineWidth,
+            TextUtils.TruncateAt.END
+        ).toString()
+    }
+
+    return lines
 }
 
 private fun Review.reviewerDisplayName(): String {
@@ -8224,6 +8964,43 @@ private fun addPickedReviewPhotoUris(
             }
         }
     return updatedPhotoUris
+}
+
+private fun replaceReviewPhotoUri(
+    photoUris: List<String>,
+    index: Int,
+    originalUri: String,
+    editedUri: String
+): List<String> {
+    val updatedPhotoUris = photoUris.toMutableList()
+    when {
+        index in updatedPhotoUris.indices && updatedPhotoUris[index] == originalUri -> {
+            updatedPhotoUris[index] = editedUri
+        }
+        originalUri in updatedPhotoUris -> {
+            updatedPhotoUris[updatedPhotoUris.indexOf(originalUri)] = editedUri
+        }
+    }
+    return updatedPhotoUris
+}
+
+private fun deleteReviewPhotoEditCacheFiles(context: Context, photoUris: List<String>) {
+    photoUris.forEach { uriText -> deleteReviewPhotoEditCacheFile(context, uriText) }
+}
+
+private fun deleteReviewPhotoEditCacheFile(context: Context, uriText: String) {
+    runCatching {
+        val uri = Uri.parse(uriText)
+        if (uri.scheme != "file") return
+        val path = uri.path ?: return
+        val targetFile = File(path).canonicalFile
+        val editCacheDir = File(context.cacheDir, REVIEW_PHOTO_EDIT_CACHE_DIR).canonicalFile
+        val isInsideEditCache = targetFile.path == editCacheDir.path ||
+            targetFile.path.startsWith(editCacheDir.path + File.separator)
+        if (isInsideEditCache) {
+            targetFile.delete()
+        }
+    }
 }
 
 private suspend fun uploadReviewPhotos(
@@ -8314,6 +9091,11 @@ private fun String.toStoragePathSegment(): String {
 private fun Throwable.toCrowdSuggestionMessage(): String = toCrowdBackendMessage("submit this suggestion")
 
 private fun Throwable.toCrowdLoadMessage(): String = toCrowdBackendMessage("load community suggestions")
+
+private fun Throwable.toReviewPhotoEditorMessage(action: String): String {
+    val details = message?.takeIf { it.isNotBlank() }
+    return "Could not $action. ${details.orEmpty().toDebugSuffix().ifBlank { this::class.simpleName ?: "Unknown error" }}"
+}
 
 private fun Throwable.toReviewPostMessage(): String {
     val details = buildList {
